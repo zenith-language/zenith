@@ -11,6 +11,8 @@ pub const chunk = @import("chunk");
 pub const err = @import("error");
 pub const debug = @import("debug");
 pub const lexer = @import("lexer");
+pub const ast = @import("ast");
+pub const parser = @import("parser");
 
 test {
     // Force the test runner to analyse all transitive dependencies so

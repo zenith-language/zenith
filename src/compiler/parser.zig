@@ -1,0 +1,1018 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const token_mod = @import("token");
+const Token = token_mod.Token;
+const Tag = token_mod.Tag;
+const ast_mod = @import("ast");
+const Ast = ast_mod.Ast;
+const Node = Ast.Node;
+const error_mod = @import("error");
+const Diagnostic = error_mod.Diagnostic;
+const ErrorCode = error_mod.ErrorCode;
+const Label = error_mod.Label;
+
+/// Recursive descent parser with Pratt operator precedence.
+///
+/// Consumes the flat token array produced by the lexer and builds an AST
+/// using MultiArrayList(Node) storage.  Error recovery uses panic-mode
+/// synchronisation: on a parse error, the parser skips tokens until it
+/// reaches a statement boundary (`let`, `if`, `while`, `for`, `}`, EOF).
+pub const Parser = struct {
+    tokens: []const Token,
+    source: []const u8,
+    pos: u32,
+    ast: Ast,
+    allocator: Allocator,
+
+    pub const Error = error{ParseError} || Allocator.Error;
+
+    /// Parse a token stream into an AST.
+    pub fn parse(tokens: []const Token, source: []const u8, allocator: Allocator) Error!Ast {
+        var self = Parser{
+            .tokens = tokens,
+            .source = source,
+            .pos = 0,
+            .ast = Ast.init(tokens, source),
+            .allocator = allocator,
+        };
+
+        // Parse top-level statements into a root node.
+        var stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer stmts.deinit(allocator);
+
+        while (!self.atEnd()) {
+            if (self.parseStatement()) |stmt| {
+                try stmts.append(allocator, stmt);
+            } else |_| {
+                // Error recovery: synchronize to next statement boundary.
+                self.synchronize();
+            }
+        }
+
+        // Create root node with extra_data range for statement list.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (stmts.items) |s| {
+            _ = try self.ast.addExtra(s, allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        _ = try self.ast.addNode(.{
+            .tag = .root,
+            .main_token = 0,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, allocator);
+
+        return self.ast;
+    }
+
+    // ── Statement parsing ──────────────────────────────────────────────
+
+    fn parseStatement(self: *Parser) Error!Node.Index {
+        return switch (self.peekTag()) {
+            .kw_let => self.parseLetDecl(),
+            .kw_while => self.parseWhileStmt(),
+            .kw_for => self.parseForStmt(),
+            else => self.parseExprStmt(),
+        };
+    }
+
+    fn parseLetDecl(self: *Parser) Error!Node.Index {
+        const let_tok = self.pos;
+        self.advance(); // consume 'let'
+
+        // Expect identifier.
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected identifier after 'let'");
+            return error.ParseError;
+        }
+        const name_tok = self.pos;
+        self.advance(); // consume identifier
+
+        // Expect '='.
+        if (self.peekTag() != .equal) {
+            try self.emitError("expected '=' after variable name");
+            return error.ParseError;
+        }
+        self.advance(); // consume '='
+
+        // Parse initializer expression.
+        const initializer = try self.parseExpression();
+
+        return self.ast.addNode(.{
+            .tag = .let_decl,
+            .main_token = let_tok,
+            .data = .{ .lhs = name_tok, .rhs = initializer },
+        }, self.allocator);
+    }
+
+    fn parseWhileStmt(self: *Parser) Error!Node.Index {
+        const while_tok = self.pos;
+        self.advance(); // consume 'while'
+
+        // Parse condition.
+        const condition = try self.parseExpression();
+
+        // Parse body (block).
+        const body = try self.parseBlockExpr();
+
+        return self.ast.addNode(.{
+            .tag = .while_stmt,
+            .main_token = while_tok,
+            .data = .{ .lhs = condition, .rhs = body },
+        }, self.allocator);
+    }
+
+    fn parseForStmt(self: *Parser) Error!Node.Index {
+        const for_tok = self.pos;
+        self.advance(); // consume 'for'
+
+        // Expect loop variable identifier.
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected identifier after 'for'");
+            return error.ParseError;
+        }
+        const var_tok = self.pos;
+        self.advance(); // consume identifier
+
+        // Expect 'in'.
+        if (self.peekTag() != .kw_in) {
+            try self.emitError("expected 'in' after loop variable");
+            return error.ParseError;
+        }
+        self.advance(); // consume 'in'
+
+        // Parse iterable expression.
+        const iterable = try self.parseExpression();
+
+        // Parse body (block).
+        const body = try self.parseBlockExpr();
+
+        // Store var_tok and body in extra_data.
+        const extra_idx = try self.ast.addExtra(var_tok, self.allocator);
+        _ = try self.ast.addExtra(body, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .for_stmt,
+            .main_token = for_tok,
+            .data = .{ .lhs = iterable, .rhs = extra_idx },
+        }, self.allocator);
+    }
+
+    fn parseExprStmt(self: *Parser) Error!Node.Index {
+        const expr = try self.parseExpression();
+
+        // Check for assignment: if next token is '=' and expr is an identifier.
+        if (self.peekTag() == .equal) {
+            self.advance(); // consume '='
+            const value = try self.parseExpression();
+            const tags = self.ast.nodes.items(.tag);
+            const main_token = self.ast.nodes.items(.main_token)[expr];
+            if (tags[expr] == .identifier) {
+                return self.ast.addNode(.{
+                    .tag = .assign_stmt,
+                    .main_token = main_token,
+                    .data = .{ .lhs = expr, .rhs = value },
+                }, self.allocator);
+            }
+        }
+
+        return self.ast.addNode(.{
+            .tag = .expr_stmt,
+            .main_token = self.ast.nodes.items(.main_token)[expr],
+            .data = .{ .lhs = expr, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    // ── Expression parsing (Pratt) ─────────────────────────────────────
+
+    const Precedence = enum(u8) {
+        none,
+        or_prec, // or
+        and_prec, // and
+        equality, // == !=
+        comparison, // < > <= >=
+        additive, // + - ++
+        multiplicative, // * / %
+        unary, // - not
+        call, // f(x)
+        primary, // literals, identifiers, grouped
+    };
+
+    fn parseExpression(self: *Parser) Error!Node.Index {
+        return self.parsePrecedence(.or_prec);
+    }
+
+    fn parsePrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
+        // Prefix (unary / primary).
+        var left = try self.parsePrefix();
+
+        // Infix (binary operators, left-associative).
+        while (true) {
+            const prec = self.infixPrecedence(self.peekTag());
+            if (@intFromEnum(prec) < @intFromEnum(min_prec)) break;
+
+            left = try self.parseInfix(left, prec);
+        }
+
+        return left;
+    }
+
+    fn parsePrefix(self: *Parser) Error!Node.Index {
+        return switch (self.peekTag()) {
+            .minus => self.parseUnaryNegate(),
+            .kw_not => self.parseUnaryNot(),
+            .left_paren => self.parseGrouped(),
+            .left_brace => self.parseBlockExpr(),
+            .kw_if => self.parseIfExpr(),
+            .int_literal => self.parseLiteral(.int_literal),
+            .float_literal => self.parseLiteral(.float_literal),
+            .string_literal => self.parseLiteral(.string_literal),
+            .atom_literal => self.parseLiteral(.atom_literal),
+            .kw_true => self.parseLiteral(.bool_literal),
+            .kw_false => self.parseLiteral(.bool_literal),
+            .kw_nil => self.parseLiteral(.nil_literal),
+            .identifier => self.parseIdentifier(),
+            else => {
+                try self.emitError("expected expression");
+                return error.ParseError;
+            },
+        };
+    }
+
+    fn parseInfix(self: *Parser, left: Node.Index, prec: Precedence) Error!Node.Index {
+        const op_tag = self.peekTag();
+        const op_tok = self.pos;
+
+        // Check if this is a call expression.
+        if (op_tag == .left_paren) {
+            return self.parseCall(left);
+        }
+
+        const node_tag = self.tokenToNodeTag(op_tag);
+        self.advance(); // consume operator
+
+        // Left-associative: next precedence is one higher.
+        const next_prec: Precedence = @enumFromInt(@intFromEnum(prec) + 1);
+        const right = try self.parsePrecedence(next_prec);
+
+        return self.ast.addNode(.{
+            .tag = node_tag,
+            .main_token = op_tok,
+            .data = .{ .lhs = left, .rhs = right },
+        }, self.allocator);
+    }
+
+    fn parseCall(self: *Parser, callee: Node.Index) Error!Node.Index {
+        const paren_tok = self.pos;
+        self.advance(); // consume '('
+
+        var args: std.ArrayListUnmanaged(u32) = .empty;
+        defer args.deinit(self.allocator);
+
+        // Parse arguments.
+        if (self.peekTag() != .right_paren) {
+            const first = try self.parseExpression();
+            try args.append(self.allocator, first);
+
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                const arg = try self.parseExpression();
+                try args.append(self.allocator, arg);
+            }
+        }
+
+        if (self.peekTag() != .right_paren) {
+            try self.emitError("expected ')' after arguments");
+            return error.ParseError;
+        }
+        self.advance(); // consume ')'
+
+        // Store args in extra_data.
+        const arg_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (args.items) |a| {
+            _ = try self.ast.addExtra(a, self.allocator);
+        }
+        const arg_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        // Store arg range in extra_data.
+        const extra_idx = try self.ast.addExtra(arg_start, self.allocator);
+        _ = try self.ast.addExtra(arg_end, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .call_expr,
+            .main_token = paren_tok,
+            .data = .{ .lhs = callee, .rhs = extra_idx },
+        }, self.allocator);
+    }
+
+    fn parseLiteral(self: *Parser, tag: Node.Tag) Error!Node.Index {
+        const tok = self.pos;
+        self.advance();
+        return self.ast.addNode(.{
+            .tag = tag,
+            .main_token = tok,
+            .data = .{ .lhs = 0, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    fn parseIdentifier(self: *Parser) Error!Node.Index {
+        const tok = self.pos;
+        self.advance();
+        return self.ast.addNode(.{
+            .tag = .identifier,
+            .main_token = tok,
+            .data = .{ .lhs = 0, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    fn parseUnaryNegate(self: *Parser) Error!Node.Index {
+        const op_tok = self.pos;
+        self.advance(); // consume '-'
+        const operand = try self.parsePrecedence(.unary);
+        return self.ast.addNode(.{
+            .tag = .negate,
+            .main_token = op_tok,
+            .data = .{ .lhs = operand, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    fn parseUnaryNot(self: *Parser) Error!Node.Index {
+        const op_tok = self.pos;
+        self.advance(); // consume 'not'
+        const operand = try self.parsePrecedence(.unary);
+        return self.ast.addNode(.{
+            .tag = .logical_not,
+            .main_token = op_tok,
+            .data = .{ .lhs = operand, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    fn parseGrouped(self: *Parser) Error!Node.Index {
+        self.advance(); // consume '('
+        const inner = try self.parseExpression();
+
+        if (self.peekTag() != .right_paren) {
+            try self.emitError("expected ')' after expression");
+            return error.ParseError;
+        }
+        self.advance(); // consume ')'
+
+        return self.ast.addNode(.{
+            .tag = .grouped_expr,
+            .main_token = self.pos -| 1,
+            .data = .{ .lhs = inner, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    fn parseBlockExpr(self: *Parser) Error!Node.Index {
+        if (self.peekTag() != .left_brace) {
+            try self.emitError("expected '{'");
+            return error.ParseError;
+        }
+        const brace_tok = self.pos;
+        self.advance(); // consume '{'
+
+        var stmts: std.ArrayListUnmanaged(u32) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        while (self.peekTag() != .right_brace and !self.atEnd()) {
+            if (self.parseStatement()) |stmt| {
+                try stmts.append(self.allocator, stmt);
+            } else |_| {
+                self.synchronize();
+            }
+        }
+
+        if (self.peekTag() != .right_brace) {
+            try self.emitError("expected '}' to close block");
+            return error.ParseError;
+        }
+        self.advance(); // consume '}'
+
+        // Store statement indices in extra_data.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (stmts.items) |s| {
+            _ = try self.ast.addExtra(s, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .block_expr,
+            .main_token = brace_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    fn parseIfExpr(self: *Parser) Error!Node.Index {
+        const if_tok = self.pos;
+        self.advance(); // consume 'if'
+
+        // Parse condition.
+        const condition = try self.parseExpression();
+
+        // Parse then-branch (block).
+        const then_branch = try self.parseBlockExpr();
+
+        // Optional else branch.
+        var else_branch: Node.Index = Node.null_node;
+        if (self.peekTag() == .kw_else) {
+            self.advance(); // consume 'else'
+            // else can be followed by another if (else if) or a block.
+            if (self.peekTag() == .kw_if) {
+                else_branch = try self.parseIfExpr();
+            } else {
+                else_branch = try self.parseBlockExpr();
+            }
+        }
+
+        // Store then/else in extra_data.
+        const extra_idx = try self.ast.addExtra(then_branch, self.allocator);
+        _ = try self.ast.addExtra(else_branch, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .if_expr,
+            .main_token = if_tok,
+            .data = .{ .lhs = condition, .rhs = extra_idx },
+        }, self.allocator);
+    }
+
+    // ── Operator precedence table ─────────────────────────────────────
+
+    fn infixPrecedence(self: *const Parser, tag: Tag) Precedence {
+        _ = self;
+        return switch (tag) {
+            .kw_or => .or_prec,
+            .kw_and => .and_prec,
+            .equal_equal, .bang_equal => .equality,
+            .less, .greater, .less_equal, .greater_equal => .comparison,
+            .plus, .minus, .plus_plus => .additive,
+            .star, .slash, .percent => .multiplicative,
+            .left_paren => .call,
+            else => .none,
+        };
+    }
+
+    fn tokenToNodeTag(self: *const Parser, tag: Tag) Node.Tag {
+        _ = self;
+        return switch (tag) {
+            .plus => .add,
+            .minus => .subtract,
+            .star => .multiply,
+            .slash => .divide,
+            .percent => .modulo,
+            .equal_equal => .equal,
+            .bang_equal => .not_equal,
+            .less => .less,
+            .greater => .greater,
+            .less_equal => .less_equal,
+            .greater_equal => .greater_equal,
+            .kw_and => .logical_and,
+            .kw_or => .logical_or,
+            .plus_plus => .concat,
+            else => .expr_stmt, // should not happen
+        };
+    }
+
+    // ── Token access helpers ──────────────────────────────────────────
+
+    fn peekTag(self: *const Parser) Tag {
+        if (self.pos >= self.tokens.len) return .eof;
+        return self.tokens[self.pos].tag;
+    }
+
+    fn advance(self: *Parser) void {
+        if (self.pos < self.tokens.len) {
+            self.pos += 1;
+        }
+    }
+
+    fn atEnd(self: *const Parser) bool {
+        return self.peekTag() == .eof;
+    }
+
+    // ── Error handling ───────────────────────────────────────────────
+
+    fn emitError(self: *Parser, message: []const u8) Error!void {
+        const tok = if (self.pos < self.tokens.len) self.tokens[self.pos] else self.tokens[self.tokens.len - 1];
+        try self.ast.errors.append(.{
+            .error_code = .E005,
+            .severity = .@"error",
+            .message = message,
+            .span = .{ .start = tok.start, .end = tok.end },
+            .labels = &[_]Label{},
+            .help = null,
+        }, self.allocator);
+    }
+
+    fn synchronize(self: *Parser) void {
+        while (!self.atEnd()) {
+            // Stop at tokens that can start a new statement.
+            switch (self.peekTag()) {
+                .kw_let, .kw_if, .kw_while, .kw_for, .kw_fn, .kw_return, .right_brace => return,
+                else => self.advance(),
+            }
+        }
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Test helpers ──────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+const lexer_mod = @import("lexer");
+const Lexer = lexer_mod.Lexer;
+
+/// Lex + parse source, return AST (caller must deinit).
+fn testParse(source: []const u8, allocator: Allocator) !Ast {
+    var lex = Lexer.init(source);
+    try lex.tokenize(allocator);
+    // We must keep the tokens alive for the AST's lifetime.
+    // Store them by moving ownership -- the lexer errors can be freed.
+    const tokens = lex.tokens.items;
+
+    var ast = try Parser.parse(tokens, source, allocator);
+    // Transfer lexer errors -- not needed for test assertions.
+    // Clean up lexer error list but keep token array alive (owned by ast.tokens pointer).
+    lex.errors.deinit(allocator);
+    // Do NOT deinit lex.tokens here -- ownership transferred to `ast.tokens` slice reference.
+    // We need to track the token list so we can free it.  Store the raw list in a var
+    // so the caller frees it.  Actually, let's use a wrapper.
+
+    // Problem: we must not free the token array until the AST is freed.
+    // Solution: we leak the token memory into the AST.  For tests, the testing
+    // allocator will catch actual leaks.  Let's create a helper struct.
+    _ = &ast;
+
+    // Actually let's just return ast and have the caller also deinit the lexer tokens.
+    // We'll use a different approach: return a struct.
+    // For simplicity in tests: we won't deinit lexer.tokens here, and rely on
+    // TestResult below.
+    return ast;
+}
+
+const TestResult = struct {
+    ast: Ast,
+    token_buf: std.ArrayListUnmanaged(Token),
+
+    fn deinit(self: *TestResult, allocator: Allocator) void {
+        self.ast.deinit(allocator);
+        self.token_buf.deinit(allocator);
+    }
+};
+
+fn testParseOwned(source: []const u8, allocator: Allocator) !TestResult {
+    var lex = Lexer.init(source);
+    try lex.tokenize(allocator);
+    lex.errors.deinit(allocator);
+
+    var ast = try Parser.parse(lex.tokens.items, source, allocator);
+    _ = &ast;
+
+    return .{
+        .ast = ast,
+        .token_buf = lex.tokens,
+    };
+}
+
+/// Get the tag of the node at index.
+fn nodeTag(ast: *const Ast, idx: Node.Index) Node.Tag {
+    return ast.nodes.items(.tag)[idx];
+}
+
+/// Get the data of the node at index.
+fn nodeData(ast: *const Ast, idx: Node.Index) Node.Data {
+    return ast.nodes.items(.data)[idx];
+}
+
+/// Get the root node's statement list.
+fn rootStmts(ast: *const Ast) []const u32 {
+    // Root is always the last node.
+    const root_idx: u32 = @intCast(ast.nodes.len - 1);
+    const data = ast.nodes.items(.data)[root_idx];
+    return ast.extra_data.items[data.lhs..data.rhs];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Tests ──────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+// Test 1: Parse `42` produces AST with single int_literal node
+test "parser: int literal" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("42", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    // stmt is an expr_stmt wrapping int_literal
+    try std.testing.expectEqual(Node.Tag.expr_stmt, nodeTag(&r.ast, stmts[0]));
+    const inner = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, inner));
+}
+
+// Test 2: Parse `1 + 2` produces binary_op(add) node
+test "parser: simple addition" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("1 + 2", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    const stmt = stmts[0];
+    try std.testing.expectEqual(Node.Tag.expr_stmt, nodeTag(&r.ast, stmt));
+    const expr = nodeData(&r.ast, stmt).lhs;
+    try std.testing.expectEqual(Node.Tag.add, nodeTag(&r.ast, expr));
+
+    // Children should be int_literal nodes.
+    const data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, data.lhs));
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, data.rhs));
+}
+
+// Test 3: Parse `1 + 2 * 3` respects precedence: add(1, mul(2, 3))
+test "parser: operator precedence mul before add" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("1 + 2 * 3", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.add, nodeTag(&r.ast, expr));
+
+    const add_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, add_data.lhs)); // 1
+    try std.testing.expectEqual(Node.Tag.multiply, nodeTag(&r.ast, add_data.rhs)); // 2 * 3
+
+    const mul_data = nodeData(&r.ast, add_data.rhs);
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, mul_data.lhs)); // 2
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, mul_data.rhs)); // 3
+}
+
+// Test 4: Parse `-x` produces negate(identifier)
+test "parser: unary negate" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("-x", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.negate, nodeTag(&r.ast, expr));
+
+    const operand = nodeData(&r.ast, expr).lhs;
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, operand));
+}
+
+// Test 5: Parse `not true` produces logical_not(bool_literal)
+test "parser: unary not" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("not true", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.logical_not, nodeTag(&r.ast, expr));
+
+    const operand = nodeData(&r.ast, expr).lhs;
+    try std.testing.expectEqual(Node.Tag.bool_literal, nodeTag(&r.ast, operand));
+}
+
+// Test 6: Parse `let x = 42` produces let_decl node
+test "parser: let declaration" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("let x = 42", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    try std.testing.expectEqual(Node.Tag.let_decl, nodeTag(&r.ast, stmts[0]));
+
+    const data = nodeData(&r.ast, stmts[0]);
+    // data.rhs should be an int_literal node.
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, data.rhs));
+}
+
+// Test 7: Parse `if x > 0 { x } else { -x }` produces if_expr
+test "parser: if else expression" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("if x > 0 { x } else { -x }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.if_expr, nodeTag(&r.ast, expr));
+
+    // condition is x > 0
+    const if_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.greater, nodeTag(&r.ast, if_data.lhs));
+
+    // then/else stored in extra_data
+    const then_branch = r.ast.extra_data.items[if_data.rhs];
+    const else_branch = r.ast.extra_data.items[if_data.rhs + 1];
+    try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, then_branch));
+    try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, else_branch));
+    try std.testing.expect(else_branch != Node.null_node);
+}
+
+// Test 8: Parse `while x > 0 { x = x - 1 }` produces while_stmt
+test "parser: while statement" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("while x > 0 { x = x - 1 }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    try std.testing.expectEqual(Node.Tag.while_stmt, nodeTag(&r.ast, stmts[0]));
+
+    const data = nodeData(&r.ast, stmts[0]);
+    // condition: x > 0
+    try std.testing.expectEqual(Node.Tag.greater, nodeTag(&r.ast, data.lhs));
+    // body: block_expr
+    try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, data.rhs));
+}
+
+// Test 9: Parse `for i in range(10) { print(i) }` produces for_stmt
+test "parser: for-in statement" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("for i in range(10) { print(i) }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    try std.testing.expectEqual(Node.Tag.for_stmt, nodeTag(&r.ast, stmts[0]));
+
+    const data = nodeData(&r.ast, stmts[0]);
+    // lhs = iterable (call_expr: range(10))
+    try std.testing.expectEqual(Node.Tag.call_expr, nodeTag(&r.ast, data.lhs));
+}
+
+// Test 10: Parse `{ let x = 1\n x + 2 }` produces block_expr
+test "parser: block expression" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("{ let x = 1\n x + 2 }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, expr));
+
+    // Block should contain 2 statements: let_decl and expr_stmt
+    const block_data = nodeData(&r.ast, expr);
+    const block_stmts = r.ast.extra_data.items[block_data.lhs..block_data.rhs];
+    try std.testing.expectEqual(@as(usize, 2), block_stmts.len);
+    try std.testing.expectEqual(Node.Tag.let_decl, nodeTag(&r.ast, block_stmts[0]));
+    try std.testing.expectEqual(Node.Tag.expr_stmt, nodeTag(&r.ast, block_stmts[1]));
+}
+
+// Test 11: Parse `:ok` produces atom_literal node
+test "parser: atom literal" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned(":ok", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.atom_literal, nodeTag(&r.ast, expr));
+}
+
+// Test 12: Parse `x and y or z` produces correct precedence: or(and(x, y), z)
+test "parser: and/or precedence" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("x and y or z", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.logical_or, nodeTag(&r.ast, expr));
+
+    const or_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.logical_and, nodeTag(&r.ast, or_data.lhs));
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, or_data.rhs)); // z
+
+    const and_data = nodeData(&r.ast, or_data.lhs);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, and_data.lhs)); // x
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, and_data.rhs)); // y
+}
+
+// Test 13: Parse `a == b` produces equal node
+test "parser: equality" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("a == b", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.equal, nodeTag(&r.ast, expr));
+}
+
+// Test 14: Parse multiple statements produces root with all
+test "parser: multiple statements" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("let x = 1\nlet y = 2\nx + y", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 3), stmts.len);
+    try std.testing.expectEqual(Node.Tag.let_decl, nodeTag(&r.ast, stmts[0]));
+    try std.testing.expectEqual(Node.Tag.let_decl, nodeTag(&r.ast, stmts[1]));
+    try std.testing.expectEqual(Node.Tag.expr_stmt, nodeTag(&r.ast, stmts[2]));
+}
+
+// Test 15: Parse error produces diagnostic, parser recovers
+test "parser: error recovery" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("let = 42\nlet y = 10", allocator);
+    defer r.deinit(allocator);
+
+    // Should have at least one error diagnostic.
+    try std.testing.expect(r.ast.errors.items.items.len > 0);
+
+    // Should still have parsed the second statement.
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expect(stmts.len >= 1);
+    // Find the let_decl for y.
+    var found_y = false;
+    for (stmts) |s| {
+        if (nodeTag(&r.ast, s) == .let_decl) {
+            found_y = true;
+        }
+    }
+    try std.testing.expect(found_y);
+}
+
+// Test 16: Operator precedence: unary > multiplicative > additive > comparison > equality > and > or
+test "parser: full precedence chain" {
+    const allocator = std.testing.allocator;
+    // -1 * 2 + 3 < 4 == true and false or true
+    // Should parse as: or(and(equal(less(add(mul(negate(1), 2), 3), 4), true), false), true)
+    var r = try testParseOwned("-1 * 2 + 3 < 4 == true and false or true", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    // Top level should be 'or'
+    try std.testing.expectEqual(Node.Tag.logical_or, nodeTag(&r.ast, expr));
+}
+
+// Test 17: Parse `x ++ y` produces concat node
+test "parser: string concatenation" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("x ++ y", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.concat, nodeTag(&r.ast, expr));
+}
+
+// Test 18: Parse `print(x)` produces call_expr
+test "parser: function call" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("print(x)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.call_expr, nodeTag(&r.ast, expr));
+
+    // Callee should be identifier
+    const call_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, call_data.lhs));
+}
+
+// Additional tests:
+
+test "parser: nil literal" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("nil", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.nil_literal, nodeTag(&r.ast, expr));
+}
+
+test "parser: bool literal" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("true", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.bool_literal, nodeTag(&r.ast, expr));
+}
+
+test "parser: string literal" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("\"hello\"", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.string_literal, nodeTag(&r.ast, expr));
+}
+
+test "parser: float literal" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("3.14", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.float_literal, nodeTag(&r.ast, expr));
+}
+
+test "parser: grouped expression" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("(1 + 2) * 3", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    // Top: multiply
+    try std.testing.expectEqual(Node.Tag.multiply, nodeTag(&r.ast, expr));
+    // lhs: grouped_expr
+    const mul_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.grouped_expr, nodeTag(&r.ast, mul_data.lhs));
+}
+
+test "parser: call with multiple args" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("add(1, 2, 3)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.call_expr, nodeTag(&r.ast, expr));
+
+    // Check arg count via extra_data.
+    const call_data = nodeData(&r.ast, expr);
+    const extra_idx = call_data.rhs;
+    const arg_start = r.ast.extra_data.items[extra_idx];
+    const arg_end = r.ast.extra_data.items[extra_idx + 1];
+    try std.testing.expectEqual(@as(u32, 3), arg_end - arg_start);
+}
+
+test "parser: not equal" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("a != b", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.not_equal, nodeTag(&r.ast, expr));
+}
+
+test "parser: all comparison operators" {
+    const allocator = std.testing.allocator;
+
+    const ops = [_]struct { src: []const u8, tag: Node.Tag }{
+        .{ .src = "a < b", .tag = .less },
+        .{ .src = "a > b", .tag = .greater },
+        .{ .src = "a <= b", .tag = .less_equal },
+        .{ .src = "a >= b", .tag = .greater_equal },
+    };
+
+    for (ops) |op| {
+        var r = try testParseOwned(op.src, allocator);
+        defer r.deinit(allocator);
+
+        const stmts = rootStmts(&r.ast);
+        const expr = nodeData(&r.ast, stmts[0]).lhs;
+        try std.testing.expectEqual(op.tag, nodeTag(&r.ast, expr));
+    }
+}
+
+test "parser: assignment statement" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("x = 42", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    try std.testing.expectEqual(Node.Tag.assign_stmt, nodeTag(&r.ast, stmts[0]));
+}
+
+test "parser: modulo operator" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("10 % 3", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.modulo, nodeTag(&r.ast, expr));
+}
+
+test "parser: if without else" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("if x { 1 }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.if_expr, nodeTag(&r.ast, expr));
+
+    // else_branch should be null_node
+    const if_data = nodeData(&r.ast, expr);
+    const else_branch = r.ast.extra_data.items[if_data.rhs + 1];
+    try std.testing.expectEqual(Node.null_node, else_branch);
+}

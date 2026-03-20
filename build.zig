@@ -67,6 +67,28 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const ast_mod = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ast.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "token", .module = token_mod },
+            .{ .name = "error", .module = error_mod },
+        },
+    });
+
+    const parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/compiler/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "token", .module = token_mod },
+            .{ .name = "error", .module = error_mod },
+            .{ .name = "ast", .module = ast_mod },
+            .{ .name = "lexer", .module = lexer_mod },
+        },
+    });
+
     // ── Library module (public API) ────────────────────────────────────
     const lib_mod = b.addModule("zenith", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -81,6 +103,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "error", .module = error_mod },
             .{ .name = "debug", .module = debug_mod },
             .{ .name = "lexer", .module = lexer_mod },
+            .{ .name = "ast", .module = ast_mod },
+            .{ .name = "parser", .module = parser_mod },
         },
     });
 
@@ -130,6 +154,8 @@ pub fn build(b: *std.Build) void {
         error_mod,
         debug_mod,
         lexer_mod,
+        ast_mod,
+        parser_mod,
     };
 
     for (test_modules) |mod| {
