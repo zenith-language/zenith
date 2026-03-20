@@ -233,6 +233,10 @@ pub const Value = struct {
                     const big = ObjInt.fromObj(obj_ptr);
                     try writer.print("{d}", .{big.value});
                 },
+                .range => {
+                    const r = obj_mod.ObjRange.fromObj(obj_ptr);
+                    try writer.print("range({d}, {d}, {d})", .{ r.start, r.end, r.step });
+                },
             }
         } else {
             try writer.writeAll("<unknown>");

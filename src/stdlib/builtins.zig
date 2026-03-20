@@ -83,6 +83,10 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
                 const big = obj_mod.ObjInt.fromObj(obj_ptr);
                 try writer.print("{d}", .{big.value});
             },
+            .range => {
+                const r = obj_mod.ObjRange.fromObj(obj_ptr);
+                try writer.print("range({d}, {d}, {d})", .{ r.start, r.end, r.step });
+            },
         }
     } else {
         try writer.writeAll("<unknown>");
@@ -139,6 +143,7 @@ fn builtinTypeOf(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     if (val.isString()) return Value.fromAtom(4); // :string
     if (val.isObjType(.bytes)) return Value.fromAtom(5); // :bytes
     if (val.isAtom()) return Value.fromAtom(6); // :atom
+    if (val.isObjType(.range)) return Value.fromAtom(7); // :range
     return Value.fromAtom(3); // fallback: nil
 }
 
@@ -167,50 +172,25 @@ fn builtinPanic(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
 }
 
 /// range(n) or range(start, end) or range(start, end, step).
-/// Returns an integer encoding of the range parameters for for-in loops.
-/// In Phase 1, we store range as 3 values on the stack via a special encoding:
-/// We use an ObjString with a special marker for now, but the cleaner approach
-/// is to return a specially-tagged value the VM knows how to iterate.
-///
-/// For Phase 1 simplicity: range returns a "range descriptor" encoded as
-/// three consecutive ints pushed by the VM when it sees the call to range.
-/// Actually, the simplest approach: return a Value that encodes the range.
-/// Since we don't have custom object types yet, we'll use atoms + the VM
-/// will handle range iteration specially.
-///
-/// Even simpler: range() returns an atom :range, and the actual start/end/step
-/// are passed as arguments that the VM captures during the call. The VM's
-/// for-in loop handler knows to check if the iterable came from range().
-///
-/// SIMPLEST for Phase 1: We encode range parameters into the constant pool
-/// or use a simple approach where range returns a special "range value" that
-/// the VM interprets. Let's use 3 ints packed: we create an ObjRange.
-///
-/// Actually: the simplest correct approach is that range() creates and returns
-/// an object that for-in can iterate. For Phase 1 let's just store the range
-/// params as a sentinel. The VM handles range-based for-in directly.
-///
-/// For now: range() will return a nil value, and the compiler/VM will handle
-/// range-based for-in loops via op_for_iter directly. range() is a recognized
-/// builtin pattern at compile time.
+/// Returns a heap-allocated ObjRange that the VM's op_for_iter can iterate.
 fn builtinRange(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
-    _ = allocator;
-    // Validate range arguments: range(end), range(start, end), range(start, end, step).
-    // For Phase 1: return nil. Range-based for-in is not fully wired up
-    // via builtin calls yet. This builtin validates args and exists for
-    // completeness; actual iteration happens via op_for_iter in the VM.
+    const ObjRange = obj_mod.ObjRange;
     switch (args.len) {
         1 => {
             if (!args[0].isInt()) {
                 err_msg.* = "range() expects integer arguments";
                 return error.RuntimeError;
             }
+            const r = try ObjRange.create(allocator, 0, args[0].asInt(), 1);
+            return Value.fromObj(&r.obj);
         },
         2 => {
             if (!args[0].isInt() or !args[1].isInt()) {
                 err_msg.* = "range() expects integer arguments";
                 return error.RuntimeError;
             }
+            const r = try ObjRange.create(allocator, args[0].asInt(), args[1].asInt(), 1);
+            return Value.fromObj(&r.obj);
         },
         3 => {
             if (!args[0].isInt() or !args[1].isInt() or !args[2].isInt()) {
@@ -221,13 +201,14 @@ fn builtinRange(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
                 err_msg.* = "range() step cannot be zero";
                 return error.RuntimeError;
             }
+            const r = try ObjRange.create(allocator, args[0].asInt(), args[1].asInt(), args[2].asInt());
+            return Value.fromObj(&r.obj);
         },
         else => {
             err_msg.* = "range() takes 1 to 3 arguments";
             return error.RuntimeError;
         },
     }
-    return Value.nil;
 }
 
 /// show(value) -- like print but returns the value (for debugging).
@@ -386,12 +367,49 @@ test "builtins: range with invalid args" {
     try std.testing.expectError(error.RuntimeError, result);
 }
 
-test "builtins: range with valid single arg" {
+test "builtins: range with step zero" {
     const allocator = std.testing.allocator;
     var err_msg: []const u8 = "";
-    const result = try builtinRange(&[_]Value{Value.fromInt(10)}, allocator, &err_msg);
-    // For Phase 1, range returns nil (iteration handled by VM)
-    try std.testing.expect(result.isNil());
+    const result = builtinRange(&[_]Value{ Value.fromInt(0), Value.fromInt(10), Value.fromInt(0) }, allocator, &err_msg);
+    try std.testing.expectError(error.RuntimeError, result);
+    try std.testing.expectEqualStrings("range() step cannot be zero", err_msg);
+}
+
+test "builtins: range(n) returns ObjRange(0, n, 1)" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const result = try builtinRange(&[_]Value{Value.fromInt(5)}, allocator, &err_msg);
+    try std.testing.expect(result.isObj());
+    try std.testing.expect(result.isObjType(.range));
+    const r = obj_mod.ObjRange.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(i32, 0), r.start);
+    try std.testing.expectEqual(@as(i32, 5), r.end);
+    try std.testing.expectEqual(@as(i32, 1), r.step);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: range(start, end) returns ObjRange(start, end, 1)" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const result = try builtinRange(&[_]Value{ Value.fromInt(2), Value.fromInt(5) }, allocator, &err_msg);
+    try std.testing.expect(result.isObjType(.range));
+    const r = obj_mod.ObjRange.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(i32, 2), r.start);
+    try std.testing.expectEqual(@as(i32, 5), r.end);
+    try std.testing.expectEqual(@as(i32, 1), r.step);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: range(start, end, step) returns ObjRange" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const result = try builtinRange(&[_]Value{ Value.fromInt(0), Value.fromInt(10), Value.fromInt(2) }, allocator, &err_msg);
+    try std.testing.expect(result.isObjType(.range));
+    const r = obj_mod.ObjRange.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(i32, 0), r.start);
+    try std.testing.expectEqual(@as(i32, 10), r.end);
+    try std.testing.expectEqual(@as(i32, 2), r.step);
+    result.asObj().destroy(allocator);
 }
 
 test "builtins: formatValue for various types" {

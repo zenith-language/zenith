@@ -6,6 +6,7 @@ pub const ObjType = enum(u8) {
     string,
     bytes,
     int_big,
+    range,
 };
 
 /// Common header for all heap-allocated objects.
@@ -32,6 +33,10 @@ pub const Obj = struct {
             .int_big => {
                 const big = ObjInt.fromObj(self);
                 allocator.destroy(big);
+            },
+            .range => {
+                const r = ObjRange.fromObj(self);
+                allocator.destroy(r);
             },
         }
     }
@@ -116,7 +121,60 @@ pub const ObjInt = struct {
     }
 };
 
+/// Heap-allocated range descriptor for for-in iteration.
+pub const ObjRange = struct {
+    obj: Obj,
+    start: i32,
+    end: i32,
+    step: i32,
+
+    pub fn create(allocator: Allocator, start: i32, end_val: i32, step: i32) !*ObjRange {
+        const r = try allocator.create(ObjRange);
+        r.* = .{
+            .obj = .{ .obj_type = .range },
+            .start = start,
+            .end = end_val,
+            .step = step,
+        };
+        return r;
+    }
+
+    pub fn fromObj(o: *Obj) *ObjRange {
+        return @fieldParentPtr("obj", o);
+    }
+};
+
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "ObjRange create and destroy round-trip" {
+    const allocator = std.testing.allocator;
+    const r = try ObjRange.create(allocator, 0, 5, 1);
+    defer r.obj.destroy(allocator);
+
+    try std.testing.expectEqual(@as(i32, 0), r.start);
+    try std.testing.expectEqual(@as(i32, 5), r.end);
+    try std.testing.expectEqual(@as(i32, 1), r.step);
+    try std.testing.expectEqual(ObjType.range, r.obj.obj_type);
+}
+
+test "ObjRange fromObj recovers original fields" {
+    const allocator = std.testing.allocator;
+    const r = try ObjRange.create(allocator, 2, 10, 3);
+    defer r.obj.destroy(allocator);
+
+    const obj_ptr: *Obj = &r.obj;
+    const recovered = ObjRange.fromObj(obj_ptr);
+    try std.testing.expectEqual(@as(i32, 2), recovered.start);
+    try std.testing.expectEqual(@as(i32, 10), recovered.end);
+    try std.testing.expectEqual(@as(i32, 3), recovered.step);
+}
+
+test "ObjRange destroy frees memory (testing allocator)" {
+    const allocator = std.testing.allocator;
+    const r = try ObjRange.create(allocator, 0, 100, 1);
+    // Destroy via Obj.destroy -- testing allocator will catch leaks.
+    r.obj.destroy(allocator);
+}
 
 test "ObjString create and destroy round-trip" {
     const allocator = std.testing.allocator;

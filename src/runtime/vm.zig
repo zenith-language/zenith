@@ -1224,8 +1224,12 @@ test "vm: range builtin" {
     var vm = VM.init(&tc.chunk, allocator);
     defer vm.deinit();
     const result = try vm.run();
-    // Phase 1: range returns nil, iteration handled by VM directly
-    try std.testing.expect(result.isNil());
+    // range() now returns an ObjRange value
+    try std.testing.expect(result.isObjType(.range));
+    const r = obj_mod.ObjRange.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(i32, 0), r.start);
+    try std.testing.expectEqual(@as(i32, 10), r.end);
+    try std.testing.expectEqual(@as(i32, 1), r.step);
 }
 
 // Test 23: len builtin returns string length
