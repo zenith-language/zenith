@@ -135,8 +135,9 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     const atom_names = try buildAtomNames(&compile_result, allocator);
     defer allocator.free(atom_names);
 
-    // 4. Execute
-    var vm = VM.init(&compile_result.chunk, allocator);
+    // 4. Execute -- extract chunk from top-level closure.
+    const top_chunk = &compile_result.closure.function.chunk;
+    var vm = VM.initForScript(top_chunk, allocator);
     try vm.setAtomNames(atom_names, allocator);
 
     _ = vm.run() catch {
@@ -268,17 +269,18 @@ fn compileToFile(file_path: []const u8, allocator: std.mem.Allocator) !void {
     defer allocator.free(atom_names);
 
     // Store atom names in chunk for serialization.
+    const top_chunk = &compile_result.closure.function.chunk;
     for (atom_names) |name| {
-        try compile_result.chunk.atom_names.append(allocator, name);
+        try top_chunk.atom_names.append(allocator, name);
     }
 
     // Set the source file name on the chunk.
-    compile_result.chunk.name = file_path;
+    top_chunk.name = file_path;
 
     // 4. Serialize to in-memory buffer, then write to file.
     var out_buf = std.ArrayListUnmanaged(u8){};
     defer out_buf.deinit(allocator);
-    compile_result.chunk.serialize(out_buf.writer(allocator)) catch |err| {
+    top_chunk.serialize(out_buf.writer(allocator)) catch |err| {
         writeStderr("error: cannot serialize bytecode: ");
         writeStderr(@errorName(err));
         writeStderr("\n");

@@ -65,6 +65,15 @@ pub const VM = struct {
         };
     }
 
+    /// Initialize VM and push a placeholder for slot 0 (script function).
+    /// Used by the pipeline when running compiler output.
+    pub fn initForScript(chunk: *const Chunk, allocator: Allocator) VM {
+        var vm = init(chunk, allocator);
+        vm.stack[0] = Value.nil;
+        vm.stack_top = 1;
+        return vm;
+    }
+
     /// Free VM resources.
     pub fn deinit(self: *VM) void {
         // Free allocated objects.

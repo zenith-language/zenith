@@ -113,8 +113,9 @@ fn runPipeline(source: []const u8, file_name: []const u8, allocator: std.mem.All
     const atom_names = try buildAtomNames(&compile_result, allocator);
     defer allocator.free(atom_names);
 
-    // 4. Execute
-    var vm = VM.init(&compile_result.chunk, allocator);
+    // 4. Execute -- extract chunk from the top-level closure.
+    const top_chunk = &compile_result.closure.function.chunk;
+    var vm = VM.initForScript(top_chunk, allocator);
     try vm.setAtomNames(atom_names, allocator);
     vm.output_buf = &output_buf;
 
@@ -321,15 +322,16 @@ test "e2e: bytecode roundtrip for arithmetic" {
     const atom_names = try buildAtomNames(&compile_result, allocator);
     defer allocator.free(atom_names);
 
+    const top_chunk2 = &compile_result.closure.function.chunk;
     for (atom_names) |name| {
-        try compile_result.chunk.atom_names.append(allocator, name);
+        try top_chunk2.atom_names.append(allocator, name);
     }
-    compile_result.chunk.name = "test.zen";
+    top_chunk2.name = "test.zen";
 
     // Serialize
     var ser_buf = std.ArrayListUnmanaged(u8){};
     defer ser_buf.deinit(allocator);
-    try compile_result.chunk.serialize(ser_buf.writer(allocator));
+    try top_chunk2.serialize(ser_buf.writer(allocator));
 
     // Deserialize
     var stream = std.io.fixedBufferStream(ser_buf.items);

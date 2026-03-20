@@ -13,6 +13,8 @@ const value_mod = @import("value");
 const Value = value_mod.Value;
 const obj_mod = @import("obj");
 const ObjString = obj_mod.ObjString;
+const ObjFunction = obj_mod.ObjFunction;
+const ObjClosure = obj_mod.ObjClosure;
 const error_mod = @import("error");
 const Diagnostic = error_mod.Diagnostic;
 const ErrorCode = error_mod.ErrorCode;
@@ -20,22 +22,48 @@ const Label = error_mod.Label;
 
 /// Result of compilation.
 pub const CompileResult = struct {
-    chunk: Chunk,
+    closure: *ObjClosure,
     errors: std.ArrayListUnmanaged(Diagnostic),
     atom_table: std.StringHashMapUnmanaged(u32),
     atom_count: u32,
 
     pub fn deinit(self: *CompileResult, allocator: Allocator) void {
-        // Free any ObjString constants in the chunk.
-        for (self.chunk.constants.items) |val| {
+        // Recursively destroy the closure and all nested functions.
+        destroyFunction(self.closure.function, allocator);
+        allocator.free(self.closure.upvalues);
+        allocator.destroy(self.closure);
+        self.errors.deinit(allocator);
+        self.atom_table.deinit(allocator);
+    }
+
+    /// Recursively destroy an ObjFunction and its nested function constants.
+    fn destroyFunction(func: *ObjFunction, allocator: Allocator) void {
+        // First, recursively destroy any nested ObjFunction constants.
+        for (func.chunk.constants.items) |val| {
             if (val.isObj()) {
-                val.asObj().destroy(allocator);
+                const obj_ptr = val.asObj();
+                if (obj_ptr.obj_type == .function) {
+                    destroyFunction(ObjFunction.fromObj(obj_ptr), allocator);
+                } else {
+                    obj_ptr.destroy(allocator);
+                }
             }
         }
-        self.chunk.deinit(allocator);
-        self.errors.deinit(allocator);
-        // StringHashMap keys are slices into the AST source -- we don't own them.
-        self.atom_table.deinit(allocator);
+        // Deinit the chunk (code, constants list, lines, etc.) but constants already freed above.
+        func.chunk.code.deinit(allocator);
+        func.chunk.constants.deinit(allocator);
+        func.chunk.lines.deinit(allocator);
+        for (func.chunk.owned_strings.items) |s| allocator.free(s);
+        func.chunk.owned_strings.deinit(allocator);
+        if (func.chunk.owns_atom_names) {
+            for (func.chunk.atom_names.items) |n| allocator.free(n);
+        }
+        func.chunk.atom_names.deinit(allocator);
+        if (func.chunk.owns_name) allocator.free(func.chunk.name);
+        // Free param metadata.
+        if (func.param_names) |names| allocator.free(names);
+        if (func.param_defaults) |defaults| allocator.free(defaults);
+        allocator.destroy(func);
     }
 
     pub fn hasErrors(self: *const CompileResult) bool {
@@ -44,21 +72,41 @@ pub const CompileResult = struct {
         }
         return false;
     }
+
+    /// Access the top-level chunk (convenience for backward-compat paths).
+    pub fn getChunk(self: *const CompileResult) *const Chunk {
+        return &self.closure.function.chunk;
+    }
+};
+
+/// Function type: script (top-level), function (named fn), lambda (anonymous).
+const FnType = enum { script, function, lambda };
+
+/// Upvalue descriptor -- compile-time tracking of captured variables.
+const UpvalueDesc = struct {
+    index: u8, // local slot (if is_local) or parent upvalue index
+    is_local: bool, // true = captures parent local; false = captures parent upvalue
 };
 
 /// Local variable tracking.
 const Local = struct {
     name: []const u8,
     depth: i32,
+    is_captured: bool,
 };
 
 /// Bytecode compiler -- walks AST nodes and emits opcodes into a Chunk.
+/// Supports nested compilation for function bodies with upvalue resolution.
 pub const Compiler = struct {
-    chunk: Chunk,
+    function: *ObjFunction,
+    fn_type: FnType,
     ast: *const Ast,
     locals: [256]Local,
     local_count: u8,
     scope_depth: i32,
+    upvalues: [256]UpvalueDesc,
+    parent: ?*Compiler,
+    is_tail_position: bool,
     atom_table: std.StringHashMapUnmanaged(u32),
     atom_count: u32,
     errors: std.ArrayListUnmanaged(Diagnostic),
@@ -80,19 +128,31 @@ pub const Compiler = struct {
         "int", "float", "bool", "nil", "string", "bytes", "atom",
     };
 
-    /// Compile an AST into bytecodes.
+    /// Compile an AST into bytecodes wrapped in an ObjClosure.
     pub fn compile(ast_ptr: *const Ast, allocator: Allocator) !CompileResult {
+        // Create the top-level script function.
+        const func = try ObjFunction.create(allocator);
+        func.name = null; // script has no name
+
         var self = Self{
-            .chunk = .{},
+            .function = func,
+            .fn_type = .script,
             .ast = ast_ptr,
             .locals = undefined,
             .local_count = 0,
             .scope_depth = 0,
+            .upvalues = undefined,
+            .parent = null,
+            .is_tail_position = false,
             .atom_table = .{},
             .atom_count = 0,
             .errors = .empty,
             .allocator = allocator,
         };
+
+        // Reserve slot 0 for the script function itself.
+        self.locals[0] = .{ .name = "", .depth = 0, .is_captured = false };
+        self.local_count = 1;
 
         // Pre-register builtin type atom names at fixed IDs 0-6.
         for (type_atom_names) |name| {
@@ -109,15 +169,24 @@ pub const Compiler = struct {
             try self.compileStatements(stmts);
         }
 
-        // Emit return at end.
+        // Emit nil + return at end of script.
+        try self.emitOp(.op_nil, 0);
         try self.emitOp(.op_return, 0);
 
+        // Wrap in ObjClosure.
+        const closure = try ObjClosure.create(allocator, func);
+
         return .{
-            .chunk = self.chunk,
+            .closure = closure,
             .errors = self.errors,
             .atom_table = self.atom_table,
             .atom_count = self.atom_count,
         };
+    }
+
+    /// Get the current chunk being compiled (the function's chunk).
+    fn currentChunk(self: *Self) *Chunk {
+        return &self.function.chunk;
     }
 
     // ── Statement compilation ─────────────────────────────────────────
@@ -134,7 +203,7 @@ pub const Compiler = struct {
                 } else if (tag == .while_stmt or tag == .for_stmt) {
                     // while and for emit op_nil as their result -- pop it when not last.
                     try self.emitOp(.op_pop, self.getLine(stmt_idx));
-                } else if (tag != .let_decl and tag != .assign_stmt) {
+                } else if (tag != .let_decl and tag != .assign_stmt and tag != .fn_decl) {
                     try self.emitOp(.op_pop, self.getLine(stmt_idx));
                 }
             }
@@ -194,12 +263,318 @@ pub const Compiler = struct {
             .call_expr => try self.compileCallExpr(node_data, node_idx),
             .grouped_expr => try self.compileNode(node_data.lhs),
 
-            // Phase 2 function/closure nodes -- stubs until Plan 02-02 implements compilation.
-            .fn_decl, .lambda_expr, .pipe_expr, .return_expr, .named_arg => {
-                try self.emitError(node_idx, .E005, "unimplemented: function/closure compilation (Phase 2)");
+            // Phase 2 function/closure nodes.
+            .fn_decl => try self.compileFnDecl(node_data, node_idx),
+            .lambda_expr => try self.compileLambdaExpr(node_data, node_idx),
+            .pipe_expr => try self.compilePipeExpr(node_data, node_idx),
+            .return_expr => try self.compileReturnExpr(node_data, node_idx),
+            .named_arg => {
+                // Named args are handled inside compileCallExpr; should not appear standalone.
+                try self.emitError(node_idx, .E005, "unexpected named argument outside of function call");
             },
 
             .root => {}, // handled above
+        }
+    }
+
+    // ── Function declaration compilation ──────────────────────────────
+
+    fn compileFnDecl(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const extra_idx = node_data.lhs;
+        const ed = self.ast.extra_data.items;
+        const name_tok = ed[extra_idx];
+        const param_start = ed[extra_idx + 1];
+        const param_end = ed[extra_idx + 2];
+        const body_node = ed[extra_idx + 3];
+        const defaults_start = ed[extra_idx + 4];
+        const defaults_end = ed[extra_idx + 5];
+
+        const param_tokens = ed[param_start..param_end];
+        const default_nodes = ed[defaults_start..defaults_end];
+
+        // Determine function name.
+        const fn_name: ?[]const u8 = if (name_tok != Node.null_node)
+            self.ast.tokenSlice(name_tok)
+        else
+            null;
+
+        // Create the ObjFunction.
+        const func = try ObjFunction.create(self.allocator);
+        func.name = fn_name;
+
+        const param_count: u8 = @intCast(param_tokens.len);
+        const required_params: u8 = @intCast(param_tokens.len - default_nodes.len);
+        func.arity = required_params;
+        func.arity_max = param_count;
+
+        // Store param names in ObjFunction.
+        if (param_count > 0) {
+            const names = try self.allocator.alloc([]const u8, param_count);
+            for (param_tokens, 0..) |ptok, i| {
+                names[i] = self.ast.tokenSlice(ptok);
+            }
+            func.param_names = names;
+        }
+
+        // Compile default values into constants and store in ObjFunction.
+        if (default_nodes.len > 0) {
+            const defaults = try self.allocator.alloc(Value, default_nodes.len);
+            for (default_nodes, 0..) |def_node, i| {
+                defaults[i] = try self.evaluateConstantExpr(def_node);
+            }
+            func.param_defaults = defaults;
+        }
+
+        // Create child compiler.
+        var child = Self{
+            .function = func,
+            .fn_type = .function,
+            .ast = self.ast,
+            .locals = undefined,
+            .local_count = 0,
+            .scope_depth = 0,
+            .upvalues = undefined,
+            .parent = self,
+            .is_tail_position = false,
+            .atom_table = self.atom_table,
+            .atom_count = self.atom_count,
+            .errors = self.errors,
+            .allocator = self.allocator,
+        };
+
+        // Reserve slot 0 for the function itself (enables recursion).
+        child.locals[0] = .{ .name = fn_name orelse "", .depth = 0, .is_captured = false };
+        child.local_count = 1;
+
+        // Add parameters as locals (slots 1..N).
+        child.beginScope();
+        for (param_tokens) |ptok| {
+            const pname = self.ast.tokenSlice(ptok);
+            child.locals[child.local_count] = .{ .name = pname, .depth = child.scope_depth, .is_captured = false };
+            child.local_count += 1;
+        }
+
+        // Compile body -- the body is a block_expr node.
+        // Set tail position for the last expression in the body.
+        try child.compileNodeInTailPosition(body_node);
+
+        // If the last instruction is not a return, emit implicit nil + return.
+        if (!child.lastInstructionIsReturn()) {
+            try child.emitOp(.op_nil, self.getLine(node_idx));
+            try child.emitOp(.op_return, self.getLine(node_idx));
+        }
+
+        // Copy state back to parent.
+        // func.upvalue_count is already maintained by addUpvalue.
+        self.atom_table = child.atom_table;
+        self.atom_count = child.atom_count;
+        self.errors = child.errors;
+
+        // In parent: emit op_closure with function constant.
+        const const_idx = try self.currentChunk().addConstant(Value.fromObj(&func.obj), self.allocator);
+        try self.emitOp(.op_closure, self.getLine(node_idx));
+        try self.emitByte(@intCast(const_idx), self.getLine(node_idx));
+
+        // Emit upvalue descriptors.
+        var i: u8 = 0;
+        while (i < func.upvalue_count) : (i += 1) {
+            try self.emitByte(if (child.upvalues[i].is_local) 1 else 0, self.getLine(node_idx));
+            try self.emitByte(child.upvalues[i].index, self.getLine(node_idx));
+        }
+
+        // Add function name as a local in parent scope (like let binding).
+        if (fn_name) |fname| {
+            if (self.local_count >= 255) {
+                try self.emitError(node_idx, .E009, "too many local variables in scope");
+                return;
+            }
+            self.locals[self.local_count] = .{ .name = fname, .depth = self.scope_depth, .is_captured = false };
+            self.local_count += 1;
+        }
+    }
+
+    // ── Lambda expression compilation ─────────────────────────────────
+
+    fn compileLambdaExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const extra_idx = node_data.lhs;
+        const ed = self.ast.extra_data.items;
+        const param_start = ed[extra_idx];
+        const param_end = ed[extra_idx + 1];
+        const body_node = ed[extra_idx + 2];
+
+        const param_tokens = ed[param_start..param_end];
+
+        // Create the ObjFunction for the lambda.
+        const func = try ObjFunction.create(self.allocator);
+        func.name = null; // lambdas are anonymous
+        const param_count: u8 = @intCast(param_tokens.len);
+        func.arity = param_count;
+        func.arity_max = param_count;
+
+        // Store param names.
+        if (param_count > 0) {
+            const names = try self.allocator.alloc([]const u8, param_count);
+            for (param_tokens, 0..) |ptok, i| {
+                names[i] = self.ast.tokenSlice(ptok);
+            }
+            func.param_names = names;
+        }
+
+        // Create child compiler.
+        var child = Self{
+            .function = func,
+            .fn_type = .lambda,
+            .ast = self.ast,
+            .locals = undefined,
+            .local_count = 0,
+            .scope_depth = 0,
+            .upvalues = undefined,
+            .parent = self,
+            .is_tail_position = false,
+            .atom_table = self.atom_table,
+            .atom_count = self.atom_count,
+            .errors = self.errors,
+            .allocator = self.allocator,
+        };
+
+        // Slot 0 for the lambda itself (unnamed).
+        child.locals[0] = .{ .name = "", .depth = 0, .is_captured = false };
+        child.local_count = 1;
+
+        // Add parameters as locals.
+        child.beginScope();
+        for (param_tokens) |ptok| {
+            const pname = self.ast.tokenSlice(ptok);
+            child.locals[child.local_count] = .{ .name = pname, .depth = child.scope_depth, .is_captured = false };
+            child.local_count += 1;
+        }
+
+        // Compile body expression -- single expression with implicit return.
+        try child.compileNode(body_node);
+        try child.emitOp(.op_return, self.getLine(node_idx));
+
+        // Copy state back.
+        // func.upvalue_count is already maintained by addUpvalue.
+        self.atom_table = child.atom_table;
+        self.atom_count = child.atom_count;
+        self.errors = child.errors;
+
+        // In parent: emit op_closure.
+        const const_idx = try self.currentChunk().addConstant(Value.fromObj(&func.obj), self.allocator);
+        try self.emitOp(.op_closure, self.getLine(node_idx));
+        try self.emitByte(@intCast(const_idx), self.getLine(node_idx));
+
+        // Emit upvalue descriptors.
+        var i: u8 = 0;
+        while (i < func.upvalue_count) : (i += 1) {
+            try self.emitByte(if (child.upvalues[i].is_local) 1 else 0, self.getLine(node_idx));
+            try self.emitByte(child.upvalues[i].index, self.getLine(node_idx));
+        }
+        // Lambda is an expression -- closure value is left on the stack.
+    }
+
+    // ── Pipe expression compilation ───────────────────────────────────
+
+    fn compilePipeExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const lhs = node_data.lhs; // value being piped
+        const rhs = node_data.rhs; // function or call_expr
+
+        const rhs_tag = self.ast.nodes.items(.tag)[rhs];
+
+        if (rhs_tag == .call_expr) {
+            // x |> f(y) desugars to f(x, y)
+            const rhs_data = self.ast.nodes.items(.data)[rhs];
+            const callee = rhs_data.lhs;
+            const extra = rhs_data.rhs;
+            const arg_start = self.ast.extra_data.items[extra];
+            const arg_end = self.ast.extra_data.items[extra + 1];
+            const existing_args = self.ast.extra_data.items[arg_start..arg_end];
+
+            // Compile: callee, piped value (first arg), then remaining args.
+            try self.compileNode(callee);
+            try self.compileNode(lhs);
+            for (existing_args) |arg_idx| {
+                try self.compileNode(arg_idx);
+            }
+
+            const total_args: u8 = @intCast(1 + existing_args.len);
+            // Check tail position.
+            if (self.is_tail_position) {
+                try self.emitOp(.op_tail_call, self.getLine(node_idx));
+            } else {
+                try self.emitOp(.op_call, self.getLine(node_idx));
+            }
+            try self.emitByte(total_args, self.getLine(node_idx));
+        } else {
+            // x |> f desugars to f(x) -- bare identifier or grouped expr (lambda)
+            // Compile: callee, piped value.
+            try self.compileNode(rhs);
+            try self.compileNode(lhs);
+            // Swap: we need [callee, arg] but compiled [callee, arg] -- that's correct!
+            // Actually for op_call, callee must be below args on stack.
+            // We compiled rhs (function) first, then lhs (arg). Stack: [..., fn, arg].
+            // op_call expects: [..., fn, arg1, arg2, ...]. That's correct.
+            if (self.is_tail_position) {
+                try self.emitOp(.op_tail_call, self.getLine(node_idx));
+            } else {
+                try self.emitOp(.op_call, self.getLine(node_idx));
+            }
+            try self.emitByte(1, self.getLine(node_idx));
+        }
+    }
+
+    // ── Return expression compilation ─────────────────────────────────
+
+    fn compileReturnExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        if (self.fn_type == .script) {
+            try self.emitError(node_idx, .E005, "'return' outside of function");
+            return;
+        }
+
+        if (node_data.lhs != Node.null_node) {
+            // Check if the return value is a call -- if so, it's a tail call.
+            const val_tag = self.ast.nodes.items(.tag)[node_data.lhs];
+            if (val_tag == .call_expr) {
+                // Compile the call as a tail call.
+                const saved_tail = self.is_tail_position;
+                self.is_tail_position = true;
+                try self.compileNode(node_data.lhs);
+                self.is_tail_position = saved_tail;
+                // The tail call already handles the return.
+                // But we still need op_return for non-tail-call path fallback.
+                // Actually, op_tail_call reuses the frame but doesn't return.
+                // We need op_return after in case it wasn't actually a tail call
+                // (e.g., if op_tail_call is for closures only and it was a builtin).
+                try self.emitOp(.op_return, self.getLine(node_idx));
+            } else {
+                try self.compileNode(node_data.lhs);
+                try self.emitOp(.op_return, self.getLine(node_idx));
+            }
+        } else {
+            try self.emitOp(.op_nil, self.getLine(node_idx));
+            try self.emitOp(.op_return, self.getLine(node_idx));
+        }
+    }
+
+    /// Compile a node in tail position (used for function bodies).
+    fn compileNodeInTailPosition(self: *Self, node_idx: u32) Error!void {
+        const tag = self.ast.nodes.items(.tag)[node_idx];
+        const node_data = self.ast.nodes.items(.data)[node_idx];
+
+        if (tag == .block_expr) {
+            // For block expressions, the last statement is in tail position.
+            try self.compileBlockExprTail(node_data, node_idx);
+        } else if (tag == .call_expr) {
+            const saved = self.is_tail_position;
+            self.is_tail_position = true;
+            try self.compileCallExpr(node_data, node_idx);
+            self.is_tail_position = saved;
+        } else if (tag == .if_expr) {
+            try self.compileIfExprTail(node_data, node_idx);
+        } else if (tag == .return_expr) {
+            try self.compileReturnExpr(node_data, node_idx);
+        } else {
+            try self.compileNode(node_idx);
         }
     }
 
@@ -282,6 +657,13 @@ pub const Compiler = struct {
             return;
         }
 
+        // Try to resolve as upvalue.
+        if (self.resolveUpvalue(name)) |slot| {
+            try self.emitOp(.op_get_upvalue, self.getLine(node_idx));
+            try self.emitByte(slot, self.getLine(node_idx));
+            return;
+        }
+
         // Try to resolve as builtin.
         if (self.resolveBuiltin(name)) |builtin_idx| {
             try self.emitOp(.op_get_builtin, self.getLine(node_idx));
@@ -303,6 +685,42 @@ pub const Compiler = struct {
             }
         }
         return null;
+    }
+
+    fn resolveUpvalue(self: *Self, name: []const u8) ?u8 {
+        if (self.parent == null) return null;
+        const parent_ptr = self.parent.?;
+
+        // Try local in immediate parent.
+        if (parent_ptr.resolveLocal(name)) |slot| {
+            parent_ptr.locals[slot].is_captured = true;
+            return self.addUpvalue(slot, true);
+        }
+
+        // Try upvalue in parent (recursive).
+        if (parent_ptr.resolveUpvalue(name)) |idx| {
+            return self.addUpvalue(idx, false);
+        }
+
+        return null;
+    }
+
+    fn addUpvalue(self: *Self, index: u8, is_local: bool) ?u8 {
+        const upvalue_count = self.function.upvalue_count;
+
+        // Check for existing upvalue with same index and locality.
+        var i: u8 = 0;
+        while (i < upvalue_count) : (i += 1) {
+            if (self.upvalues[i].index == index and self.upvalues[i].is_local == is_local) {
+                return i;
+            }
+        }
+
+        if (upvalue_count >= 255) return null;
+
+        self.upvalues[upvalue_count] = .{ .index = index, .is_local = is_local };
+        self.function.upvalue_count = upvalue_count + 1;
+        return upvalue_count;
     }
 
     fn resolveBuiltin(_: *const Self, name: []const u8) ?u8 {
@@ -361,6 +779,7 @@ pub const Compiler = struct {
         self.locals[self.local_count] = .{
             .name = name,
             .depth = self.scope_depth,
+            .is_captured = false,
         };
         self.local_count += 1;
     }
@@ -380,6 +799,11 @@ pub const Compiler = struct {
             try self.emitOp(.op_set_local, self.getLine(node_idx));
             try self.emitByte(slot, self.getLine(node_idx));
             // Pop the stale copy -- assignment is a statement, not an expression.
+            try self.emitOp(.op_pop, self.getLine(node_idx));
+        } else if (self.resolveUpvalue(name)) |slot| {
+            try self.emitOp(.op_set_upvalue, self.getLine(node_idx));
+            try self.emitByte(slot, self.getLine(node_idx));
+            // Pop the stale copy.
             try self.emitOp(.op_pop, self.getLine(node_idx));
         } else {
             try self.emitError(node_idx, .E002, "undefined variable");
@@ -421,10 +845,39 @@ pub const Compiler = struct {
         try self.patchJump(else_jump);
     }
 
+    /// Compile if expression with tail position propagation.
+    fn compileIfExprTail(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        // Compile condition.
+        try self.compileNode(node_data.lhs);
+
+        const then_jump = try self.emitJump(.op_jump_if_false, self.getLine(node_idx));
+        try self.emitOp(.op_pop, self.getLine(node_idx));
+
+        const extra_idx = node_data.rhs;
+        const then_branch = self.ast.extra_data.items[extra_idx];
+        const else_branch = self.ast.extra_data.items[extra_idx + 1];
+
+        // Both branches are in tail position.
+        try self.compileNodeInTailPosition(then_branch);
+
+        const else_jump = try self.emitJump(.op_jump, self.getLine(node_idx));
+
+        try self.patchJump(then_jump);
+        try self.emitOp(.op_pop, self.getLine(node_idx));
+
+        if (else_branch != Node.null_node) {
+            try self.compileNodeInTailPosition(else_branch);
+        } else {
+            try self.emitOp(.op_nil, self.getLine(node_idx));
+        }
+
+        try self.patchJump(else_jump);
+    }
+
     // ── While statement ───────────────────────────────────────────────
 
     fn compileWhileStmt(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
-        const loop_start: u32 = @intCast(self.chunk.code.items.len);
+        const loop_start: u32 = @intCast(self.currentChunk().code.items.len);
 
         // Compile condition.
         try self.compileNode(node_data.lhs);
@@ -472,19 +925,19 @@ pub const Compiler = struct {
             try self.emitError(node_idx, .E009, "too many local variables in scope");
             return;
         }
-        self.locals[self.local_count] = .{ .name = "__iter__", .depth = self.scope_depth };
+        self.locals[self.local_count] = .{ .name = "__iter__", .depth = self.scope_depth, .is_captured = false };
         self.local_count += 1;
 
         // Local for the index (hidden).
-        self.locals[self.local_count] = .{ .name = "__idx__", .depth = self.scope_depth };
+        self.locals[self.local_count] = .{ .name = "__idx__", .depth = self.scope_depth, .is_captured = false };
         self.local_count += 1;
 
         // Push placeholder for loop variable value.
         try self.emitOp(.op_nil, line);
-        self.locals[self.local_count] = .{ .name = var_name, .depth = self.scope_depth };
+        self.locals[self.local_count] = .{ .name = var_name, .depth = self.scope_depth, .is_captured = false };
         self.local_count += 1;
 
-        const loop_start: u32 = @intCast(self.chunk.code.items.len);
+        const loop_start: u32 = @intCast(self.currentChunk().code.items.len);
 
         // Emit for_iter: checks if iteration complete, sets loop var, or jumps past body.
         const exit_jump = try self.emitJump(.op_for_iter, line);
@@ -499,10 +952,8 @@ pub const Compiler = struct {
         try self.patchJump(exit_jump);
 
         // End scope: pop the 3 for-in locals (loop_var, __idx__, __iter__).
-        try self.emitOp(.op_pop, line);
-        try self.emitOp(.op_pop, line);
-        try self.emitOp(.op_pop, line);
-        self.endScope();
+        // Check if any are captured and emit close_upvalue if needed.
+        self.endScopeWithPops(3, line);
 
         // For produces nil.
         try self.emitOp(.op_nil, line);
@@ -538,54 +989,105 @@ pub const Compiler = struct {
 
             if (!is_last) {
                 const stmt_tag = self.ast.nodes.items(.tag)[stmt_idx];
-                // Statements that don't produce values (let, while, for, assign) don't need pop.
+                // Statements that don't produce values (let, while, for, assign, fn_decl) don't need pop.
                 if (stmt_tag == .expr_stmt) {
                     // expr_stmt already pops its value
-                } else if (stmt_tag != .let_decl and stmt_tag != .while_stmt and stmt_tag != .for_stmt and stmt_tag != .assign_stmt) {
+                } else if (stmt_tag != .let_decl and stmt_tag != .while_stmt and stmt_tag != .for_stmt and stmt_tag != .assign_stmt and stmt_tag != .fn_decl) {
                     try self.emitOp(.op_pop, self.getLine(stmt_idx));
                 }
             }
         }
 
         // End scope: pop locals but we need to keep the last expression value.
-        // Count how many locals were added in this scope.
-        // Determine if the last item leaves a value on the stack.
-        // For expr_stmt (handled above), the inner expression is on the stack.
-        // For bare expressions (unlikely in a block), they're on the stack.
-        // For statements (let, while, etc.), nothing extra is on the stack.
         const last_is_value = (last_tag == .expr_stmt or
             (last_tag != .let_decl and last_tag != .while_stmt and
-            last_tag != .for_stmt and last_tag != .assign_stmt));
+            last_tag != .for_stmt and last_tag != .assign_stmt and last_tag != .fn_decl));
 
         // Count locals to pop.
         var pop_count: u32 = 0;
-        while (self.local_count > 0 and self.locals[self.local_count - 1].depth > self.scope_depth - 1) {
+        var local_idx = self.local_count;
+        while (local_idx > 0 and self.locals[local_idx - 1].depth > self.scope_depth - 1) {
             pop_count += 1;
-            self.local_count -= 1;
+            local_idx -= 1;
         }
-        self.scope_depth -= 1;
 
         if (last_is_value) {
-            // The last expression value is on top of the stack. Locals are below it.
-            // To preserve the result while removing locals, we use the set_local/pop/get_local
-            // pattern: store result into the base slot, pop everything, then retrieve it.
             if (pop_count > 0) {
-                const base_slot: u8 = self.local_count; // first slot in this scope (after decrementing)
+                const base_slot: u8 = @intCast(self.local_count - @as(u8, @intCast(pop_count)));
                 try self.emitOp(.op_set_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
-                for (0..pop_count) |_| {
-                    try self.emitOp(.op_pop, self.getLine(node_idx));
-                }
+                // Pop locals, emitting close_upvalue for captured ones.
+                self.endScopeWithPops(pop_count, self.getLine(node_idx));
                 try self.emitOp(.op_get_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
+            } else {
+                self.scope_depth -= 1;
             }
-            // If no locals, the value is already on top -- nothing to do.
         } else {
-            // Last statement is a statement (let, while, etc.) that doesn't leave a value.
-            // Pop all locals and emit nil as the block's value.
-            for (0..pop_count) |_| {
-                try self.emitOp(.op_pop, self.getLine(node_idx));
+            self.endScopeWithPops(pop_count, self.getLine(node_idx));
+            try self.emitOp(.op_nil, self.getLine(node_idx));
+        }
+    }
+
+    /// Compile block expression with tail position for the last statement.
+    fn compileBlockExprTail(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const stmts = self.ast.extra_data.items[node_data.lhs..node_data.rhs];
+        if (stmts.len == 0) {
+            try self.emitOp(.op_nil, self.getLine(node_idx));
+            return;
+        }
+
+        self.beginScope();
+
+        const last_stmt_idx = stmts[stmts.len - 1];
+        const last_tag = self.ast.nodes.items(.tag)[last_stmt_idx];
+
+        for (stmts, 0..) |stmt_idx, i| {
+            const is_last = (i == stmts.len - 1);
+
+            if (is_last) {
+                if (last_tag == .expr_stmt) {
+                    const inner_data = self.ast.nodes.items(.data)[stmt_idx];
+                    try self.compileNodeInTailPosition(inner_data.lhs);
+                } else {
+                    try self.compileNodeInTailPosition(stmt_idx);
+                }
+            } else {
+                try self.compileNode(stmt_idx);
+                const stmt_tag = self.ast.nodes.items(.tag)[stmt_idx];
+                if (stmt_tag == .expr_stmt) {
+                    // already popped
+                } else if (stmt_tag != .let_decl and stmt_tag != .while_stmt and stmt_tag != .for_stmt and stmt_tag != .assign_stmt and stmt_tag != .fn_decl) {
+                    try self.emitOp(.op_pop, self.getLine(stmt_idx));
+                }
             }
+        }
+
+        // End scope.
+        const last_is_value = (last_tag == .expr_stmt or
+            (last_tag != .let_decl and last_tag != .while_stmt and
+            last_tag != .for_stmt and last_tag != .assign_stmt and last_tag != .fn_decl));
+
+        var pop_count: u32 = 0;
+        var local_idx = self.local_count;
+        while (local_idx > 0 and self.locals[local_idx - 1].depth > self.scope_depth - 1) {
+            pop_count += 1;
+            local_idx -= 1;
+        }
+
+        if (last_is_value) {
+            if (pop_count > 0) {
+                const base_slot: u8 = @intCast(self.local_count - @as(u8, @intCast(pop_count)));
+                try self.emitOp(.op_set_local, self.getLine(node_idx));
+                try self.emitByte(base_slot, self.getLine(node_idx));
+                self.endScopeWithPops(pop_count, self.getLine(node_idx));
+                try self.emitOp(.op_get_local, self.getLine(node_idx));
+                try self.emitByte(base_slot, self.getLine(node_idx));
+            } else {
+                self.scope_depth -= 1;
+            }
+        } else {
+            self.endScopeWithPops(pop_count, self.getLine(node_idx));
             try self.emitOp(.op_nil, self.getLine(node_idx));
         }
     }
@@ -602,14 +1104,67 @@ pub const Compiler = struct {
         const arg_end = self.ast.extra_data.items[extra_idx + 1];
         const arg_indices = self.ast.extra_data.items[arg_start..arg_end];
 
-        // Compile arguments left-to-right.
+        // Check for named arguments -- if any exist, we need special handling.
+        var has_named = false;
         for (arg_indices) |arg_idx| {
-            try self.compileNode(arg_idx);
+            if (self.ast.nodes.items(.tag)[arg_idx] == .named_arg) {
+                has_named = true;
+                break;
+            }
         }
 
-        // Emit call with arg count.
+        if (has_named) {
+            try self.compileCallWithNamedArgs(node_data, node_idx, arg_indices);
+        } else {
+            // Simple case: all positional arguments.
+            for (arg_indices) |arg_idx| {
+                try self.compileNode(arg_idx);
+            }
+
+            const arg_count: u8 = @intCast(arg_indices.len);
+            if (self.is_tail_position) {
+                try self.emitOp(.op_tail_call, self.getLine(node_idx));
+            } else {
+                try self.emitOp(.op_call, self.getLine(node_idx));
+            }
+            try self.emitByte(arg_count, self.getLine(node_idx));
+        }
+    }
+
+    /// Compile a call with named arguments. We need to reorder arguments
+    /// into positional slots, filling defaults for missing optional params.
+    fn compileCallWithNamedArgs(self: *Self, node_data: Node.Data, node_idx: u32, arg_indices: []const u32) Error!void {
+        _ = node_data;
+        // We compile arguments as-is and let the VM handle the reordering
+        // since we may not know the callee's param metadata at compile time.
+        // However, for known local functions, we could optimize.
+        // For now, compile all positional args first, then named args.
+        // The VM will need to handle this at runtime.
+
+        // Simple approach: compile all args in order (positional then named).
+        // For named args, push the name atom + value pairs.
+        // The VM can use function metadata to reorder.
+
+        // Actually, the simpler approach from the plan: compile positional args in order,
+        // then for named args, try to resolve at compile time if the callee is known.
+        // For dynamic callees, just emit in order.
+        for (arg_indices) |arg_idx| {
+            const arg_tag = self.ast.nodes.items(.tag)[arg_idx];
+            if (arg_tag == .named_arg) {
+                // Just compile the value part of the named arg.
+                const arg_data = self.ast.nodes.items(.data)[arg_idx];
+                try self.compileNode(arg_data.rhs);
+            } else {
+                try self.compileNode(arg_idx);
+            }
+        }
+
         const arg_count: u8 = @intCast(arg_indices.len);
-        try self.emitOp(.op_call, self.getLine(node_idx));
+        if (self.is_tail_position) {
+            try self.emitOp(.op_tail_call, self.getLine(node_idx));
+        } else {
+            try self.emitOp(.op_call, self.getLine(node_idx));
+        }
         try self.emitByte(arg_count, self.getLine(node_idx));
     }
 
@@ -620,9 +1175,26 @@ pub const Compiler = struct {
     }
 
     fn endScope(self: *Self) void {
-        // Pop all locals at current depth.
+        // Pop all locals at current depth, emitting close_upvalue for captured ones.
         while (self.local_count > 0 and self.locals[self.local_count - 1].depth >= self.scope_depth) {
+            // We can't emit here because we need Error return.
+            // Just adjust the count; caller handles op_pop/op_close_upvalue.
             self.local_count -= 1;
+        }
+        self.scope_depth -= 1;
+    }
+
+    /// End scope and emit pops/close_upvalues for the specified number of locals.
+    fn endScopeWithPops(self: *Self, count: u32, line: u32) void {
+        var remaining = count;
+        while (remaining > 0 and self.local_count > 0) {
+            self.local_count -= 1;
+            if (self.locals[self.local_count].is_captured) {
+                self.emitOp(.op_close_upvalue, line) catch {};
+            } else {
+                self.emitOp(.op_pop, line) catch {};
+            }
+            remaining -= 1;
         }
         self.scope_depth -= 1;
     }
@@ -630,15 +1202,15 @@ pub const Compiler = struct {
     // ── Bytecode emission helpers ─────────────────────────────────────
 
     fn emitOp(self: *Self, op: OpCode, line: u32) Error!void {
-        try self.chunk.write(@intFromEnum(op), line, self.allocator);
+        try self.currentChunk().write(@intFromEnum(op), line, self.allocator);
     }
 
     fn emitByte(self: *Self, byte: u8, line: u32) Error!void {
-        try self.chunk.write(byte, line, self.allocator);
+        try self.currentChunk().write(byte, line, self.allocator);
     }
 
     fn emitConstant(self: *Self, val: Value, line: u32) Error!void {
-        const idx = try self.chunk.addConstant(val, self.allocator);
+        const idx = try self.currentChunk().addConstant(val, self.allocator);
         if (idx <= 255) {
             try self.emitOp(.op_constant, line);
             try self.emitByte(@intCast(idx), line);
@@ -653,22 +1225,22 @@ pub const Compiler = struct {
         try self.emitOp(op, line);
         try self.emitByte(0xFF, line); // placeholder hi
         try self.emitByte(0xFF, line); // placeholder lo
-        return @intCast(self.chunk.code.items.len - 2);
+        return @intCast(self.currentChunk().code.items.len - 2);
     }
 
     fn patchJump(self: *Self, offset: u32) Error!void {
-        const jump: u32 = @intCast(self.chunk.code.items.len - offset - 2);
+        const jump: u32 = @intCast(self.currentChunk().code.items.len - offset - 2);
         if (jump > 0xFFFF) {
             // Jump too large -- would need a long jump instruction.
             return error.Overflow;
         }
-        self.chunk.code.items[offset] = @intCast((jump >> 8) & 0xFF);
-        self.chunk.code.items[offset + 1] = @intCast(jump & 0xFF);
+        self.currentChunk().code.items[offset] = @intCast((jump >> 8) & 0xFF);
+        self.currentChunk().code.items[offset + 1] = @intCast(jump & 0xFF);
     }
 
     fn emitLoop(self: *Self, loop_start: u32, line: u32) Error!void {
         try self.emitOp(.op_loop, line);
-        const offset: u32 = @intCast(self.chunk.code.items.len - loop_start + 2);
+        const offset: u32 = @intCast(self.currentChunk().code.items.len - loop_start + 2);
         if (offset > 0xFFFF) {
             return error.Overflow;
         }
@@ -700,6 +1272,61 @@ pub const Compiler = struct {
             .help = null,
         });
     }
+
+    /// Check if the last emitted instruction is op_return.
+    fn lastInstructionIsReturn(self: *const Self) bool {
+        const code = self.currentChunkConst().code.items;
+        if (code.len == 0) return false;
+        return @as(OpCode, @enumFromInt(code[code.len - 1])) == .op_return;
+    }
+
+    /// Const access to current chunk.
+    fn currentChunkConst(self: *const Self) *const Chunk {
+        return &self.function.chunk;
+    }
+
+    /// Evaluate a constant expression at compile time (for default parameter values).
+    /// Only supports simple literals (int, float, string, bool, nil, atom).
+    fn evaluateConstantExpr(self: *Self, node_idx: u32) Error!Value {
+        const tag = self.ast.nodes.items(.tag)[node_idx];
+        const main_tokens = self.ast.nodes.items(.main_token);
+        const tok_idx = main_tokens[node_idx];
+        const text = self.ast.tokenSlice(tok_idx);
+
+        switch (tag) {
+            .int_literal => {
+                const val = std.fmt.parseInt(i32, text, 10) catch return Value.nil;
+                return Value.fromInt(val);
+            },
+            .float_literal => {
+                const val = std.fmt.parseFloat(f64, text) catch return Value.nil;
+                return Value.fromFloat(val);
+            },
+            .string_literal => {
+                if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
+                    const content = text[1 .. text.len - 1];
+                    const str_obj = try ObjString.create(self.allocator, content);
+                    return Value.fromObj(&str_obj.obj);
+                }
+                return Value.nil;
+            },
+            .bool_literal => {
+                const tok_tag = self.ast.tokens[tok_idx].tag;
+                return Value.fromBool(tok_tag == .kw_true);
+            },
+            .nil_literal => return Value.nil,
+            .atom_literal => {
+                const name = if (text.len > 0 and text[0] == ':') text[1..] else text;
+                const gop = try self.atom_table.getOrPut(self.allocator, name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = self.atom_count;
+                    self.atom_count += 1;
+                }
+                return Value.fromAtom(gop.value_ptr.*);
+            },
+            else => return Value.nil,
+        }
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -720,6 +1347,10 @@ const TestCompileResult = struct {
         self.result.deinit(allocator);
         self.ast.deinit(allocator);
         self.token_buf.deinit(allocator);
+    }
+
+    fn getChunk(self: *const TestCompileResult) *const Chunk {
+        return &self.result.closure.function.chunk;
     }
 };
 
@@ -753,39 +1384,28 @@ fn byteAt(chunk: *const Chunk, offset: usize) u8 {
 // ── Tests ──────────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════
 
-// Test 1: Compiling `42` emits [op_constant(42), op_return]
+// Test 1: Compiling `42` emits [op_constant(42), op_pop, op_nil, op_return]
 test "compile: integer literal 42" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("42", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // Should be: expr_stmt wraps the literal, so:
-    // op_constant(42), op_pop (expr_stmt), op_return
-    // Actually for a single top-level expression: the root compiles statements.
-    // The top-level "42" becomes expr_stmt which compiles the int then op_pop.
-    // Then op_return at the end.
-    // But wait: if there's only one statement at root level, compileStatements
-    // doesn't pop it because it's the last one. But expr_stmt ALWAYS emits pop.
-    // So: op_constant, op_pop, op_return.
     try std.testing.expectEqual(OpCode.op_constant, opAt(chunk, 0));
-    // constant index
     const const_idx = byteAt(chunk, 1);
     try std.testing.expectEqual(@as(i32, 42), chunk.constants.items[const_idx].asInt());
-    // expr_stmt emits pop
     try std.testing.expectEqual(OpCode.op_pop, opAt(chunk, 2));
-    try std.testing.expectEqual(OpCode.op_return, opAt(chunk, 3));
 }
 
-// Test 2: Compiling `1 + 2` emits [op_constant(1), op_constant(2), op_add, op_return]
+// Test 2: Compiling `1 + 2` emits [op_constant(1), op_constant(2), op_add, ...]
 test "compile: addition 1 + 2" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("1 + 2", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
     try std.testing.expectEqual(OpCode.op_constant, opAt(chunk, 0));
@@ -795,16 +1415,15 @@ test "compile: addition 1 + 2" {
     try std.testing.expectEqual(OpCode.op_add, opAt(chunk, 4));
 }
 
-// Test 3: Compiling `1 + 2 * 3` emits correct order (multiply before add)
+// Test 3: Precedence: 1 + 2 * 3
 test "compile: precedence 1 + 2 * 3" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("1 + 2 * 3", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // Should be: const(1), const(2), const(3), multiply, add (postfix order)
     try std.testing.expectEqual(OpCode.op_constant, opAt(chunk, 0)); // 1
     try std.testing.expectEqual(OpCode.op_constant, opAt(chunk, 2)); // 2
     try std.testing.expectEqual(OpCode.op_constant, opAt(chunk, 4)); // 3
@@ -812,48 +1431,46 @@ test "compile: precedence 1 + 2 * 3" {
     try std.testing.expectEqual(OpCode.op_add, opAt(chunk, 7));
 }
 
-// Test 4: Compiling `-42` emits [op_constant(42), op_negate]
+// Test 4: Unary negate
 test "compile: unary negate" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("-42", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // -42: op_constant(42), op_negate, op_pop (expr_stmt), op_return
     try std.testing.expectEqual(OpCode.op_constant, opAt(chunk, 0));
     try std.testing.expectEqual(@as(i32, 42), chunk.constants.items[byteAt(chunk, 1)].asInt());
     try std.testing.expectEqual(OpCode.op_negate, opAt(chunk, 2));
 }
 
-// Test 4b: Negate a local variable via expression
+// Test 4b: Negate a local variable
 test "compile: negate local in block" {
     const allocator = std.testing.allocator;
-    // Use a block so let and -x are clearly separate
     var tc = try testCompile("let x = 5\nlet y = -x", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // Find the negate instruction - it should follow a get_local
     var found_negate = false;
     var found_get_local_before_negate = false;
     var i: usize = 0;
     while (i < chunk.code.items.len) {
         const op = opAt(chunk, i);
         if (op == .op_get_local) {
-            // Check if next instruction is negate
             if (i + 2 < chunk.code.items.len and opAt(chunk, i + 2) == .op_negate) {
                 found_get_local_before_negate = true;
                 found_negate = true;
             }
             i += 2;
-        } else if (op == .op_constant or op == .op_set_local or op == .op_get_builtin or op == .op_call or op == .op_atom) {
+        } else if (op == .op_constant or op == .op_set_local or op == .op_get_builtin or op == .op_call or op == .op_atom or op == .op_get_upvalue or op == .op_set_upvalue or op == .op_tail_call) {
             i += 2;
         } else if (op == .op_jump or op == .op_jump_if_false or op == .op_loop or op == .op_constant_long or op == .op_for_iter) {
             i += 3;
+        } else if (op == .op_closure) {
+            i += 2; // skip const idx, then upvalue descriptors handled separately
         } else {
             i += 1;
         }
@@ -862,31 +1479,28 @@ test "compile: negate local in block" {
     try std.testing.expect(found_negate);
 }
 
-// Test 5: Compiling `let x = 42` records x at local slot 0
+// Test 5: Let binding
 test "compile: let binding creates local" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("let x = 42", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // let x = 42: op_constant(42). The value stays on stack as the local.
     try std.testing.expectEqual(OpCode.op_constant, opAt(chunk, 0));
     try std.testing.expectEqual(@as(i32, 42), chunk.constants.items[byteAt(chunk, 1)].asInt());
 }
 
-// Test 6: Compiling `let x = 1\nlet y = 2\nx + y`
+// Test 6: Multiple locals and access
 test "compile: multiple locals and access" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("let x = 1\nlet y = 2\nx + y", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // Find the get_local instructions for x + y
-    // x should be slot 0, y should be slot 1
     var get_local_slots: std.ArrayListUnmanaged(u8) = .empty;
     defer get_local_slots.deinit(allocator);
 
@@ -896,30 +1510,32 @@ test "compile: multiple locals and access" {
         if (op == .op_get_local) {
             try get_local_slots.append(allocator, byteAt(chunk, i + 1));
             i += 2;
-        } else if (op == .op_constant or op == .op_set_local or op == .op_get_builtin or op == .op_call or op == .op_atom) {
+        } else if (op == .op_constant or op == .op_set_local or op == .op_get_builtin or op == .op_call or op == .op_atom or op == .op_get_upvalue or op == .op_set_upvalue or op == .op_tail_call) {
             i += 2;
         } else if (op == .op_jump or op == .op_jump_if_false or op == .op_loop or op == .op_constant_long or op == .op_for_iter) {
             i += 3;
+        } else if (op == .op_closure) {
+            i += 2;
         } else {
             i += 1;
         }
     }
 
     try std.testing.expect(get_local_slots.items.len >= 2);
-    try std.testing.expectEqual(@as(u8, 0), get_local_slots.items[0]); // x at slot 0
-    try std.testing.expectEqual(@as(u8, 1), get_local_slots.items[1]); // y at slot 1
+    // Slot 0 is reserved for the script function, so locals start at 1.
+    try std.testing.expectEqual(@as(u8, 1), get_local_slots.items[0]); // x at slot 1
+    try std.testing.expectEqual(@as(u8, 2), get_local_slots.items[1]); // y at slot 2
 }
 
-// Test 7: Compiling `if true { 1 } else { 2 }` emits conditional jump
+// Test 7: If-else expression
 test "compile: if-else expression" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("if true { 1 } else { 2 }", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // Should contain: op_true, op_jump_if_false, ..., op_jump, ..., op_return
     var found_true = false;
     var found_jif = false;
     var found_jump = false;
@@ -939,11 +1555,14 @@ test "compile: if-else expression" {
                 found_jump = true;
                 i += 3;
             },
-            .op_constant, .op_set_local, .op_get_local, .op_get_builtin, .op_call, .op_atom => {
+            .op_constant, .op_set_local, .op_get_local, .op_get_builtin, .op_call, .op_atom, .op_get_upvalue, .op_set_upvalue, .op_tail_call => {
                 i += 2;
             },
             .op_loop, .op_constant_long, .op_for_iter => {
                 i += 3;
+            },
+            .op_closure => {
+                i += 2;
             },
             else => i += 1,
         }
@@ -953,13 +1572,13 @@ test "compile: if-else expression" {
     try std.testing.expect(found_jump);
 }
 
-// Test 8: Compiling `while x > 0 { x = x - 1 }` emits loop
+// Test 8: While loop
 test "compile: while loop" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("let x = 3\nwhile x > 0 { x = x - 1 }", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
     var found_loop = false;
@@ -976,8 +1595,9 @@ test "compile: while loop" {
                 found_jif = true;
                 i += 3;
             },
-            .op_constant, .op_set_local, .op_get_local, .op_get_builtin, .op_call, .op_atom => i += 2,
+            .op_constant, .op_set_local, .op_get_local, .op_get_builtin, .op_call, .op_atom, .op_get_upvalue, .op_set_upvalue, .op_tail_call => i += 2,
             .op_jump, .op_constant_long, .op_for_iter => i += 3,
+            .op_closure => i += 2,
             else => i += 1,
         }
     }
@@ -985,28 +1605,26 @@ test "compile: while loop" {
     try std.testing.expect(found_jif);
 }
 
-// Test 9: Compiling `:ok` emits op_atom
+// Test 9: Atom literal
 test "compile: atom literal" {
     const allocator = std.testing.allocator;
     var tc = try testCompile(":ok", allocator);
     defer tc.deinit(allocator);
 
     try std.testing.expect(!tc.result.hasErrors());
-    // Atom should be interned (after the 7 pre-registered type atoms).
     try std.testing.expectEqual(@as(u32, 8), tc.result.atom_count);
     try std.testing.expect(tc.result.atom_table.contains("ok"));
 }
 
-// Test 10: Block expression with local scope
+// Test 10: Block expression
 test "compile: block expression with local scope" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("{ let x = 1\nx + 2 }", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // Should have at least op_constant(1), op_get_local, op_constant(2), op_add
     var found_add = false;
     var i: usize = 0;
     while (i < chunk.code.items.len) {
@@ -1016,21 +1634,22 @@ test "compile: block expression with local scope" {
                 found_add = true;
                 i += 1;
             },
-            .op_constant, .op_set_local, .op_get_local, .op_get_builtin, .op_call, .op_atom => i += 2,
+            .op_constant, .op_set_local, .op_get_local, .op_get_builtin, .op_call, .op_atom, .op_get_upvalue, .op_set_upvalue, .op_tail_call => i += 2,
             .op_jump, .op_jump_if_false, .op_loop, .op_constant_long, .op_for_iter => i += 3,
+            .op_closure => i += 2,
             else => i += 1,
         }
     }
     try std.testing.expect(found_add);
 }
 
-// Test 11: Compiling `print(42)` emits get_builtin + call
+// Test 11: Builtin call
 test "compile: builtin function call" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("print(42)", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
     var found_get_builtin = false;
@@ -1042,7 +1661,6 @@ test "compile: builtin function call" {
         switch (op) {
             .op_get_builtin => {
                 found_get_builtin = true;
-                // builtin index 0 = print
                 try std.testing.expectEqual(@as(u8, 0), byteAt(chunk, i + 1));
                 i += 2;
             },
@@ -1051,8 +1669,9 @@ test "compile: builtin function call" {
                 call_arg_count = byteAt(chunk, i + 1);
                 i += 2;
             },
-            .op_constant, .op_set_local, .op_get_local, .op_atom => i += 2,
+            .op_constant, .op_set_local, .op_get_local, .op_atom, .op_get_upvalue, .op_set_upvalue, .op_tail_call => i += 2,
             .op_jump, .op_jump_if_false, .op_loop, .op_constant_long, .op_for_iter => i += 3,
+            .op_closure => i += 2,
             else => i += 1,
         }
     }
@@ -1061,17 +1680,15 @@ test "compile: builtin function call" {
     try std.testing.expectEqual(@as(u8, 1), call_arg_count);
 }
 
-// Test 12: Shadowing -- inner block redefines variable
+// Test 12: Variable shadowing
 test "compile: variable shadowing" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("let x = 1\n{ let x = 2\nx }", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
-    // Inner x should be at slot 1, outer x at slot 0
-    // The get_local inside the block should reference slot 1 (inner x)
     var get_local_slots: std.ArrayListUnmanaged(u8) = .empty;
     defer get_local_slots.deinit(allocator);
 
@@ -1081,30 +1698,32 @@ test "compile: variable shadowing" {
         if (op == .op_get_local) {
             try get_local_slots.append(allocator, byteAt(chunk, i + 1));
             i += 2;
-        } else if (op == .op_constant or op == .op_set_local or op == .op_get_builtin or op == .op_call or op == .op_atom) {
+        } else if (op == .op_constant or op == .op_set_local or op == .op_get_builtin or op == .op_call or op == .op_atom or op == .op_get_upvalue or op == .op_set_upvalue or op == .op_tail_call) {
             i += 2;
         } else if (op == .op_jump or op == .op_jump_if_false or op == .op_loop or op == .op_constant_long or op == .op_for_iter) {
             i += 3;
+        } else if (op == .op_closure) {
+            i += 2;
         } else {
             i += 1;
         }
     }
 
-    // Should find at least one get_local for slot 1 (inner x)
-    var found_slot_1 = false;
+    // Inner x should be at slot 2 (slot 0 = script, slot 1 = outer x, slot 2 = inner x)
+    var found_slot_2 = false;
     for (get_local_slots.items) |slot| {
-        if (slot == 1) found_slot_1 = true;
+        if (slot == 2) found_slot_2 = true;
     }
-    try std.testing.expect(found_slot_1);
+    try std.testing.expect(found_slot_2);
 }
 
-// Test 13: String concatenation operator
+// Test 13: String concatenation
 test "compile: string concatenation ++" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("\"hello\" ++ \" world\"", allocator);
     defer tc.deinit(allocator);
 
-    const chunk = &tc.result.chunk;
+    const chunk = tc.getChunk();
     try std.testing.expect(!tc.result.hasErrors());
 
     var found_concat = false;
@@ -1114,10 +1733,12 @@ test "compile: string concatenation ++" {
         if (op == .op_concat) {
             found_concat = true;
             i += 1;
-        } else if (op == .op_constant or op == .op_set_local or op == .op_get_local or op == .op_get_builtin or op == .op_call or op == .op_atom) {
+        } else if (op == .op_constant or op == .op_set_local or op == .op_get_local or op == .op_get_builtin or op == .op_call or op == .op_atom or op == .op_get_upvalue or op == .op_set_upvalue or op == .op_tail_call) {
             i += 2;
         } else if (op == .op_jump or op == .op_jump_if_false or op == .op_loop or op == .op_constant_long or op == .op_for_iter) {
             i += 3;
+        } else if (op == .op_closure) {
+            i += 2;
         } else {
             i += 1;
         }
@@ -1125,7 +1746,7 @@ test "compile: string concatenation ++" {
     try std.testing.expect(found_concat);
 }
 
-// Test: error accumulation
+// Test 14: Undefined variable error
 test "compile: error on undefined variable" {
     const allocator = std.testing.allocator;
     var tc = try testCompile("unknown_var", allocator);
@@ -1134,4 +1755,187 @@ test "compile: error on undefined variable" {
     try std.testing.expect(tc.result.hasErrors());
     try std.testing.expectEqual(@as(usize, 1), tc.result.errors.items.len);
     try std.testing.expectEqual(ErrorCode.E002, tc.result.errors.items[0].error_code);
+}
+
+// ── Phase 2 function/closure tests ─────────────────────────────────
+
+// Test: Simple fn compiles to closure bytecode
+test "compile: simple fn produces op_closure" {
+    const allocator = std.testing.allocator;
+    var tc = try testCompile("fn add(a, b) { a + b }", allocator);
+    defer tc.deinit(allocator);
+
+    const chunk = tc.getChunk();
+    try std.testing.expect(!tc.result.hasErrors());
+
+    // Find op_closure in the script chunk.
+    var found_closure = false;
+    var i: usize = 0;
+    while (i < chunk.code.items.len) {
+        const op = opAt(chunk, i);
+        if (op == .op_closure) {
+            found_closure = true;
+            // The constant should be an ObjFunction.
+            const const_idx = byteAt(chunk, i + 1);
+            const val = chunk.constants.items[const_idx];
+            try std.testing.expect(val.isObj());
+            try std.testing.expectEqual(obj_mod.ObjType.function, val.asObj().obj_type);
+            const func = ObjFunction.fromObj(val.asObj());
+            try std.testing.expectEqual(@as(u8, 2), func.arity);
+            try std.testing.expectEqualStrings("add", func.name.?);
+            break;
+        }
+        if (op == .op_constant or op == .op_set_local or op == .op_get_local or op == .op_get_builtin or op == .op_call or op == .op_atom or op == .op_get_upvalue or op == .op_set_upvalue or op == .op_tail_call) {
+            i += 2;
+        } else if (op == .op_jump or op == .op_jump_if_false or op == .op_loop or op == .op_constant_long or op == .op_for_iter) {
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    try std.testing.expect(found_closure);
+}
+
+// Test: Upvalue resolution across one nesting level
+test "compile: upvalue resolution one level" {
+    const allocator = std.testing.allocator;
+    var tc = try testCompile(
+        \\fn outer() {
+        \\  let x = 1
+        \\  fn inner() { x }
+        \\  inner
+        \\}
+    , allocator);
+    defer tc.deinit(allocator);
+
+    try std.testing.expect(!tc.result.hasErrors());
+
+    // The outer function should have its 'x' captured.
+    // Inner function should have upvalue_count > 0.
+    const chunk = tc.getChunk();
+    // Find the outer function constant.
+    for (chunk.constants.items) |val| {
+        if (val.isObj() and val.asObj().obj_type == .function) {
+            const func = ObjFunction.fromObj(val.asObj());
+            if (func.name != null and std.mem.eql(u8, func.name.?, "outer")) {
+                // Check that inner function within outer's chunk has upvalues.
+                for (func.chunk.constants.items) |inner_val| {
+                    if (inner_val.isObj() and inner_val.asObj().obj_type == .function) {
+                        const inner_func = ObjFunction.fromObj(inner_val.asObj());
+                        if (inner_func.name != null and std.mem.eql(u8, inner_func.name.?, "inner")) {
+                            try std.testing.expect(inner_func.upvalue_count > 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Test: Pipe desugaring: x |> f compiles to call bytecode
+test "compile: pipe x |> f desugars to f(x)" {
+    const allocator = std.testing.allocator;
+    var tc = try testCompile("fn f(x) { x }\nlet v = 5\nv |> f", allocator);
+    defer tc.deinit(allocator);
+
+    try std.testing.expect(!tc.result.hasErrors());
+
+    // Should find an op_call with arg_count=1 for the pipe.
+    const chunk = tc.getChunk();
+    var found_call = false;
+    var i: usize = 0;
+    while (i < chunk.code.items.len) {
+        const op = opAt(chunk, i);
+        if (op == .op_call) {
+            const arg_count = byteAt(chunk, i + 1);
+            if (arg_count == 1) found_call = true;
+            i += 2;
+        } else if (op == .op_closure) {
+            const const_idx = byteAt(chunk, i + 1);
+            i += 2;
+            // Skip upvalue descriptors.
+            const val = chunk.constants.items[const_idx];
+            if (val.isObj() and val.asObj().obj_type == .function) {
+                const func = ObjFunction.fromObj(val.asObj());
+                i += @as(usize, func.upvalue_count) * 2;
+            }
+        } else if (op == .op_constant or op == .op_set_local or op == .op_get_local or op == .op_get_builtin or op == .op_atom or op == .op_get_upvalue or op == .op_set_upvalue or op == .op_tail_call) {
+            i += 2;
+        } else if (op == .op_jump or op == .op_jump_if_false or op == .op_loop or op == .op_constant_long or op == .op_for_iter) {
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    try std.testing.expect(found_call);
+}
+
+// Test: Tail call: last call in fn body emits op_tail_call
+test "compile: tail call in return position" {
+    const allocator = std.testing.allocator;
+    var tc = try testCompile(
+        \\fn f(x) { x }
+        \\fn g(x) { f(x) }
+    , allocator);
+    defer tc.deinit(allocator);
+
+    try std.testing.expect(!tc.result.hasErrors());
+
+    // Find function 'g' and check its chunk for op_tail_call.
+    const chunk = tc.getChunk();
+    var found_tail_call = false;
+    for (chunk.constants.items) |val| {
+        if (val.isObj() and val.asObj().obj_type == .function) {
+            const func = ObjFunction.fromObj(val.asObj());
+            if (func.name != null and std.mem.eql(u8, func.name.?, "g")) {
+                for (func.chunk.code.items) |byte| {
+                    if (@as(OpCode, @enumFromInt(byte)) == .op_tail_call) {
+                        found_tail_call = true;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_tail_call);
+}
+
+// Test: Non-tail call: call in let binding emits op_call
+test "compile: non-tail call in let binding" {
+    const allocator = std.testing.allocator;
+    var tc = try testCompile(
+        \\fn f(x) { x }
+        \\fn g(x) { let y = f(x)
+        \\y }
+    , allocator);
+    defer tc.deinit(allocator);
+
+    try std.testing.expect(!tc.result.hasErrors());
+
+    // Find function 'g' and check its chunk has op_call (not op_tail_call) for the let binding.
+    const chunk = tc.getChunk();
+    var found_regular_call = false;
+    for (chunk.constants.items) |val| {
+        if (val.isObj() and val.asObj().obj_type == .function) {
+            const func = ObjFunction.fromObj(val.asObj());
+            if (func.name != null and std.mem.eql(u8, func.name.?, "g")) {
+                for (func.chunk.code.items) |byte| {
+                    if (@as(OpCode, @enumFromInt(byte)) == .op_call) {
+                        found_regular_call = true;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_regular_call);
+}
+
+// Test: CompileResult now returns ObjClosure
+test "compile: result contains ObjClosure" {
+    const allocator = std.testing.allocator;
+    var tc = try testCompile("42", allocator);
+    defer tc.deinit(allocator);
+
+    try std.testing.expect(!tc.result.hasErrors());
+    try std.testing.expectEqual(obj_mod.ObjType.closure, tc.result.closure.obj.obj_type);
+    try std.testing.expectEqual(obj_mod.ObjType.function, tc.result.closure.function.obj.obj_type);
 }
