@@ -54,8 +54,15 @@ pub const OpCode = enum(u8) {
     op_pop,
     op_print,
 
+    // -- Closures -----------------------------------------------------------
+    op_closure, // [const_idx as u32] followed by upvalue_count pairs of (is_local: u8, index: u8)
+    op_get_upvalue, // [slot: u8]
+    op_set_upvalue, // [slot: u8]
+    op_close_upvalue, // no operand, closes upvalue at stack_top - 1
+
     // -- Calls --------------------------------------------------------------
     op_call, // reserved for builtins
+    op_tail_call, // [arg_count: u8]
     op_return,
 
     // -- Atoms --------------------------------------------------------------
@@ -521,6 +528,23 @@ test "OpCode enum includes all Phase 1 opcodes" {
         .op_for_iter,
     };
     try std.testing.expect(opcodes.len >= 30);
+}
+
+test "OpCode enum includes Phase 2 closure opcodes" {
+    const closure_opcodes = [_]OpCode{
+        .op_closure,
+        .op_get_upvalue,
+        .op_set_upvalue,
+        .op_close_upvalue,
+        .op_tail_call,
+    };
+    // Verify all 5 new opcodes exist and are distinct.
+    for (closure_opcodes, 0..) |op, i| {
+        for (closure_opcodes[i + 1 ..]) |other| {
+            try std.testing.expect(@intFromEnum(op) != @intFromEnum(other));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), closure_opcodes.len);
 }
 
 test "Chunk deinit does not leak" {

@@ -24,6 +24,8 @@ const obj_mod = @import("obj");
 const Obj = obj_mod.Obj;
 const ObjString = obj_mod.ObjString;
 const ObjInt = obj_mod.ObjInt;
+const ObjFunction = obj_mod.ObjFunction;
+const ObjClosure = obj_mod.ObjClosure;
 
 pub const Value = struct {
     bits: u64,
@@ -134,6 +136,16 @@ pub const Value = struct {
         return self.isInt() or self.isObjType(.int_big);
     }
 
+    /// Returns true if this value is a closure object.
+    pub fn isClosure(self: Value) bool {
+        return self.isObjType(.closure);
+    }
+
+    /// Returns true if this value is a function object.
+    pub fn isFunction(self: Value) bool {
+        return self.isObjType(.function);
+    }
+
     // ── Decoders ───────────────────────────────────────────────────────
 
     pub fn asFloat(self: Value) f64 {
@@ -162,6 +174,16 @@ pub const Value = struct {
 
     pub fn asObj(self: Value) *Obj {
         return @ptrFromInt(self.bits & ~(SIGN_BIT | QNAN));
+    }
+
+    /// Decode a closure object.
+    pub fn asClosure(self: Value) *ObjClosure {
+        return ObjClosure.fromObj(self.asObj());
+    }
+
+    /// Decode a function object.
+    pub fn asFunction(self: Value) *ObjFunction {
+        return ObjFunction.fromObj(self.asObj());
     }
 
     pub fn asAtom(self: Value) u32 {
@@ -236,6 +258,25 @@ pub const Value = struct {
                 .range => {
                     const r = obj_mod.ObjRange.fromObj(obj_ptr);
                     try writer.print("range({d}, {d}, {d})", .{ r.start, r.end, r.step });
+                },
+                .function => {
+                    const func = ObjFunction.fromObj(obj_ptr);
+                    if (func.name) |name| {
+                        try writer.print("<fn {s}>", .{name});
+                    } else {
+                        try writer.writeAll("<fn>");
+                    }
+                },
+                .closure => {
+                    const clos = ObjClosure.fromObj(obj_ptr);
+                    if (clos.function.name) |name| {
+                        try writer.print("<fn {s}>", .{name});
+                    } else {
+                        try writer.writeAll("<fn>");
+                    }
+                },
+                .upvalue => {
+                    try writer.writeAll("<upvalue>");
                 },
             }
         } else {
@@ -436,6 +477,36 @@ test "negative i64 overflow to heap" {
     v.asObj().destroy(allocator);
 }
 
+test "Value.isClosure and asClosure round-trip" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+    const clos = try ObjClosure.create(allocator, func);
+    defer clos.obj.destroy(allocator);
+
+    const v = Value.fromObj(&clos.obj);
+    try std.testing.expect(v.isClosure());
+    try std.testing.expect(!v.isFunction());
+    try std.testing.expect(!v.isInt());
+    try std.testing.expect(!v.isFloat());
+
+    const recovered = v.asClosure();
+    try std.testing.expectEqual(func, recovered.function);
+}
+
+test "Value.isFunction and asFunction round-trip" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+
+    const v = Value.fromObj(&func.obj);
+    try std.testing.expect(v.isFunction());
+    try std.testing.expect(!v.isClosure());
+
+    const recovered = v.asFunction();
+    try std.testing.expectEqual(@as(u8, 0), recovered.arity);
+}
+
 test "Value.format prints correctly" {
     var buf: [128]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
@@ -455,4 +526,31 @@ test "Value.format prints correctly" {
     stream.reset();
     try Value.false_val.format("", .{}, writer);
     try std.testing.expectEqualStrings("false", stream.getWritten());
+}
+
+test "Value.format closure and function display" {
+    const allocator = std.testing.allocator;
+    var buf: [128]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+
+    // Named function
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+    func.name = "add";
+    const clos = try ObjClosure.create(allocator, func);
+    defer clos.obj.destroy(allocator);
+
+    try Value.fromObj(&clos.obj).format("", .{}, writer);
+    try std.testing.expectEqualStrings("<fn add>", stream.getWritten());
+
+    // Anonymous function
+    stream.reset();
+    const anon = try ObjFunction.create(allocator);
+    defer anon.obj.destroy(allocator);
+    const anon_clos = try ObjClosure.create(allocator, anon);
+    defer anon_clos.obj.destroy(allocator);
+
+    try Value.fromObj(&anon_clos.obj).format("", .{}, writer);
+    try std.testing.expectEqualStrings("<fn>", stream.getWritten());
 }

@@ -1,5 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const value_mod = @import("value");
+const Value = value_mod.Value;
+const chunk_mod = @import("chunk");
+const Chunk = chunk_mod.Chunk;
 
 /// Object type tag for heap-allocated values.
 pub const ObjType = enum(u8) {
@@ -7,6 +11,9 @@ pub const ObjType = enum(u8) {
     bytes,
     int_big,
     range,
+    function,
+    closure,
+    upvalue,
 };
 
 /// Common header for all heap-allocated objects.
@@ -37,6 +44,26 @@ pub const Obj = struct {
             .range => {
                 const r = ObjRange.fromObj(self);
                 allocator.destroy(r);
+            },
+            .function => {
+                const func = ObjFunction.fromObj(self);
+                func.chunk.deinit(allocator);
+                if (func.param_names) |names| {
+                    allocator.free(names);
+                }
+                if (func.param_defaults) |defaults| {
+                    allocator.free(defaults);
+                }
+                allocator.destroy(func);
+            },
+            .closure => {
+                const clos = ObjClosure.fromObj(self);
+                allocator.free(clos.upvalues);
+                allocator.destroy(clos);
+            },
+            .upvalue => {
+                const uv = ObjUpvalue.fromObj(self);
+                allocator.destroy(uv);
             },
         }
     }
@@ -144,7 +171,197 @@ pub const ObjRange = struct {
     }
 };
 
+/// Compiled function prototype (compile-time container).
+/// ObjFunction is the compile-time representation of a function.
+/// At runtime, functions are ALWAYS wrapped in ObjClosure (even if they
+/// capture no upvalues). ObjFunction is purely compile-time.
+pub const ObjFunction = struct {
+    obj: Obj,
+    /// Number of required positional parameters.
+    arity: u8,
+    /// Total parameters including optional named ones.
+    arity_max: u8,
+    /// Number of upvalues captured by this function.
+    upvalue_count: u8,
+    /// The function's bytecode.
+    chunk: Chunk,
+    /// Function name (null for anonymous lambdas). Not owned -- points into source.
+    name: ?[]const u8,
+    /// Parameter names (token slices, not owned). Null if no params.
+    param_names: ?[]const []const u8,
+    /// Default values for named parameters. Null if no defaults.
+    param_defaults: ?[]const Value,
+
+    pub fn create(allocator: Allocator) !*ObjFunction {
+        const func = try allocator.create(ObjFunction);
+        func.* = .{
+            .obj = .{ .obj_type = .function },
+            .arity = 0,
+            .arity_max = 0,
+            .upvalue_count = 0,
+            .chunk = .{},
+            .name = null,
+            .param_names = null,
+            .param_defaults = null,
+        };
+        return func;
+    }
+
+    pub fn fromObj(obj: *Obj) *ObjFunction {
+        return @fieldParentPtr("obj", obj);
+    }
+};
+
+/// Runtime closure wrapping a function prototype + captured upvalues.
+/// The VM only ever calls ObjClosure, never ObjFunction directly.
+pub const ObjClosure = struct {
+    obj: Obj,
+    /// The underlying function prototype.
+    function: *ObjFunction,
+    /// Captured upvalue pointers. Length == function.upvalue_count.
+    upvalues: []?*ObjUpvalue,
+
+    pub fn create(allocator: Allocator, function: *ObjFunction) !*ObjClosure {
+        const upvalue_count = function.upvalue_count;
+        const upvalues = try allocator.alloc(?*ObjUpvalue, upvalue_count);
+        @memset(upvalues, null);
+
+        const clos = try allocator.create(ObjClosure);
+        clos.* = .{
+            .obj = .{ .obj_type = .closure },
+            .function = function,
+            .upvalues = upvalues,
+        };
+        return clos;
+    }
+
+    pub fn fromObj(obj: *Obj) *ObjClosure {
+        return @fieldParentPtr("obj", obj);
+    }
+};
+
+/// Captured variable indirection for closures.
+/// An upvalue starts "open" (pointing to a stack slot). When the enclosing
+/// scope exits, it becomes "closed" (value copied into the `closed` field).
+pub const ObjUpvalue = struct {
+    obj: Obj,
+    /// Points to the stack slot when open.
+    location: *Value,
+    /// Storage for the value after the upvalue is closed.
+    closed: Value,
+    /// Linked list of open upvalues (for the VM's open upvalue tracking).
+    next: ?*ObjUpvalue,
+
+    pub fn create(allocator: Allocator, slot: *Value) !*ObjUpvalue {
+        const uv = try allocator.create(ObjUpvalue);
+        uv.* = .{
+            .obj = .{ .obj_type = .upvalue },
+            .location = slot,
+            .closed = Value.nil,
+            .next = null,
+        };
+        return uv;
+    }
+
+    pub fn fromObj(obj: *Obj) *ObjUpvalue {
+        return @fieldParentPtr("obj", obj);
+    }
+};
+
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "ObjFunction create and destroy lifecycle" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+
+    try std.testing.expectEqual(ObjType.function, func.obj.obj_type);
+    try std.testing.expectEqual(@as(u8, 0), func.arity);
+    try std.testing.expectEqual(@as(u8, 0), func.arity_max);
+    try std.testing.expectEqual(@as(u8, 0), func.upvalue_count);
+    try std.testing.expect(func.name == null);
+    try std.testing.expect(func.param_names == null);
+    try std.testing.expect(func.param_defaults == null);
+}
+
+test "ObjFunction with chunk data" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+
+    // Add some bytecode to the function's chunk.
+    try func.chunk.write(@intFromEnum(chunk_mod.OpCode.op_return), 1, allocator);
+    _ = try func.chunk.addConstant(Value.fromInt(42), allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), func.chunk.code.items.len);
+    try std.testing.expectEqual(@as(usize, 1), func.chunk.constants.items.len);
+}
+
+test "ObjClosure create with 0 upvalues" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+
+    const clos = try ObjClosure.create(allocator, func);
+    defer clos.obj.destroy(allocator);
+
+    try std.testing.expectEqual(ObjType.closure, clos.obj.obj_type);
+    try std.testing.expectEqual(func, clos.function);
+    try std.testing.expectEqual(@as(usize, 0), clos.upvalues.len);
+}
+
+test "ObjClosure create with 3 upvalues" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    func.upvalue_count = 3;
+    defer func.obj.destroy(allocator);
+
+    const clos = try ObjClosure.create(allocator, func);
+    defer clos.obj.destroy(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), clos.upvalues.len);
+    // All upvalues should be initialized to null.
+    for (clos.upvalues) |uv| {
+        try std.testing.expect(uv == null);
+    }
+}
+
+test "ObjUpvalue create with stack slot" {
+    const allocator = std.testing.allocator;
+    var slot = Value.fromInt(99);
+    const uv = try ObjUpvalue.create(allocator, &slot);
+    defer uv.obj.destroy(allocator);
+
+    try std.testing.expectEqual(ObjType.upvalue, uv.obj.obj_type);
+    try std.testing.expectEqual(@as(i32, 99), uv.location.asInt());
+    try std.testing.expect(uv.closed.isNil());
+    try std.testing.expect(uv.next == null);
+}
+
+test "ObjFunction fromObj recovers original" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+    func.arity = 2;
+    func.name = "add";
+
+    const obj_ptr: *Obj = &func.obj;
+    const recovered = ObjFunction.fromObj(obj_ptr);
+    try std.testing.expectEqual(@as(u8, 2), recovered.arity);
+    try std.testing.expectEqualStrings("add", recovered.name.?);
+}
+
+test "ObjClosure fromObj recovers original" {
+    const allocator = std.testing.allocator;
+    const func = try ObjFunction.create(allocator);
+    defer func.obj.destroy(allocator);
+    const clos = try ObjClosure.create(allocator, func);
+    defer clos.obj.destroy(allocator);
+
+    const obj_ptr: *Obj = &clos.obj;
+    const recovered = ObjClosure.fromObj(obj_ptr);
+    try std.testing.expectEqual(func, recovered.function);
+}
 
 test "ObjRange create and destroy round-trip" {
     const allocator = std.testing.allocator;

@@ -279,6 +279,12 @@ pub const VM = struct {
                     try self.push(val);
                 },
 
+                // Phase 2 closure opcodes -- stubs until Plan 02-02 implements them.
+                .op_closure, .op_get_upvalue, .op_set_upvalue, .op_close_upvalue, .op_tail_call => {
+                    try self.runtimeError(.E001, "unimplemented: closure opcodes (Phase 2)");
+                    return error.RuntimeErr;
+                },
+
                 .op_for_iter => {
                     // For-in iteration: reads the iterator and index from stack,
                     // advances, and either sets the loop variable or jumps past the body.

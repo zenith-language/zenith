@@ -23,6 +23,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // NOTE: obj_mod needs value and chunk imports for ObjFunction/ObjClosure.
+    // These are added below via addImport after value_mod and chunk_mod are created,
+    // to break the circular build-script dependency.
+
     const value_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/value.zig"),
         .target = target,
@@ -41,6 +45,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "obj", .module = obj_mod },
         },
     });
+
+    // Wire circular imports for obj_mod (ObjFunction needs Value and Chunk).
+    obj_mod.addImport("value", value_mod);
+    obj_mod.addImport("chunk", chunk_mod);
 
     const error_mod = b.createModule(.{
         .root_source_file = b.path("src/common/error.zig"),

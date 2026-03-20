@@ -87,6 +87,25 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
                 const r = obj_mod.ObjRange.fromObj(obj_ptr);
                 try writer.print("range({d}, {d}, {d})", .{ r.start, r.end, r.step });
             },
+            .function => {
+                const func = obj_mod.ObjFunction.fromObj(obj_ptr);
+                if (func.name) |name| {
+                    try writer.print("<fn {s}>", .{name});
+                } else {
+                    try writer.writeAll("<fn>");
+                }
+            },
+            .closure => {
+                const clos = obj_mod.ObjClosure.fromObj(obj_ptr);
+                if (clos.function.name) |name| {
+                    try writer.print("<fn {s}>", .{name});
+                } else {
+                    try writer.writeAll("<fn>");
+                }
+            },
+            .upvalue => {
+                try writer.writeAll("<upvalue>");
+            },
         }
     } else {
         try writer.writeAll("<unknown>");
@@ -144,6 +163,7 @@ fn builtinTypeOf(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     if (val.isObjType(.bytes)) return Value.fromAtom(5); // :bytes
     if (val.isAtom()) return Value.fromAtom(6); // :atom
     if (val.isObjType(.range)) return Value.fromAtom(7); // :range
+    if (val.isObjType(.closure) or val.isObjType(.function)) return Value.fromAtom(8); // :function
     return Value.fromAtom(3); // fallback: nil
 }
 
