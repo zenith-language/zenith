@@ -41,7 +41,16 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
     const writer = buf.writer(allocator);
 
     if (val.isFloat()) {
-        try writer.print("{d}", .{val.asFloat()});
+        // Format floats so they always show at least one decimal place,
+        // distinguishing them from integers visually (e.g., 4.0 not 4).
+        const f = val.asFloat();
+        // Check if the float is an integer value (no fractional part).
+        if (f == @trunc(f) and !std.math.isNan(f) and !std.math.isInf(f)) {
+            // Format with exactly one decimal place.
+            try writer.print("{d:.1}", .{f});
+        } else {
+            try writer.print("{d}", .{f});
+        }
     } else if (val.isNil()) {
         try writer.writeAll("nil");
     } else if (val.isBool()) {

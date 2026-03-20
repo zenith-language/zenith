@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
         },
     });
 
@@ -212,6 +213,21 @@ pub fn build(b: *std.Build) void {
     // Also test lib.zig to exercise the full transitive import graph.
     {
         const t = b.addTest(.{ .root_module = lib_mod });
+        const run_t = b.addRunArtifact(t);
+        test_step.dependOn(&run_t.step);
+    }
+
+    // End-to-end test runner.
+    {
+        const e2e_mod = b.createModule(.{
+            .root_source_file = b.path("tests/run_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zenith", .module = lib_mod },
+            },
+        });
+        const t = b.addTest(.{ .root_module = e2e_mod });
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }

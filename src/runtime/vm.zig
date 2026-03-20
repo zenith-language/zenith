@@ -534,6 +534,16 @@ pub const VM = struct {
                 const args_start = self.stack_top - @as(u32, arg_count);
                 const args = self.stack[args_start..self.stack_top];
 
+                // Special-case print and show builtins to inject atom names.
+                if (builtin_idx == 0) {
+                    // print builtin: use VM's printValue for proper atom name formatting.
+                    try self.printValue(args[0]);
+                    // Pop arguments and callee, push nil result.
+                    self.stack_top -= (@as(u32, arg_count) + 1);
+                    try self.push(Value.nil);
+                    return;
+                }
+
                 // Call the native function.
                 var err_msg: []const u8 = "";
                 const result = builtin.func(args, self.allocator, &err_msg) catch |err| {

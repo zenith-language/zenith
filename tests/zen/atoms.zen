@@ -1,0 +1,8 @@
+let status = :ok
+print(status)
+print(:error)
+let same = :ok == :ok
+print(same)
+let diff = :ok == :error
+print(diff)
+print(type_of(:ok))

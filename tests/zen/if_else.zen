@@ -1,0 +1,8 @@
+let x = 10
+let result = if x > 5 { "big" } else { "small" }
+print(result)
+let y = if false { 1 } else { 2 }
+print(y)
+-- Nested if
+let z = if x > 20 { "huge" } else { if x > 5 { "medium" } else { "tiny" } }
+print(z)

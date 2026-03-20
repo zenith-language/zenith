@@ -1,0 +1,7 @@
+print(type_of(42))
+print(type_of(3.14))
+print(type_of(true))
+print(type_of(nil))
+print(type_of("hello"))
+assert(1 + 1 == 2)
+print("assertions passed")

@@ -74,6 +74,12 @@ pub const Compiler = struct {
         "print", "str", "len", "type_of", "assert", "panic", "range", "show",
     };
 
+    // Builtin type atom names, pre-registered at IDs 0-6 to match
+    // the hardcoded return values from type_of().
+    const type_atom_names = [_][]const u8{
+        "int", "float", "bool", "nil", "string", "bytes", "atom",
+    };
+
     /// Compile an AST into bytecodes.
     pub fn compile(ast_ptr: *const Ast, allocator: Allocator) !CompileResult {
         var self = Self{
@@ -87,6 +93,12 @@ pub const Compiler = struct {
             .errors = .empty,
             .allocator = allocator,
         };
+
+        // Pre-register builtin type atom names at fixed IDs 0-6.
+        for (type_atom_names) |name| {
+            try self.atom_table.put(allocator, name, self.atom_count);
+            self.atom_count += 1;
+        }
 
         // Find and compile the root node (last node in the AST).
         const root_idx: u32 = @intCast(ast_ptr.nodes.len - 1);
@@ -493,10 +505,24 @@ pub const Compiler = struct {
 
         self.beginScope();
 
+        const last_stmt_idx = stmts[stmts.len - 1];
+        const last_tag = self.ast.nodes.items(.tag)[last_stmt_idx];
+
         // Compile all statements. The last one should leave its value on stack.
         for (stmts, 0..) |stmt_idx, i| {
-            try self.compileNode(stmt_idx);
-            if (i < stmts.len - 1) {
+            const is_last = (i == stmts.len - 1);
+
+            if (is_last and last_tag == .expr_stmt) {
+                // For the last item in a block, if it's an expr_stmt, compile
+                // just the inner expression WITHOUT the pop, so its value
+                // remains on the stack as the block's result.
+                const inner_data = self.ast.nodes.items(.data)[stmt_idx];
+                try self.compileNode(inner_data.lhs);
+            } else {
+                try self.compileNode(stmt_idx);
+            }
+
+            if (!is_last) {
                 const stmt_tag = self.ast.nodes.items(.tag)[stmt_idx];
                 // Statements that don't produce values (let, while, for, assign) don't need pop.
                 if (stmt_tag == .expr_stmt) {
@@ -509,8 +535,13 @@ pub const Compiler = struct {
 
         // End scope: pop locals but we need to keep the last expression value.
         // Count how many locals were added in this scope.
-        const last_stmt_idx = stmts[stmts.len - 1];
-        const last_tag = self.ast.nodes.items(.tag)[last_stmt_idx];
+        // Determine if the last item leaves a value on the stack.
+        // For expr_stmt (handled above), the inner expression is on the stack.
+        // For bare expressions (unlikely in a block), they're on the stack.
+        // For statements (let, while, etc.), nothing extra is on the stack.
+        const last_is_value = (last_tag == .expr_stmt or
+            (last_tag != .let_decl and last_tag != .while_stmt and
+            last_tag != .for_stmt and last_tag != .assign_stmt));
 
         // Count locals to pop.
         var pop_count: u32 = 0;
@@ -520,183 +551,21 @@ pub const Compiler = struct {
         }
         self.scope_depth -= 1;
 
-        // If the last item is an expression (not a statement), we need to
-        // preserve its value while popping locals from underneath it.
-        if (last_tag != .let_decl and last_tag != .while_stmt and last_tag != .for_stmt and last_tag != .assign_stmt and last_tag != .expr_stmt) {
-            // The result is on top of stack. Locals are below it.
-            // We need to pop the locals beneath the result.
-            // Strategy: set_local to slot 0 (temp), pop locals, get_local 0.
-            // Actually, simpler: for each local to pop, we emit a pop BEFORE the result.
-            // But the result is already on top...
-            // Best approach: track the base slot, and after leaving the scope, emit pops.
-            // The result value is on top. We need to slide it down past the locals.
-            // For now, use a simple approach: stash the result, pop locals, push result back.
-            // Actually the simplest and most common approach: just pop the locals from under.
-            // Since we can't easily do that, we'll reorganize.
-            // Better approach: result is on top of stack. Locals are the N slots below it.
-            // We can use set_local to the base slot, pop everything, then get_local base.
-            // ... this is getting complex. Let's just use the standard approach:
-            // Pop locals that are ABOVE the result. Since locals are below, we actually
-            // need a different strategy.
-            //
-            // Standard Lox approach for blocks: the result is on top. Pop all locals
-            // from the scope, which means popping from below the result. Most VMs handle
-            // this by just noting that the VM should pop N items from under the top.
-            //
-            // Simple approach for now: emit OP_POPs. The result on top stays, and we
-            // pop the locals from underneath... but standard OP_POP removes the top.
-            //
-            // Actually: re-think. When we exit a block like { let x = 1; x + 2 }:
-            //   Stack: [..., 1 (x), 3 (result)]
-            // We need to end up with: [..., 3]
-            // So we need to swap top with underneath, then pop. Or we can use a
-            // rotate/swap operation. Since we don't have that, let's do:
-            //   1. For each local, emit a pop to remove it from under the result.
-            //      But op_pop removes the TOP item, not underneath.
-            //
-            // Real solution: emit the pops BETWEEN the last-but-one statement and
-            // the last expression. But we already compiled everything.
-            //
-            // Practical solution used in Crafting Interpreters: for blocks that
-            // produce a value, we handle it by not popping the last expression.
-            // The scope locals get popped explicitly. The trick is: the locals ARE
-            // the stack slots. When we pop locals, the result stays because it's
-            // on top of them.
-            //
-            // Wait -- that's exactly what happens:
-            //   Stack: [local_x=1, result=3]
-            //   Pop locals (1 pop): removes top -> removes result!
-            //
-            // Hmm. The issue is that locals AND the result are interleaved.
-            // Actually no: locals are assigned during `let`, and the result
-            // expression is evaluated after all lets. So:
-            //   let x = 1   -> stack: [1]
-            //   x + 2       -> stack: [1, 3]
-            //   end scope   -> need to pop local x, keep 3
-            //
-            // So we need to pop 1 element from UNDER the top. This requires
-            // either a swap+pop or a special opcode.
-            //
-            // For simplicity, I'll handle this at the block level:
-            // After evaluating all statements including the final expression,
-            // if there are locals to pop, we need to slide the result down.
-            // We can do this by emitting set_local to the base_slot position,
-            // then popping the remaining locals, then getting from base_slot.
-            //
-            // Actually even simpler: just pop the excess. The result is on top.
-            // Pop count locals from underneath. Since we can't pop from underneath,
-            // we'll just pop from top (destroying result), but save/restore it.
-            // We don't have save/restore... Let's just emit pop_count OP_POPs
-            // and note that for block expressions, the compiler "swaps" before popping.
-
-            // Practical approach: we need some mechanism.
-            // Simplest: just emit extra pops. The result on top gets destroyed.
-            // Then emit the result again? No, we can't replay.
-            //
-            // OK: cleanest approach for Phase 1. We don't have closures or complex
-            // scoping yet. Let's just handle it with a simple pattern:
-            // - Before the last expression, note the base slot.
-            // - After compiling the last expression (result on top),
-            //   set it into the base_slot, pop all locals above base, then get base_slot.
-            // But this changes the slot...
-            //
-            // SIMPLEST correct approach: after compiling block contents, the result
-            // is on top and locals are below. To remove locals while keeping result:
-            // If pop_count > 0, we set_local to the first local slot of this scope,
-            // then pop (pop_count - 1) times, and the result now sits in that slot
-            // where it'll be used as the "value" of the block expression.
-            // BUT: this slot is about to go out of scope.
-            //
-            // ACTUALLY: the simplest correct pattern used by many compilers is:
-            // Pop count is the number of locals. Each local IS a stack slot.
-            // The last value (block result) is at stack_top. The locals are below it.
-            // We need pop_count "swaps" or one rotate. Since we don't have rotate,
-            // let's just do: for each pop, we emit op_pop but NOTE: op_pop removes
-            // the TOP. So if we do pop_count op_pops, we remove the result + (pop_count-1) locals.
-            // That's wrong.
-            //
-            // Final approach: I'll use a two-step strategy:
-            // 1. When there's a block result and locals to clean up,
-            //    rewrite the compilation so we endScope BEFORE the last expression.
-            //    This way locals are popped, then the last expression is evaluated
-            //    with access to parent scope only.
-            //
-            // But the last expression might reference block locals (like `x + 2` where x is local).
-            // So we can't pop locals before evaluating it.
-            //
-            // THE ACTUAL STANDARD APPROACH: Don't pop at compile time. Instead,
-            // the endScope emits pops for every local EXCEPT that we account for
-            // the block result being on top. So we:
-            //   1. Compile last expression -> result on top of locals
-            //   2. For each local, copy the top value down by one slot:
-            //      set_local(base_slot), pop remaining locals.
-            //   Actually even simpler for a single-pass compiler:
-            //   The result is on top. We can do pop_count OP_POPs *below* it by
-            //   just accepting that the VM maintains stack_top correctly and we
-            //   emit a sequence of instructions that effectively does:
-            //   temp = pop(); for N: pop(); push(temp);
-            //
-            // For Phase 1 correctness and simplicity, I'll use this approach:
-            // After compiling all block stmts, if there are locals AND the last
-            // item leaves a value:
-            //   - Store result in a temporary (set_local to first scope slot).
-            //   - Pop the remaining scope locals.
-            //   - Get the temporary back (get_local first scope slot).
-            //   Actually this still leaves the temp local on stack.
-            //
-            // CLEANEST: Let me just use pop_count op_pop AFTER the result.
-            // This means the block result gets popped too. But then we need
-            // to recompute the result. That's not possible.
-            //
-            // OK, I'm overcomplicating this. Let me use the approach from Crafting
-            // Interpreters: endScope pops ALL locals, and block expressions
-            // handle the result by setting the result into slot[base], popping
-            // the rest. Actually CI doesn't have block expressions.
-            //
-            // FINAL APPROACH for Phase 1:
-            // I will NOT emit pops for scope cleanup in block expressions when
-            // the last element is an expression producing a value. Instead:
-            // - The last expression value is on top of the stack.
-            // - I record the base_slot at scope entry.
-            // - At scope exit, I know how many slots to reclaim.
-            // - I emit OP_POP for (local_count - base) - but FIRST I need to
-            //   rotate the value down. Since I don't have rotate, I'll use:
-            //   Emit nothing. Just adjust local_count. The VM stack slots
-            //   for locals become "dead" but aren't explicitly popped.
-            //   Then on the next scope/function entry, they'll be overwritten.
-            //   This "leaks" stack slots but is correct for Phase 1 where we
-            //   don't have deep nesting and stack overflow checks will catch issues.
-            //
-            // WAIT. Actually the simplest and CORRECT approach is: pop EVERYTHING
-            // including the result, and note that we need the result. Before popping,
-            // stash it in a local slot.
-            //
-            // Let me just use the "pop under" approach:
-            //   result is at stack[top]
-            //   locals are at stack[base..top-1]
-            //   We want stack[base-1] = result, top = base
-            //   So: conceptually set stack[base_before_scope] = stack[top], top = base_before_scope + 1
-            //   But we can't do that with just set_local and pop.
-            //
-            //   set_local(base_before_scope) -> stack[base] = result (top unchanged)
-            //   Then pop (pop_count) times -> removes top, top, top...
-            //   After pop_count pops: top = original_top - pop_count
-            //   original_top = base + pop_count + 1 (locals + result)
-            //   After pops: top = base + 1, stack[base] = result. CORRECT!
-
+        if (last_is_value) {
+            // The last expression value is on top of the stack. Locals are below it.
+            // To preserve the result while removing locals, we use the set_local/pop/get_local
+            // pattern: store result into the base slot, pop everything, then retrieve it.
             if (pop_count > 0) {
-                // base_slot is the first local in this scope
-                const base_slot: u8 = self.local_count; // after decrementing
+                const base_slot: u8 = self.local_count; // first slot in this scope (after decrementing)
                 try self.emitOp(.op_set_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
-                // Pop the remaining (pop_count) slots including the duplicated result
                 for (0..pop_count) |_| {
                     try self.emitOp(.op_pop, self.getLine(node_idx));
                 }
-                // Now get the result back from base_slot
                 try self.emitOp(.op_get_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
             }
+            // If no locals, the value is already on top -- nothing to do.
         } else {
             // Last statement is a statement (let, while, etc.) that doesn't leave a value.
             // Pop all locals and emit nil as the block's value.
@@ -1109,8 +978,8 @@ test "compile: atom literal" {
     defer tc.deinit(allocator);
 
     try std.testing.expect(!tc.result.hasErrors());
-    // Atom should be interned with id 0.
-    try std.testing.expectEqual(@as(u32, 1), tc.result.atom_count);
+    // Atom should be interned (after the 7 pre-registered type atoms).
+    try std.testing.expectEqual(@as(u32, 8), tc.result.atom_count);
     try std.testing.expect(tc.result.atom_table.contains("ok"));
 }
 

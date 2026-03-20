@@ -1,0 +1,13 @@
+let x = 42
+print(x)
+let y = x + 8
+print(y)
+-- Shadowing
+let x = 100
+print(x)
+-- Block scoping
+{
+  let z = 999
+  print(z)
+}
+print(x)

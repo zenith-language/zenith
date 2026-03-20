@@ -1,0 +1,6 @@
+:int
+:float
+:bool
+:nil
+:string
+assertions passed

@@ -1,0 +1,4 @@
+print("hello" ++ " " ++ "world")
+print(len("hello"))
+print(str(42))
+print(str(true))
