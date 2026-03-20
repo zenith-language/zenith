@@ -1,15 +1,15 @@
 // Zenith library root -- re-exports public API for consumers.
 //
-// All submodules are imported here so that `zig build test` can discover
-// their inline test blocks through transitive reference analysis.
+// All submodules are provided via named module imports from the build system.
+// This avoids cross-directory import issues in Zig 0.15+.
 
-pub const token = @import("compiler/token.zig");
-pub const memory = @import("runtime/memory.zig");
-pub const value = @import("runtime/value.zig");
-pub const obj = @import("runtime/obj.zig");
-pub const chunk = @import("runtime/chunk.zig");
-pub const err = @import("common/error.zig");
-pub const debug = @import("common/debug.zig");
+pub const token = @import("token");
+pub const memory = @import("memory");
+pub const value = @import("value");
+pub const obj = @import("obj");
+pub const chunk = @import("chunk");
+pub const err = @import("error");
+pub const debug = @import("debug");
 
 test {
     // Force the test runner to analyse all transitive dependencies so
