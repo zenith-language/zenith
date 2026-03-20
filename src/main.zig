@@ -135,9 +135,8 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     const atom_names = try buildAtomNames(&compile_result, allocator);
     defer allocator.free(atom_names);
 
-    // 4. Execute -- extract chunk from top-level closure.
-    const top_chunk = &compile_result.closure.function.chunk;
-    var vm = VM.initForScript(top_chunk, allocator);
+    // 4. Execute -- use closure-based VM.
+    var vm = VM.initWithClosure(compile_result.closure, allocator);
     try vm.setAtomNames(atom_names, allocator);
 
     _ = vm.run() catch {
