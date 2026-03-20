@@ -4,3 +4,15 @@ while i < 5 {
   print(i)
   i = i + 1
 }
+-- For-in with range(n)
+for j in range(3) {
+  print(j)
+}
+-- For-in with range(start, end)
+for k in range(5, 8) {
+  print(k)
+}
+-- For-in with range(start, end, step)
+for m in range(0, 10, 3) {
+  print(m)
+}
