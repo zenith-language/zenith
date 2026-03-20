@@ -143,7 +143,7 @@ pub const Diagnostic = struct {
         // Source context
         const source_line = getSourceLine(source, diag.span.start);
         const line_num_width = digitCount(loc.line);
-        const pad = line_num_width + 1;
+        const pad = line_num_width + 2;
 
         // Empty gutter line
         try writeSpaces(writer, pad);
