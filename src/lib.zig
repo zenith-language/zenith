@@ -14,6 +14,8 @@ pub const lexer = @import("lexer");
 pub const ast = @import("ast");
 pub const parser = @import("parser");
 pub const compiler = @import("compiler");
+pub const builtins = @import("builtins");
+pub const vm = @import("vm");
 
 test {
     // Force the test runner to analyse all transitive dependencies so

@@ -89,6 +89,29 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const builtins_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/builtins.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+        },
+    });
+
+    const vm_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "chunk", .module = chunk_mod },
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "error", .module = error_mod },
+            .{ .name = "builtins", .module = builtins_mod },
+        },
+    });
+
     const compiler_mod = b.createModule(.{
         .root_source_file = b.path("src/compiler/compiler.zig"),
         .target = target,
@@ -122,6 +145,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ast", .module = ast_mod },
             .{ .name = "parser", .module = parser_mod },
             .{ .name = "compiler", .module = compiler_mod },
+            .{ .name = "builtins", .module = builtins_mod },
+            .{ .name = "vm", .module = vm_mod },
         },
     });
 
@@ -174,6 +199,8 @@ pub fn build(b: *std.Build) void {
         ast_mod,
         parser_mod,
         compiler_mod,
+        builtins_mod,
+        vm_mod,
     };
 
     for (test_modules) |mod| {
