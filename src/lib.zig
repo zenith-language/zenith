@@ -13,6 +13,7 @@ pub const debug = @import("debug");
 pub const lexer = @import("lexer");
 pub const ast = @import("ast");
 pub const parser = @import("parser");
+pub const compiler = @import("compiler");
 
 test {
     // Force the test runner to analyse all transitive dependencies so
