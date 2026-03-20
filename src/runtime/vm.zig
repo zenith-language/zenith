@@ -344,7 +344,7 @@ pub const VM = struct {
                     try self.push(val);
                 },
 
-                .op_closure, .op_get_upvalue, .op_set_upvalue, .op_close_upvalue, .op_tail_call => {
+                .op_closure, .op_get_upvalue, .op_set_upvalue, .op_close_upvalue, .op_close_upvalue_at, .op_tail_call => {
                     try self.runtimeErrorLegacy(.E001, "closure opcodes require frame mode");
                     return error.RuntimeErr;
                 },
@@ -503,6 +503,11 @@ pub const VM = struct {
                 .op_close_upvalue => {
                     self.closeUpvalues(self.stack_top - 1);
                     _ = try self.pop();
+                },
+
+                .op_close_upvalue_at => {
+                    const slot = self.readByteFrame();
+                    self.closeUpvalues(frame.base_slot + slot);
                 },
 
                 .op_return => {

@@ -25,6 +25,7 @@ const TestCase = struct {
 };
 
 const normal_tests = [_]TestCase{
+    // Phase 1 tests
     .{ .name = "arithmetic", .zen_path = "tests/zen/arithmetic.zen", .expected_path = "tests/zen/arithmetic.expected", .is_error_test = false },
     .{ .name = "let_bindings", .zen_path = "tests/zen/let_bindings.zen", .expected_path = "tests/zen/let_bindings.expected", .is_error_test = false },
     .{ .name = "if_else", .zen_path = "tests/zen/if_else.zen", .expected_path = "tests/zen/if_else.expected", .is_error_test = false },
@@ -33,13 +34,24 @@ const normal_tests = [_]TestCase{
     .{ .name = "blocks", .zen_path = "tests/zen/blocks.zen", .expected_path = "tests/zen/blocks.expected", .is_error_test = false },
     .{ .name = "strings", .zen_path = "tests/zen/strings.zen", .expected_path = "tests/zen/strings.expected", .is_error_test = false },
     .{ .name = "builtins", .zen_path = "tests/zen/builtins.zen", .expected_path = "tests/zen/builtins.expected", .is_error_test = false },
+    // Phase 2 tests
+    .{ .name = "functions", .zen_path = "tests/zen/functions.zen", .expected_path = "tests/zen/functions.expected", .is_error_test = false },
+    .{ .name = "closures", .zen_path = "tests/zen/closures.zen", .expected_path = "tests/zen/closures.expected", .is_error_test = false },
+    .{ .name = "pipes", .zen_path = "tests/zen/pipes.zen", .expected_path = "tests/zen/pipes.expected", .is_error_test = false },
+    .{ .name = "lambdas", .zen_path = "tests/zen/lambdas.zen", .expected_path = "tests/zen/lambdas.expected", .is_error_test = false },
+    .{ .name = "named_args", .zen_path = "tests/zen/named_args.zen", .expected_path = "tests/zen/named_args.expected", .is_error_test = false },
+    .{ .name = "tail_calls", .zen_path = "tests/zen/tail_calls.zen", .expected_path = "tests/zen/tail_calls.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
+    // Phase 1 error tests
     .{ .name = "type_mismatch", .zen_path = "tests/zen/errors/type_mismatch.zen", .expected_path = "tests/zen/errors/type_mismatch.expected", .is_error_test = true },
     .{ .name = "overflow", .zen_path = "tests/zen/errors/overflow.zen", .expected_path = "tests/zen/errors/overflow.expected", .is_error_test = true },
     .{ .name = "div_zero", .zen_path = "tests/zen/errors/div_zero.zen", .expected_path = "tests/zen/errors/div_zero.expected", .is_error_test = true },
     .{ .name = "undefined_var", .zen_path = "tests/zen/errors/undefined_var.zen", .expected_path = "tests/zen/errors/undefined_var.expected", .is_error_test = true },
+    // Phase 2 error tests
+    .{ .name = "not_callable", .zen_path = "tests/zen/errors/not_callable.zen", .expected_path = "tests/zen/errors/not_callable.expected", .is_error_test = true },
+    .{ .name = "arity_mismatch", .zen_path = "tests/zen/errors/arity_mismatch.zen", .expected_path = "tests/zen/errors/arity_mismatch.expected", .is_error_test = true },
 };
 
 // ── Pipeline runner ────────────────────────────────────────────────────────
@@ -234,6 +246,32 @@ test "e2e: builtins" {
     try runNormalTest(normal_tests[7]);
 }
 
+// ── Phase 2 normal tests ──────────────────────────────────────────────────
+
+test "e2e: functions" {
+    try runNormalTest(normal_tests[8]);
+}
+
+test "e2e: closures" {
+    try runNormalTest(normal_tests[9]);
+}
+
+test "e2e: pipes" {
+    try runNormalTest(normal_tests[10]);
+}
+
+test "e2e: lambdas" {
+    try runNormalTest(normal_tests[11]);
+}
+
+test "e2e: named_args" {
+    try runNormalTest(normal_tests[12]);
+}
+
+test "e2e: tail_calls" {
+    try runNormalTest(normal_tests[13]);
+}
+
 // ── Error tests ────────────────────────────────────────────────────────────
 
 fn runErrorTest(tc: TestCase) !void {
@@ -282,6 +320,16 @@ test "e2e error: div_zero" {
 
 test "e2e error: undefined_var" {
     try runErrorTest(error_tests[3]);
+}
+
+// ── Phase 2 error tests ──────────────────────────────────────────────────
+
+test "e2e error: not_callable" {
+    try runErrorTest(error_tests[4]);
+}
+
+test "e2e error: arity_mismatch" {
+    try runErrorTest(error_tests[5]);
 }
 
 // ── Bytecode roundtrip test ────────────────────────────────────────────────

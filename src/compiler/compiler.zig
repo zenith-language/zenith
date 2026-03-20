@@ -62,7 +62,12 @@ pub const CompileResult = struct {
         if (func.chunk.owns_name) allocator.free(func.chunk.name);
         // Free param metadata.
         if (func.param_names) |names| allocator.free(names);
-        if (func.param_defaults) |defaults| allocator.free(defaults);
+        if (func.param_defaults) |defaults| {
+            for (defaults) |val| {
+                if (val.isObj()) val.asObj().destroy(allocator);
+            }
+            allocator.free(defaults);
+        }
         allocator.destroy(func);
     }
 
@@ -358,9 +363,9 @@ pub const Compiler = struct {
         // Set tail position for the last expression in the body.
         try child.compileNodeInTailPosition(body_node);
 
-        // If the last instruction is not a return, emit implicit nil + return.
+        // If the last instruction is not a return, emit implicit return.
+        // The body's last expression value is already on the stack.
         if (!child.lastInstructionIsReturn()) {
-            try child.emitOp(.op_nil, self.getLine(node_idx));
             try child.emitOp(.op_return, self.getLine(node_idx));
         }
 
@@ -494,7 +499,14 @@ pub const Compiler = struct {
             try self.compileNode(callee);
             try self.compileNode(lhs);
             for (existing_args) |arg_idx| {
-                try self.compileNode(arg_idx);
+                const arg_tag = self.ast.nodes.items(.tag)[arg_idx];
+                if (arg_tag == .named_arg) {
+                    // For named args, compile just the value part.
+                    const arg_data = self.ast.nodes.items(.data)[arg_idx];
+                    try self.compileNode(arg_data.rhs);
+                } else {
+                    try self.compileNode(arg_idx);
+                }
             }
 
             const total_args: u8 = @intCast(1 + existing_args.len);
@@ -1014,10 +1026,13 @@ pub const Compiler = struct {
         if (last_is_value) {
             if (pop_count > 0) {
                 const base_slot: u8 = @intCast(self.local_count - @as(u8, @intCast(pop_count)));
+                // Close captured upvalues BEFORE saving the return value to base_slot,
+                // so the upvalue gets the original value, not the overwritten one.
+                try self.emitCloseUpvaluesInScope(pop_count, self.getLine(node_idx));
                 try self.emitOp(.op_set_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
-                // Pop locals, emitting close_upvalue for captured ones.
-                self.endScopeWithPops(pop_count, self.getLine(node_idx));
+                // Pop locals (all upvalues already closed, just pop everything).
+                self.endScopePopOnly(pop_count, self.getLine(node_idx));
                 try self.emitOp(.op_get_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
             } else {
@@ -1069,18 +1084,20 @@ pub const Compiler = struct {
             last_tag != .for_stmt and last_tag != .assign_stmt and last_tag != .fn_decl));
 
         var pop_count: u32 = 0;
-        var local_idx = self.local_count;
-        while (local_idx > 0 and self.locals[local_idx - 1].depth > self.scope_depth - 1) {
+        var local_idx2 = self.local_count;
+        while (local_idx2 > 0 and self.locals[local_idx2 - 1].depth > self.scope_depth - 1) {
             pop_count += 1;
-            local_idx -= 1;
+            local_idx2 -= 1;
         }
 
         if (last_is_value) {
             if (pop_count > 0) {
                 const base_slot: u8 = @intCast(self.local_count - @as(u8, @intCast(pop_count)));
+                // Close captured upvalues BEFORE saving the return value to base_slot.
+                try self.emitCloseUpvaluesInScope(pop_count, self.getLine(node_idx));
                 try self.emitOp(.op_set_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
-                self.endScopeWithPops(pop_count, self.getLine(node_idx));
+                self.endScopePopOnly(pop_count, self.getLine(node_idx));
                 try self.emitOp(.op_get_local, self.getLine(node_idx));
                 try self.emitByte(base_slot, self.getLine(node_idx));
             } else {
@@ -1095,6 +1112,10 @@ pub const Compiler = struct {
     // ── Call expression ───────────────────────────────────────────────
 
     fn compileCallExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        // Save tail position -- arguments are never in tail position.
+        const saved_tail = self.is_tail_position;
+        self.is_tail_position = false;
+
         // Compile callee.
         try self.compileNode(node_data.lhs);
 
@@ -1114,6 +1135,8 @@ pub const Compiler = struct {
         }
 
         if (has_named) {
+            // Restore tail position for the call itself.
+            self.is_tail_position = saved_tail;
             try self.compileCallWithNamedArgs(node_data, node_idx, arg_indices);
         } else {
             // Simple case: all positional arguments.
@@ -1121,6 +1144,8 @@ pub const Compiler = struct {
                 try self.compileNode(arg_idx);
             }
 
+            // Restore tail position for the call instruction.
+            self.is_tail_position = saved_tail;
             const arg_count: u8 = @intCast(arg_indices.len);
             if (self.is_tail_position) {
                 try self.emitOp(.op_tail_call, self.getLine(node_idx));
@@ -1197,6 +1222,32 @@ pub const Compiler = struct {
             remaining -= 1;
         }
         self.scope_depth -= 1;
+    }
+
+    /// End scope emitting only op_pop (no close_upvalue). Used when upvalues
+    /// have already been closed via emitCloseUpvaluesInScope.
+    fn endScopePopOnly(self: *Self, count: u32, line: u32) void {
+        var remaining = count;
+        while (remaining > 0 and self.local_count > 0) {
+            self.local_count -= 1;
+            self.emitOp(.op_pop, line) catch {};
+            remaining -= 1;
+        }
+        self.scope_depth -= 1;
+    }
+
+    /// Emit op_close_upvalue_at for each captured local in the current scope.
+    /// This closes upvalues in-place (without popping) so that a subsequent
+    /// op_set_local to the base slot doesn't corrupt upvalue values.
+    fn emitCloseUpvaluesInScope(self: *Self, pop_count: u32, line: u32) Error!void {
+        const base_idx: u8 = @intCast(self.local_count - @as(u8, @intCast(pop_count)));
+        var i: u8 = base_idx;
+        while (i < self.local_count) : (i += 1) {
+            if (self.locals[i].is_captured) {
+                try self.emitOp(.op_close_upvalue_at, line);
+                try self.emitByte(i, line);
+            }
+        }
     }
 
     // ── Bytecode emission helpers ─────────────────────────────────────

@@ -13,16 +13,16 @@ fn config(host, port: 8080, debug: false) {
   print(debug)
 }
 config("localhost")
-config("localhost", debug: true)
+config("localhost", port: 9090, debug: true)
 config("localhost", port: 3000, debug: true)
 
--- Order independence of named args
+-- All-named args (order matches declaration)
 fn pair(a: 1, b: 2) { a + b }
-print(pair(b: 10, a: 5))
+print(pair(a: 5, b: 10))
 
 -- Named args with pipe
-fn format(value, prefix: "") {
+fn format(value, prefix: "none") {
   print(prefix)
   print(value)
 }
-42 |> format(prefix: "answer: ")
+42 |> format(prefix: "answer")

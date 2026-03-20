@@ -64,6 +64,7 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, writer: anytyp
         .op_get_upvalue => try byteInstruction("OP_GET_UPVALUE", chunk, offset, writer),
         .op_set_upvalue => try byteInstruction("OP_SET_UPVALUE", chunk, offset, writer),
         .op_close_upvalue => try simpleInstruction("OP_CLOSE_UPVALUE", offset, writer),
+        .op_close_upvalue_at => try byteInstruction("OP_CLOSE_UPVALUE_AT", chunk, offset, writer),
         .op_call => try byteInstruction("OP_CALL", chunk, offset, writer),
         .op_tail_call => try byteInstruction("OP_TAIL_CALL", chunk, offset, writer),
         .op_return => try simpleInstruction("OP_RETURN", offset, writer),

@@ -59,6 +59,7 @@ pub const OpCode = enum(u8) {
     op_get_upvalue, // [slot: u8]
     op_set_upvalue, // [slot: u8]
     op_close_upvalue, // no operand, closes upvalue at stack_top - 1
+    op_close_upvalue_at, // [slot: u8] closes upvalues at frame.base_slot + slot without popping
 
     // -- Calls --------------------------------------------------------------
     op_call, // reserved for builtins
@@ -669,4 +670,74 @@ test "Chunk deserialize rejects incompatible major version" {
     var stream = std.io.fixedBufferStream(&buf);
     const result = Chunk.deserialize(stream.reader(), allocator);
     try std.testing.expectError(error.IncompatibleVersion, result);
+}
+
+test "Chunk serialize round-trips closure opcodes" {
+    const allocator = std.testing.allocator;
+
+    // Build a chunk with Phase 2 closure opcodes.
+    var original: Chunk = .{};
+
+    // op_closure with a constant index of 0, followed by upvalue descriptor (is_local=1, index=1).
+    try original.write(@intFromEnum(OpCode.op_closure), 1, allocator);
+    try original.write(0, 1, allocator); // const_idx
+    try original.write(1, 1, allocator); // is_local
+    try original.write(1, 1, allocator); // index
+
+    // op_get_upvalue with slot 0.
+    try original.write(@intFromEnum(OpCode.op_get_upvalue), 2, allocator);
+    try original.write(0, 2, allocator);
+
+    // op_set_upvalue with slot 0.
+    try original.write(@intFromEnum(OpCode.op_set_upvalue), 3, allocator);
+    try original.write(0, 3, allocator);
+
+    // op_close_upvalue.
+    try original.write(@intFromEnum(OpCode.op_close_upvalue), 4, allocator);
+
+    // op_tail_call with arg_count 2.
+    try original.write(@intFromEnum(OpCode.op_tail_call), 5, allocator);
+    try original.write(2, 5, allocator);
+
+    // Add a constant (needed for op_closure reference).
+    _ = try original.addConstant(Value.fromInt(99), allocator);
+
+    original.name = "closure_test.zen";
+
+    // Serialize.
+    var buf = std.ArrayListUnmanaged(u8){};
+    defer buf.deinit(allocator);
+    try original.serialize(buf.writer(allocator));
+
+    // Clean up original.
+    original.code.deinit(allocator);
+    original.constants.deinit(allocator);
+    original.lines.deinit(allocator);
+    original.atom_names.deinit(allocator);
+
+    // Deserialize.
+    var stream = std.io.fixedBufferStream(buf.items);
+    var deserialized = try Chunk.deserialize(stream.reader(), allocator);
+    defer {
+        for (deserialized.constants.items) |val| {
+            if (val.isObj()) val.asObj().destroy(allocator);
+        }
+        deserialized.deinit(allocator);
+    }
+
+    // Verify code length matches.
+    try std.testing.expectEqual(@as(usize, 11), deserialized.code.items.len);
+
+    // Verify opcodes round-tripped correctly.
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_closure), deserialized.code.items[0]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_get_upvalue), deserialized.code.items[4]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_set_upvalue), deserialized.code.items[6]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_close_upvalue), deserialized.code.items[8]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.op_tail_call), deserialized.code.items[9]);
+
+    // Verify operands.
+    try std.testing.expectEqual(@as(u8, 0), deserialized.code.items[1]); // const_idx for closure
+    try std.testing.expectEqual(@as(u8, 1), deserialized.code.items[2]); // is_local
+    try std.testing.expectEqual(@as(u8, 1), deserialized.code.items[3]); // index
+    try std.testing.expectEqual(@as(u8, 2), deserialized.code.items[10]); // tail_call arg_count
 }
