@@ -1,0 +1,54 @@
+-- Basic closure capture
+fn make_greeter(name) {
+  fn greet() { print(name) }
+  greet
+}
+let hi = make_greeter("world")
+hi()
+
+-- Closure mutation (capture by reference)
+fn make_counter() {
+  let count = 0
+  fn increment() {
+    count = count + 1
+    count
+  }
+  increment
+}
+let c = make_counter()
+print(c())
+print(c())
+print(c())
+
+-- Shared upvalues (two closures over same variable)
+fn make_pair() {
+  let x = 0
+  fn get() { x }
+  fn set(val) { x = val }
+  let g = get
+  let s = set
+  s(42)
+  print(g())
+}
+make_pair()
+
+-- Closure survives enclosing scope exit
+fn outer() {
+  let x = "captured"
+  fn inner() { x }
+  inner
+}
+let f = outer()
+print(f())
+
+-- Nested closure (two levels deep)
+fn a() {
+  let x = 1
+  fn b() {
+    let y = 2
+    fn c() { x + y }
+    c
+  }
+  b
+}
+print(a()()())

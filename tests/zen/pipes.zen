@@ -1,0 +1,25 @@
+-- Bare function pipe
+fn double(x) { x * 2 }
+print(5 |> double)
+
+-- Pipe with additional args
+fn add(a, b) { a + b }
+print(5 |> add(3))
+
+-- Pipe chain
+fn inc(x) { x + 1 }
+print(1 |> inc |> double |> inc)
+
+-- Pipe with lambda in parens
+print(10 |> (|x| x * x))
+
+-- Multi-line pipe chain
+let result = 1
+  |> inc
+  |> double
+  |> inc
+print(result)
+
+-- Pipe passes first positional arg
+fn sub(a, b) { a - b }
+print(10 |> sub(3))

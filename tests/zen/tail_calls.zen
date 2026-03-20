@@ -1,0 +1,13 @@
+-- Deep tail recursion (should not overflow)
+fn count_down(n) {
+  if n <= 0 { return 0 }
+  count_down(n - 1)
+}
+print(count_down(100000))
+
+-- Tail recursive sum
+fn sum_tail(n, acc) {
+  if n <= 0 { return acc }
+  sum_tail(n - 1, acc + n)
+}
+print(sum_tail(1000, 0))

@@ -1,0 +1,44 @@
+-- Basic function declaration and call
+fn add(a, b) { a + b }
+print(add(1, 2))
+
+-- Function returning a value (implicit return)
+fn square(x) { x * x }
+print(square(5))
+
+-- Function as first-class value (pass as argument)
+fn apply(f, x) { f(x) }
+print(apply(square, 4))
+
+-- Function returning a function
+fn make_adder(n) {
+  fn adder(x) { x + n }
+  adder
+}
+let add5 = make_adder(5)
+print(add5(10))
+
+-- Function stored in variable
+let f = add
+print(f(3, 4))
+
+-- Recursive function (self-reference via name)
+fn factorial(n) {
+  if n <= 1 { 1 } else { n * factorial(n - 1) }
+}
+print(factorial(5))
+
+-- Nested function declarations
+fn outer() {
+  fn inner() { 42 }
+  inner()
+}
+print(outer())
+
+-- Function with explicit return
+fn early_return(x) {
+  if x > 10 { return x }
+  0
+}
+print(early_return(15))
+print(early_return(5))

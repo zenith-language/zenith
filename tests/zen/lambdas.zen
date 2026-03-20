@@ -1,0 +1,26 @@
+-- Simple lambda
+let double = |x| x * 2
+print(double(3))
+
+-- Two-param lambda
+let add = |a, b| a + b
+print(add(2, 3))
+
+-- Zero-arg lambda (wildcard)
+let const42 = |_| 42
+print(const42())
+
+-- Lambda as argument
+fn apply(f, x) { f(x) }
+print(apply(|x| x + 10, 5))
+
+-- Immediately invoked lambda
+print((|x| x * x)(7))
+
+-- Lambda capturing variable
+let factor = 3
+let mul = |x| x * factor
+print(mul(4))
+
+-- Lambda in pipe (wrapped in parens)
+print(8 |> (|x| x + 2))

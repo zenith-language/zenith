@@ -1,0 +1,28 @@
+-- Named arg with default
+fn greet(name, greeting: "hello") {
+  print(greeting)
+  print(name)
+}
+greet("world")
+greet("world", greeting: "hi")
+
+-- Multiple named args with defaults
+fn config(host, port: 8080, debug: false) {
+  print(host)
+  print(port)
+  print(debug)
+}
+config("localhost")
+config("localhost", debug: true)
+config("localhost", port: 3000, debug: true)
+
+-- Order independence of named args
+fn pair(a: 1, b: 2) { a + b }
+print(pair(b: 10, a: 5))
+
+-- Named args with pipe
+fn format(value, prefix: "") {
+  print(prefix)
+  print(value)
+}
+42 |> format(prefix: "answer: ")
