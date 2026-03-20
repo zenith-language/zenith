@@ -10,6 +10,7 @@ pub const obj = @import("obj");
 pub const chunk = @import("chunk");
 pub const err = @import("error");
 pub const debug = @import("debug");
+pub const lexer = @import("lexer");
 
 test {
     // Force the test runner to analyse all transitive dependencies so

@@ -57,6 +57,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const lexer_mod = b.createModule(.{
+        .root_source_file = b.path("src/compiler/lexer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "token", .module = token_mod },
+            .{ .name = "error", .module = error_mod },
+        },
+    });
+
     // ── Library module (public API) ────────────────────────────────────
     const lib_mod = b.addModule("zenith", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -70,6 +80,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chunk", .module = chunk_mod },
             .{ .name = "error", .module = error_mod },
             .{ .name = "debug", .module = debug_mod },
+            .{ .name = "lexer", .module = lexer_mod },
         },
     });
 
@@ -118,6 +129,7 @@ pub fn build(b: *std.Build) void {
         chunk_mod,
         error_mod,
         debug_mod,
+        lexer_mod,
     };
 
     for (test_modules) |mod| {
