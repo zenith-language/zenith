@@ -59,6 +59,25 @@ pub const Ast = struct {
             if_expr, // data.lhs = condition, data.rhs = extra_data index -> {then, else}
             call_expr, // data.lhs = callee, data.rhs = extra_data index -> {arg_start, arg_end}
 
+            // ── Functions / Closures ────────────────────────────────────
+            // fn_decl: data.lhs = extra_data index -> {name_token, param_start, param_end,
+            //   body_node, defaults_start, defaults_end}, data.rhs = unused (0).
+            //   Parameters stored as token indices in extra_data[param_start..param_end].
+            //   Default expressions for named params in extra_data[defaults_start..defaults_end].
+            fn_decl,
+            // lambda_expr: data.lhs = extra_data index -> {param_start, param_end, body_node},
+            //   data.rhs = unused (0). Same param storage as fn_decl but no name.
+            lambda_expr,
+            // pipe_expr: data.lhs = left operand, data.rhs = right operand.
+            //   Left-associative. Right side can be identifier, call_expr, or grouped_expr.
+            pipe_expr,
+            // return_expr: data.lhs = value expression node (or Node.null_node for bare return),
+            //   data.rhs = unused (0).
+            return_expr,
+            // named_arg: data.lhs = name token index, data.rhs = value expression node.
+            //   Used as children of call_expr argument lists.
+            named_arg,
+
             // ── Statements ──────────────────────────────────────────────
             let_decl, // data.lhs = name token index, data.rhs = initializer expression node
             assign_stmt, // data.lhs = target, data.rhs = value expression
@@ -174,6 +193,8 @@ test "Ast: all Tag variants exist" {
         .greater,      .less_equal,    .greater_equal,
         .logical_and,  .logical_or,    .concat,
         .grouped_expr, .block_expr,    .if_expr,        .call_expr,
+        .fn_decl,      .lambda_expr,   .pipe_expr,      .return_expr,
+        .named_arg,
         .let_decl,     .assign_stmt,   .while_stmt,     .for_stmt,
         .expr_stmt,    .root,
     };

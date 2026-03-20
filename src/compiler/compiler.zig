@@ -193,6 +193,12 @@ pub const Compiler = struct {
             .block_expr => try self.compileBlockExpr(node_data, node_idx),
             .call_expr => try self.compileCallExpr(node_data, node_idx),
             .grouped_expr => try self.compileNode(node_data.lhs),
+
+            // Phase 2 function/closure nodes -- stubs until Plan 02-02 implements compilation.
+            .fn_decl, .lambda_expr, .pipe_expr, .return_expr, .named_arg => {
+                try self.emitError(node_idx, .E005, "unimplemented: function/closure compilation (Phase 2)");
+            },
+
             .root => {}, // handled above
         }
     }

@@ -25,6 +25,7 @@ pub const Tag = enum(u8) {
     greater, // >
     less_equal, // <=
     greater_equal, // >=
+    pipe, // | (lambda param delimiter)
     pipe_greater, // |>
 
     // ── Punctuation ────────────────────────────────────────────────────
@@ -204,6 +205,7 @@ test "Tag enum has all required token types" {
         .greater,
         .less_equal,
         .greater_equal,
+        .pipe,
         .pipe_greater,
         .left_paren,
         .right_paren,

@@ -130,7 +130,7 @@ pub const Lexer = struct {
                 if (self.match('>')) {
                     try self.addToken(.pipe_greater, allocator);
                 } else {
-                    try self.addErrorToken("unexpected character '|'", allocator);
+                    try self.addToken(.pipe, allocator);
                 }
             },
 

@@ -23,6 +23,9 @@ pub const Parser = struct {
     pos: u32,
     ast: Ast,
     allocator: Allocator,
+    /// Tracks nesting depth inside function bodies (fn/lambda).
+    /// Used to validate that `return` only appears inside functions.
+    fn_depth: u32 = 0,
 
     pub const Error = error{ParseError} || Allocator.Error;
 
@@ -72,6 +75,8 @@ pub const Parser = struct {
             .kw_let => self.parseLetDecl(),
             .kw_while => self.parseWhileStmt(),
             .kw_for => self.parseForStmt(),
+            .kw_fn => self.parseFnDecl(),
+            .kw_return => self.parseReturnStmt(),
             else => self.parseExprStmt(),
         };
     }
@@ -188,6 +193,7 @@ pub const Parser = struct {
     const Precedence = enum(u8) {
         none,
         or_prec, // or
+        pipe_prec, // |>
         and_prec, // and
         equality, // == !=
         comparison, // < > <= >=
@@ -224,6 +230,8 @@ pub const Parser = struct {
             .left_paren => self.parseGrouped(),
             .left_brace => self.parseBlockExpr(),
             .kw_if => self.parseIfExpr(),
+            .kw_fn => self.parseFnExpr(),
+            .pipe => self.parseLambda(),
             .int_literal => self.parseLiteral(.int_literal),
             .float_literal => self.parseLiteral(.float_literal),
             .string_literal => self.parseLiteral(.string_literal),
@@ -248,6 +256,11 @@ pub const Parser = struct {
             return self.parseCall(left);
         }
 
+        // Pipe operator: special handling for left-associative pipe chains.
+        if (op_tag == .pipe_greater) {
+            return self.parsePipe(left);
+        }
+
         const node_tag = self.tokenToNodeTag(op_tag);
         self.advance(); // consume operator
 
@@ -268,15 +281,16 @@ pub const Parser = struct {
 
         var args: std.ArrayListUnmanaged(u32) = .empty;
         defer args.deinit(self.allocator);
+        var seen_named = false;
 
         // Parse arguments.
         if (self.peekTag() != .right_paren) {
-            const first = try self.parseExpression();
-            try args.append(self.allocator, first);
+            const first_arg = try self.parseCallArg(&seen_named);
+            try args.append(self.allocator, first_arg);
 
             while (self.peekTag() == .comma) {
                 self.advance(); // consume ','
-                const arg = try self.parseExpression();
+                const arg = try self.parseCallArg(&seen_named);
                 try args.append(self.allocator, arg);
             }
         }
@@ -303,6 +317,33 @@ pub const Parser = struct {
             .main_token = paren_tok,
             .data = .{ .lhs = callee, .rhs = extra_idx },
         }, self.allocator);
+    }
+
+    /// Parse a single call argument, which may be a named argument (identifier: expr).
+    fn parseCallArg(self: *Parser, seen_named: *bool) Error!Node.Index {
+        // Check if this is a named argument: identifier followed by ':'
+        if (self.peekTag() == .identifier) {
+            // Look ahead: if the next token after identifier is ':', it's a named arg.
+            if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .colon) {
+                const name_tok = self.pos;
+                self.advance(); // consume identifier
+                self.advance(); // consume ':'
+                const value = try self.parseExpression();
+                seen_named.* = true;
+                return self.ast.addNode(.{
+                    .tag = .named_arg,
+                    .main_token = name_tok,
+                    .data = .{ .lhs = name_tok, .rhs = value },
+                }, self.allocator);
+            }
+        }
+
+        // Positional argument.
+        if (seen_named.*) {
+            try self.emitError("positional argument cannot follow named argument");
+            return error.ParseError;
+        }
+        return self.parseExpression();
     }
 
     fn parseLiteral(self: *Parser, tag: Node.Tag) Error!Node.Index {
@@ -436,12 +477,311 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
+    // ── Function / Lambda / Pipe / Return parsing ──────────────────────
+
+    /// Parse a named function declaration in statement position:
+    /// `fn name(params) { body }`
+    /// Also binds the name as a local (acts like `let name = fn ...`).
+    fn parseFnDecl(self: *Parser) Error!Node.Index {
+        const fn_tok = self.pos;
+        self.advance(); // consume 'fn'
+
+        // Expect function name.
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected function name after 'fn'");
+            return error.ParseError;
+        }
+        const name_tok = self.pos;
+        self.advance(); // consume name
+
+        // Expect '('.
+        if (self.peekTag() != .left_paren) {
+            try self.emitError("expected '(' after function name");
+            return error.ParseError;
+        }
+        self.advance(); // consume '('
+
+        // Parse parameter list.
+        var params: std.ArrayListUnmanaged(u32) = .empty;
+        defer params.deinit(self.allocator);
+        var defaults: std.ArrayListUnmanaged(u32) = .empty;
+        defer defaults.deinit(self.allocator);
+        var seen_named_param = false;
+
+        if (self.peekTag() != .right_paren) {
+            try self.parseFnParam(&params, &defaults, &seen_named_param);
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                try self.parseFnParam(&params, &defaults, &seen_named_param);
+            }
+        }
+
+        if (self.peekTag() != .right_paren) {
+            try self.emitError("expected ')' after parameters");
+            return error.ParseError;
+        }
+        self.advance(); // consume ')'
+
+        // Parse body (block expression).
+        self.fn_depth += 1;
+        const body = try self.parseBlockExpr();
+        self.fn_depth -= 1;
+
+        // Store in extra_data: name_token, param_start, param_end, body_node, defaults_start, defaults_end
+        const param_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (params.items) |p| {
+            _ = try self.ast.addExtra(p, self.allocator);
+        }
+        const param_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        const defaults_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (defaults.items) |d| {
+            _ = try self.ast.addExtra(d, self.allocator);
+        }
+        const defaults_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        const extra_idx = try self.ast.addExtra(name_tok, self.allocator);
+        _ = try self.ast.addExtra(param_start, self.allocator);
+        _ = try self.ast.addExtra(param_end, self.allocator);
+        _ = try self.ast.addExtra(body, self.allocator);
+        _ = try self.ast.addExtra(defaults_start, self.allocator);
+        _ = try self.ast.addExtra(defaults_end, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .fn_decl,
+            .main_token = fn_tok,
+            .data = .{ .lhs = extra_idx, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    /// Parse a function expression in expression position:
+    /// `fn(params) { body }` (anonymous) or `fn name(params) { body }` (self-recursive)
+    fn parseFnExpr(self: *Parser) Error!Node.Index {
+        const fn_tok = self.pos;
+        self.advance(); // consume 'fn'
+
+        // Check if we have a name (for self-recursion) or go straight to '('.
+        var name_tok: u32 = Node.null_node;
+        if (self.peekTag() == .identifier) {
+            // Check if next token is '(' -- that means this is a named fn.
+            // If not, this fn is anonymous and the identifier is something else.
+            if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .left_paren) {
+                name_tok = self.pos;
+                self.advance(); // consume name
+            }
+        }
+
+        // Expect '('.
+        if (self.peekTag() != .left_paren) {
+            try self.emitError("expected '(' for function expression");
+            return error.ParseError;
+        }
+        self.advance(); // consume '('
+
+        // Parse parameter list.
+        var params: std.ArrayListUnmanaged(u32) = .empty;
+        defer params.deinit(self.allocator);
+        var defaults: std.ArrayListUnmanaged(u32) = .empty;
+        defer defaults.deinit(self.allocator);
+        var seen_named_param = false;
+
+        if (self.peekTag() != .right_paren) {
+            try self.parseFnParam(&params, &defaults, &seen_named_param);
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                try self.parseFnParam(&params, &defaults, &seen_named_param);
+            }
+        }
+
+        if (self.peekTag() != .right_paren) {
+            try self.emitError("expected ')' after parameters");
+            return error.ParseError;
+        }
+        self.advance(); // consume ')'
+
+        // Parse body.
+        self.fn_depth += 1;
+        const body = try self.parseBlockExpr();
+        self.fn_depth -= 1;
+
+        // Store in extra_data: name_token, param_start, param_end, body_node, defaults_start, defaults_end
+        const param_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (params.items) |p| {
+            _ = try self.ast.addExtra(p, self.allocator);
+        }
+        const param_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        const defaults_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (defaults.items) |d| {
+            _ = try self.ast.addExtra(d, self.allocator);
+        }
+        const defaults_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        const extra_idx = try self.ast.addExtra(name_tok, self.allocator);
+        _ = try self.ast.addExtra(param_start, self.allocator);
+        _ = try self.ast.addExtra(param_end, self.allocator);
+        _ = try self.ast.addExtra(body, self.allocator);
+        _ = try self.ast.addExtra(defaults_start, self.allocator);
+        _ = try self.ast.addExtra(defaults_end, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .fn_decl,
+            .main_token = fn_tok,
+            .data = .{ .lhs = extra_idx, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    /// Parse a single function parameter. May have a default value (`:` expr).
+    fn parseFnParam(
+        self: *Parser,
+        params: *std.ArrayListUnmanaged(u32),
+        defaults: *std.ArrayListUnmanaged(u32),
+        seen_named_param: *bool,
+    ) Error!void {
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected parameter name");
+            return error.ParseError;
+        }
+        const param_tok = self.pos;
+        self.advance(); // consume identifier
+
+        try params.append(self.allocator, param_tok);
+
+        // Check for default value.
+        if (self.peekTag() == .colon) {
+            self.advance(); // consume ':'
+            const default_expr = try self.parseExpression();
+            try defaults.append(self.allocator, default_expr);
+            seen_named_param.* = true;
+        } else {
+            // Positional param after a named param is an error.
+            if (seen_named_param.*) {
+                try self.emitError("positional parameter cannot follow named parameter with default");
+                return error.ParseError;
+            }
+        }
+    }
+
+    /// Parse a lambda expression: `|params| body_expr`
+    /// `|_| expr` is zero-arg lambda.
+    fn parseLambda(self: *Parser) Error!Node.Index {
+        const pipe_tok = self.pos;
+        self.advance(); // consume '|'
+
+        var params: std.ArrayListUnmanaged(u32) = .empty;
+        defer params.deinit(self.allocator);
+
+        // Check for zero-arg: |_|
+        if (self.peekTag() == .identifier) {
+            const slice = self.tokenSlice(self.pos);
+            if (std.mem.eql(u8, slice, "_")) {
+                // Zero-arg lambda: |_|
+                self.advance(); // consume '_'
+            } else {
+                // Parse params.
+                try params.append(self.allocator, self.pos);
+                self.advance(); // consume first param
+
+                while (self.peekTag() == .comma) {
+                    self.advance(); // consume ','
+                    if (self.peekTag() != .identifier) {
+                        try self.emitError("expected parameter name in lambda");
+                        return error.ParseError;
+                    }
+                    try params.append(self.allocator, self.pos);
+                    self.advance(); // consume param
+                }
+            }
+        }
+
+        // Expect closing '|'.
+        if (self.peekTag() != .pipe) {
+            try self.emitError("expected '|' to close lambda parameters");
+            return error.ParseError;
+        }
+        self.advance(); // consume '|'
+
+        // Parse body as a single expression.
+        self.fn_depth += 1;
+        const body = try self.parseExpression();
+        self.fn_depth -= 1;
+
+        // Store in extra_data: param_start, param_end, body_node
+        const param_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (params.items) |p| {
+            _ = try self.ast.addExtra(p, self.allocator);
+        }
+        const param_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        const extra_idx = try self.ast.addExtra(param_start, self.allocator);
+        _ = try self.ast.addExtra(param_end, self.allocator);
+        _ = try self.ast.addExtra(body, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .lambda_expr,
+            .main_token = pipe_tok,
+            .data = .{ .lhs = extra_idx, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    /// Parse the pipe operator (`|>`). Called as an infix handler.
+    /// Left-associative: `x |> f |> g` parses as `pipe(pipe(x, f), g)`.
+    fn parsePipe(self: *Parser, left: Node.Index) Error!Node.Index {
+        const op_tok = self.pos;
+        self.advance(); // consume '|>'
+
+        // Right side at one higher precedence (left-associative).
+        const next_prec: Precedence = @enumFromInt(@intFromEnum(Precedence.pipe_prec) + 1);
+        const right = try self.parsePrecedence(next_prec);
+
+        return self.ast.addNode(.{
+            .tag = .pipe_expr,
+            .main_token = op_tok,
+            .data = .{ .lhs = left, .rhs = right },
+        }, self.allocator);
+    }
+
+    /// Parse a return statement: `return` or `return expr`
+    fn parseReturnStmt(self: *Parser) Error!Node.Index {
+        const ret_tok = self.pos;
+        self.advance(); // consume 'return'
+
+        // Validate we're inside a function.
+        if (self.fn_depth == 0) {
+            try self.emitError("'return' outside of function");
+            return error.ParseError;
+        }
+
+        // Check if there's a value expression or this is a bare return.
+        var value: Node.Index = Node.null_node;
+        const next = self.peekTag();
+        if (next != .right_brace and next != .eof and
+            next != .kw_let and next != .kw_if and next != .kw_while and
+            next != .kw_for and next != .kw_fn and next != .kw_return)
+        {
+            value = try self.parseExpression();
+        }
+
+        return self.ast.addNode(.{
+            .tag = .return_expr,
+            .main_token = ret_tok,
+            .data = .{ .lhs = value, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    /// Get token source text for the given token index.
+    fn tokenSlice(self: *const Parser, token_index: u32) []const u8 {
+        const tok = self.tokens[token_index];
+        return self.source[tok.start..tok.end];
+    }
+
     // ── Operator precedence table ─────────────────────────────────────
 
     fn infixPrecedence(self: *const Parser, tag: Tag) Precedence {
         _ = self;
         return switch (tag) {
             .kw_or => .or_prec,
+            .pipe_greater => .pipe_prec,
             .kw_and => .and_prec,
             .equal_equal, .bang_equal => .equality,
             .less, .greater, .less_equal, .greater_equal => .comparison,
@@ -1015,4 +1355,308 @@ test "parser: if without else" {
     const if_data = nodeData(&r.ast, expr);
     const else_branch = r.ast.extra_data.items[if_data.rhs + 1];
     try std.testing.expectEqual(Node.null_node, else_branch);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Phase 2: Function, Lambda, Pipe, Return, Named Arg Tests ─────────
+// ═══════════════════════════════════════════════════════════════════════
+
+test "parser: fn declaration with 2 params" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("fn add(a, b) { a + b }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    try std.testing.expectEqual(Node.Tag.fn_decl, nodeTag(&r.ast, stmts[0]));
+
+    // Extract extra_data for fn_decl.
+    const fn_data = nodeData(&r.ast, stmts[0]);
+    const extra_idx = fn_data.lhs;
+    const name_tok = r.ast.extra_data.items[extra_idx];
+    const param_start = r.ast.extra_data.items[extra_idx + 1];
+    const param_end = r.ast.extra_data.items[extra_idx + 2];
+    const body_node = r.ast.extra_data.items[extra_idx + 3];
+
+    // Name should be "add".
+    const name_slice = r.ast.source[r.ast.tokens[name_tok].start..r.ast.tokens[name_tok].end];
+    try std.testing.expectEqualStrings("add", name_slice);
+
+    // 2 params.
+    try std.testing.expectEqual(@as(u32, 2), param_end - param_start);
+
+    // Body is a block_expr.
+    try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, body_node));
+}
+
+test "parser: fn with named param and default" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("fn greet(name, greeting: \"hello\") { name }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(Node.Tag.fn_decl, nodeTag(&r.ast, stmts[0]));
+
+    const fn_data = nodeData(&r.ast, stmts[0]);
+    const extra_idx = fn_data.lhs;
+    const param_start = r.ast.extra_data.items[extra_idx + 1];
+    const param_end = r.ast.extra_data.items[extra_idx + 2];
+    const defaults_start = r.ast.extra_data.items[extra_idx + 4];
+    const defaults_end = r.ast.extra_data.items[extra_idx + 5];
+
+    // 2 params total.
+    try std.testing.expectEqual(@as(u32, 2), param_end - param_start);
+    // 1 default (for "greeting").
+    try std.testing.expectEqual(@as(u32, 1), defaults_end - defaults_start);
+}
+
+test "parser: lambda with one param" {
+    const allocator = std.testing.allocator;
+    // Wrap lambda in parentheses to ensure it's parsed as expression.
+    var r = try testParseOwned("(|x| x + 1)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    // expr_stmt -> grouped_expr -> lambda_expr
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.grouped_expr, nodeTag(&r.ast, expr));
+    const inner = nodeData(&r.ast, expr).lhs;
+    try std.testing.expectEqual(Node.Tag.lambda_expr, nodeTag(&r.ast, inner));
+
+    // Extract lambda extra_data.
+    const lam_data = nodeData(&r.ast, inner);
+    const lam_extra = lam_data.lhs;
+    const pstart = r.ast.extra_data.items[lam_extra];
+    const pend = r.ast.extra_data.items[lam_extra + 1];
+    const body_node = r.ast.extra_data.items[lam_extra + 2];
+
+    // 1 param.
+    try std.testing.expectEqual(@as(u32, 1), pend - pstart);
+    // Body is an add expression.
+    try std.testing.expectEqual(Node.Tag.add, nodeTag(&r.ast, body_node));
+}
+
+test "parser: lambda with two params" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("(|a, b| a + b)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    const inner = nodeData(&r.ast, expr).lhs;
+    try std.testing.expectEqual(Node.Tag.lambda_expr, nodeTag(&r.ast, inner));
+
+    const lam_data = nodeData(&r.ast, inner);
+    const lam_extra = lam_data.lhs;
+    const pstart = r.ast.extra_data.items[lam_extra];
+    const pend = r.ast.extra_data.items[lam_extra + 1];
+
+    // 2 params.
+    try std.testing.expectEqual(@as(u32, 2), pend - pstart);
+}
+
+test "parser: zero-arg lambda |_|" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("(|_| 42)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    const inner = nodeData(&r.ast, expr).lhs;
+    try std.testing.expectEqual(Node.Tag.lambda_expr, nodeTag(&r.ast, inner));
+
+    const lam_data = nodeData(&r.ast, inner);
+    const lam_extra = lam_data.lhs;
+    const pstart = r.ast.extra_data.items[lam_extra];
+    const pend = r.ast.extra_data.items[lam_extra + 1];
+
+    // 0 params (wildcard).
+    try std.testing.expectEqual(@as(u32, 0), pend - pstart);
+}
+
+test "parser: pipe expression x |> f" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("x |> f", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.pipe_expr, nodeTag(&r.ast, expr));
+
+    const pipe_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, pipe_data.lhs)); // x
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, pipe_data.rhs)); // f
+}
+
+test "parser: pipe chain left-associative" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("x |> f |> g", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    // Top level should be pipe_expr(pipe_expr(x, f), g)
+    try std.testing.expectEqual(Node.Tag.pipe_expr, nodeTag(&r.ast, expr));
+
+    const outer = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.pipe_expr, nodeTag(&r.ast, outer.lhs)); // pipe(x, f)
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, outer.rhs)); // g
+
+    const inner = nodeData(&r.ast, outer.lhs);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, inner.lhs)); // x
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, inner.rhs)); // f
+}
+
+test "parser: pipe with call expression" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("x |> f(y)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.pipe_expr, nodeTag(&r.ast, expr));
+
+    const pipe_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, pipe_data.lhs)); // x
+    try std.testing.expectEqual(Node.Tag.call_expr, nodeTag(&r.ast, pipe_data.rhs)); // f(y)
+}
+
+test "parser: return with value" {
+    const allocator = std.testing.allocator;
+    // return inside fn
+    var r = try testParseOwned("fn foo() { return 42 }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(Node.Tag.fn_decl, nodeTag(&r.ast, stmts[0]));
+
+    // Get the body block.
+    const fn_data = nodeData(&r.ast, stmts[0]);
+    const extra_idx = fn_data.lhs;
+    const body_node = r.ast.extra_data.items[extra_idx + 3];
+    try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, body_node));
+
+    // Block should contain a return_expr statement.
+    const block_data = nodeData(&r.ast, body_node);
+    const block_stmts = r.ast.extra_data.items[block_data.lhs..block_data.rhs];
+    try std.testing.expectEqual(@as(usize, 1), block_stmts.len);
+    try std.testing.expectEqual(Node.Tag.return_expr, nodeTag(&r.ast, block_stmts[0]));
+
+    // Return value should be int_literal.
+    const ret_data = nodeData(&r.ast, block_stmts[0]);
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, ret_data.lhs));
+}
+
+test "parser: bare return" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("fn foo() { return }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const fn_data = nodeData(&r.ast, stmts[0]);
+    const extra_idx = fn_data.lhs;
+    const body_node = r.ast.extra_data.items[extra_idx + 3];
+    const block_data = nodeData(&r.ast, body_node);
+    const block_stmts = r.ast.extra_data.items[block_data.lhs..block_data.rhs];
+
+    try std.testing.expectEqual(@as(usize, 1), block_stmts.len);
+    try std.testing.expectEqual(Node.Tag.return_expr, nodeTag(&r.ast, block_stmts[0]));
+    // Bare return has null_node as value.
+    const ret_data = nodeData(&r.ast, block_stmts[0]);
+    try std.testing.expectEqual(Node.null_node, ret_data.lhs);
+}
+
+test "parser: named argument in call" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("f(x, name: val)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.call_expr, nodeTag(&r.ast, expr));
+
+    // Check args: first is positional (identifier), second is named_arg.
+    const call_data = nodeData(&r.ast, expr);
+    const extra_idx = call_data.rhs;
+    const arg_start = r.ast.extra_data.items[extra_idx];
+    const arg_end = r.ast.extra_data.items[extra_idx + 1];
+    const args = r.ast.extra_data.items[arg_start..arg_end];
+
+    try std.testing.expectEqual(@as(usize, 2), args.len);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, args[0]));
+    try std.testing.expectEqual(Node.Tag.named_arg, nodeTag(&r.ast, args[1]));
+}
+
+test "parser: multiple named arguments" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("f(x, b: 2, a: 1)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.call_expr, nodeTag(&r.ast, expr));
+
+    const call_data = nodeData(&r.ast, expr);
+    const extra_idx = call_data.rhs;
+    const arg_start = r.ast.extra_data.items[extra_idx];
+    const arg_end = r.ast.extra_data.items[extra_idx + 1];
+    const args = r.ast.extra_data.items[arg_start..arg_end];
+
+    try std.testing.expectEqual(@as(usize, 3), args.len);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, args[0])); // x (positional)
+    try std.testing.expectEqual(Node.Tag.named_arg, nodeTag(&r.ast, args[1])); // b: 2
+    try std.testing.expectEqual(Node.Tag.named_arg, nodeTag(&r.ast, args[2])); // a: 1
+}
+
+test "parser: pipe precedence lower than call, higher than or" {
+    const allocator = std.testing.allocator;
+    // `a or b |> f` should parse as `a or (b |> f)` because pipe > or.
+    var r = try testParseOwned("a or b |> f", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    // Top level should be 'or'
+    try std.testing.expectEqual(Node.Tag.logical_or, nodeTag(&r.ast, expr));
+
+    const or_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, or_data.lhs)); // a
+    try std.testing.expectEqual(Node.Tag.pipe_expr, nodeTag(&r.ast, or_data.rhs)); // b |> f
+}
+
+test "parser: fn expression (anonymous)" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("let f = fn(x) { x + 1 }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(Node.Tag.let_decl, nodeTag(&r.ast, stmts[0]));
+
+    // The initializer should be fn_decl.
+    const let_data = nodeData(&r.ast, stmts[0]);
+    try std.testing.expectEqual(Node.Tag.fn_decl, nodeTag(&r.ast, let_data.rhs));
+}
+
+test "parser: return outside function is error" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("return 42", allocator);
+    defer r.deinit(allocator);
+
+    // Should have parse errors.
+    try std.testing.expect(r.ast.errors.items.items.len > 0);
+}
+
+test "parser: fn with zero params" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("fn noop() { nil }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(Node.Tag.fn_decl, nodeTag(&r.ast, stmts[0]));
+
+    const fn_data = nodeData(&r.ast, stmts[0]);
+    const extra_idx = fn_data.lhs;
+    const param_start = r.ast.extra_data.items[extra_idx + 1];
+    const param_end = r.ast.extra_data.items[extra_idx + 2];
+    try std.testing.expectEqual(@as(u32, 0), param_end - param_start);
 }
