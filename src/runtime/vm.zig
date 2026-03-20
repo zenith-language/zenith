@@ -284,10 +284,28 @@ pub const VM = struct {
                     // advances, and either sets the loop variable or jumps past the body.
                     const jump_offset = self.readU16();
                     // Stack layout: [..., iterable, index, loop_var]
-                    // For Phase 1, iterable is expected to be from range().
-                    // Since range() returns nil in Phase 1, for-in loops are not
-                    // fully operational yet. Just jump past the body.
-                    self.ip += jump_offset;
+                    // iterable = stack_top - 3, index = stack_top - 2, loop_var = stack_top - 1
+                    const iterable = self.stack[self.stack_top - 3];
+                    if (iterable.isObjType(.range)) {
+                        const ObjRange = obj_mod.ObjRange;
+                        const r = ObjRange.fromObj(iterable.asObj());
+                        const idx = self.stack[self.stack_top - 2].asInt();
+                        const current = r.start + idx * r.step;
+                        // Check termination based on step direction.
+                        const done = if (r.step > 0) current >= r.end else current <= r.end;
+                        if (done) {
+                            // Jump past the body.
+                            self.ip += jump_offset;
+                        } else {
+                            // Set loop variable to current value.
+                            self.stack[self.stack_top - 1] = Value.fromInt(current);
+                            // Increment index.
+                            self.stack[self.stack_top - 2] = Value.fromInt(idx + 1);
+                        }
+                    } else {
+                        try self.runtimeError(.E001, "value is not iterable");
+                        return error.RuntimeErr;
+                    }
                 },
             }
         }

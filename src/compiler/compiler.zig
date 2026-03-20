@@ -131,7 +131,10 @@ pub const Compiler = struct {
                 // Expression statements that leave a value on stack need pop.
                 if (tag == .expr_stmt) {
                     // expr_stmt already does not leave a value (it pops internally)
-                } else if (tag != .let_decl and tag != .while_stmt and tag != .for_stmt and tag != .assign_stmt) {
+                } else if (tag == .while_stmt or tag == .for_stmt) {
+                    // while and for emit op_nil as their result -- pop it when not last.
+                    try self.emitOp(.op_pop, self.getLine(stmt_idx));
+                } else if (tag != .let_decl and tag != .assign_stmt) {
                     try self.emitOp(.op_pop, self.getLine(stmt_idx));
                 }
             }
@@ -370,6 +373,8 @@ pub const Compiler = struct {
         if (self.resolveLocal(name)) |slot| {
             try self.emitOp(.op_set_local, self.getLine(node_idx));
             try self.emitByte(slot, self.getLine(node_idx));
+            // Pop the stale copy -- assignment is a statement, not an expression.
+            try self.emitOp(.op_pop, self.getLine(node_idx));
         } else {
             try self.emitError(node_idx, .E002, "undefined variable");
         }
@@ -487,7 +492,10 @@ pub const Compiler = struct {
 
         try self.patchJump(exit_jump);
 
-        // End scope: pop loop locals.
+        // End scope: pop the 3 for-in locals (loop_var, __idx__, __iter__).
+        try self.emitOp(.op_pop, line);
+        try self.emitOp(.op_pop, line);
+        try self.emitOp(.op_pop, line);
         self.endScope();
 
         // For produces nil.
