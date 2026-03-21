@@ -1782,3 +1782,228 @@ test "builtins: Option.to_result converts None to Err" {
     defer result.asObj().destroy(allocator);
     try std.testing.expect(isAdtVariant(result, 1, 1)); // Err
 }
+
+// ── Additional Task 2 tests ──────────────────────────────────────────
+
+test "builtins: String.join joins list elements" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    const s1 = try ObjString.create(allocator, "hello");
+    try lst.items.append(allocator, Value.fromObj(&s1.obj));
+    const s2 = try ObjString.create(allocator, "world");
+    try lst.items.append(allocator, Value.fromObj(&s2.obj));
+    const sep = try ObjString.create(allocator, " ");
+    defer sep.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringJoin(&[_]Value{ Value.fromObj(&lst.obj), Value.fromObj(&sep.obj) }, allocator, &err_msg);
+    try std.testing.expectEqualStrings("hello world", ObjString.fromObj(result.asObj()).bytes);
+    result.asObj().destroy(allocator);
+    s1.obj.destroy(allocator);
+    s2.obj.destroy(allocator);
+}
+
+test "builtins: String.split with multi-byte separator" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "a::b::c");
+    defer s.obj.destroy(allocator);
+    const sep = try ObjString.create(allocator, "::");
+    defer sep.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringSplit(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&sep.obj) }, allocator, &err_msg);
+    const lst = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(usize, 3), lst.items.items.len);
+    try std.testing.expectEqualStrings("a", ObjString.fromObj(lst.items.items[0].asObj()).bytes);
+    try std.testing.expectEqualStrings("b", ObjString.fromObj(lst.items.items[1].asObj()).bytes);
+    try std.testing.expectEqualStrings("c", ObjString.fromObj(lst.items.items[2].asObj()).bytes);
+    for (lst.items.items) |item| item.asObj().destroy(allocator);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: String.replace with empty old returns original" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "hello");
+    defer s.obj.destroy(allocator);
+    const old = try ObjString.create(allocator, "");
+    defer old.obj.destroy(allocator);
+    const new_s = try ObjString.create(allocator, "X");
+    defer new_s.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringReplace(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&old.obj), Value.fromObj(&new_s.obj) }, allocator, &err_msg);
+    try std.testing.expectEqualStrings("hello", ObjString.fromObj(result.asObj()).bytes);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: String.length returns byte count" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "hello");
+    defer s.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringLength(&[_]Value{Value.fromObj(&s.obj)}, allocator, &err_msg);
+    try std.testing.expectEqual(@as(i32, 5), result.asInt());
+}
+
+test "builtins: Tuple.get returns Option" {
+    const allocator = std.testing.allocator;
+    const values = [_]Value{ Value.fromInt(10), Value.fromInt(20) };
+    const t = try ObjTuple.create(allocator, &values);
+    defer t.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const some = try builtinTupleGet(&[_]Value{ Value.fromObj(&t.obj), Value.fromInt(0) }, allocator, &err_msg);
+    try std.testing.expect(isAdtVariant(some, 0, 0)); // Some
+    try std.testing.expectEqual(@as(i32, 10), adtPayload(some, 0).asInt());
+    some.asObj().destroy(allocator);
+
+    const none = try builtinTupleGet(&[_]Value{ Value.fromObj(&t.obj), Value.fromInt(5) }, allocator, &err_msg);
+    try std.testing.expect(isAdtVariant(none, 0, 1)); // None
+    none.asObj().destroy(allocator);
+}
+
+test "builtins: Tuple.length returns size" {
+    const allocator = std.testing.allocator;
+    const values = [_]Value{ Value.fromInt(1), Value.fromInt(2), Value.fromInt(3) };
+    const t = try ObjTuple.create(allocator, &values);
+    defer t.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinTupleLength(&[_]Value{Value.fromObj(&t.obj)}, allocator, &err_msg);
+    try std.testing.expectEqual(@as(i32, 3), result.asInt());
+}
+
+test "builtins: List.set creates modified copy" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    try lst.items.append(allocator, Value.fromInt(1));
+    try lst.items.append(allocator, Value.fromInt(2));
+    try lst.items.append(allocator, Value.fromInt(3));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListSet(&[_]Value{ Value.fromObj(&lst.obj), Value.fromInt(1), Value.fromInt(99) }, allocator, &err_msg);
+    const new_lst = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(i32, 99), new_lst.items.items[1].asInt());
+    // Original unchanged.
+    try std.testing.expectEqual(@as(i32, 2), lst.items.items[1].asInt());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: List.flatten flattens one level" {
+    const allocator = std.testing.allocator;
+    const inner1 = try ObjList.create(allocator);
+    defer inner1.obj.destroy(allocator);
+    try inner1.items.append(allocator, Value.fromInt(1));
+    try inner1.items.append(allocator, Value.fromInt(2));
+
+    const inner2 = try ObjList.create(allocator);
+    defer inner2.obj.destroy(allocator);
+    try inner2.items.append(allocator, Value.fromInt(3));
+
+    const outer = try ObjList.create(allocator);
+    defer outer.obj.destroy(allocator);
+    try outer.items.append(allocator, Value.fromObj(&inner1.obj));
+    try outer.items.append(allocator, Value.fromObj(&inner2.obj));
+    try outer.items.append(allocator, Value.fromInt(4));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListFlatten(&[_]Value{Value.fromObj(&outer.obj)}, allocator, &err_msg);
+    const flat = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(usize, 4), flat.items.items.len);
+    try std.testing.expectEqual(@as(i32, 1), flat.items.items[0].asInt());
+    try std.testing.expectEqual(@as(i32, 2), flat.items.items[1].asInt());
+    try std.testing.expectEqual(@as(i32, 3), flat.items.items[2].asInt());
+    try std.testing.expectEqual(@as(i32, 4), flat.items.items[3].asInt());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: Map.delete removes key" {
+    const allocator = std.testing.allocator;
+    const m = try ObjMap.create(allocator);
+    defer m.obj.destroy(allocator);
+    try m.entries.put(allocator, Value.fromInt(1), Value.fromInt(10));
+    try m.entries.put(allocator, Value.fromInt(2), Value.fromInt(20));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinMapDelete(&[_]Value{ Value.fromObj(&m.obj), Value.fromInt(1) }, allocator, &err_msg);
+    const new_m = ObjMap.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(u32, 1), new_m.entries.count());
+    try std.testing.expect(new_m.entries.get(Value.fromInt(2)) != null);
+    try std.testing.expect(new_m.entries.get(Value.fromInt(1)) == null);
+    // Original unchanged.
+    try std.testing.expectEqual(@as(u32, 2), m.entries.count());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: Map.keys and Map.values" {
+    const allocator = std.testing.allocator;
+    const m = try ObjMap.create(allocator);
+    defer m.obj.destroy(allocator);
+    try m.entries.put(allocator, Value.fromInt(1), Value.fromInt(10));
+    try m.entries.put(allocator, Value.fromInt(2), Value.fromInt(20));
+
+    var err_msg: []const u8 = "";
+    const keys_result = try builtinMapKeys(&[_]Value{Value.fromObj(&m.obj)}, allocator, &err_msg);
+    const keys_list = ObjList.fromObj(keys_result.asObj());
+    try std.testing.expectEqual(@as(usize, 2), keys_list.items.items.len);
+    keys_result.asObj().destroy(allocator);
+
+    const vals_result = try builtinMapValues(&[_]Value{Value.fromObj(&m.obj)}, allocator, &err_msg);
+    const vals_list = ObjList.fromObj(vals_result.asObj());
+    try std.testing.expectEqual(@as(usize, 2), vals_list.items.items.len);
+    vals_result.asObj().destroy(allocator);
+}
+
+test "builtins: Map.merge combines two maps" {
+    const allocator = std.testing.allocator;
+    const m1 = try ObjMap.create(allocator);
+    defer m1.obj.destroy(allocator);
+    try m1.entries.put(allocator, Value.fromInt(1), Value.fromInt(10));
+    try m1.entries.put(allocator, Value.fromInt(2), Value.fromInt(20));
+
+    const m2 = try ObjMap.create(allocator);
+    defer m2.obj.destroy(allocator);
+    try m2.entries.put(allocator, Value.fromInt(2), Value.fromInt(200)); // overwrite
+    try m2.entries.put(allocator, Value.fromInt(3), Value.fromInt(30));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinMapMerge(&[_]Value{ Value.fromObj(&m1.obj), Value.fromObj(&m2.obj) }, allocator, &err_msg);
+    const merged = ObjMap.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(u32, 3), merged.entries.count());
+    // Key 2 should have m2's value (200).
+    try std.testing.expectEqual(@as(i32, 200), merged.entries.get(Value.fromInt(2)).?.asInt());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: List.zip creates tuples" {
+    const allocator = std.testing.allocator;
+    const lst1 = try ObjList.create(allocator);
+    defer lst1.obj.destroy(allocator);
+    try lst1.items.append(allocator, Value.fromInt(1));
+    try lst1.items.append(allocator, Value.fromInt(2));
+
+    const lst2 = try ObjList.create(allocator);
+    defer lst2.obj.destroy(allocator);
+    try lst2.items.append(allocator, Value.fromInt(10));
+    try lst2.items.append(allocator, Value.fromInt(20));
+    try lst2.items.append(allocator, Value.fromInt(30)); // extra element ignored
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListZip(&[_]Value{ Value.fromObj(&lst1.obj), Value.fromObj(&lst2.obj) }, allocator, &err_msg);
+    const zipped = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(usize, 2), zipped.items.items.len);
+    // First element should be tuple (1, 10).
+    const tup0 = ObjTuple.fromObj(zipped.items.items[0].asObj());
+    try std.testing.expectEqual(@as(i32, 1), tup0.fields[0].asInt());
+    try std.testing.expectEqual(@as(i32, 10), tup0.fields[1].asInt());
+    // Second element should be tuple (2, 20).
+    const tup1 = ObjTuple.fromObj(zipped.items.items[1].asObj());
+    try std.testing.expectEqual(@as(i32, 2), tup1.fields[0].asInt());
+    try std.testing.expectEqual(@as(i32, 20), tup1.fields[1].asInt());
+    // Clean up tuples (they were heap allocated by zip).
+    for (zipped.items.items) |item| item.asObj().destroy(allocator);
+    result.asObj().destroy(allocator);
+}
