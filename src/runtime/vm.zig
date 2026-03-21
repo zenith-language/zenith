@@ -354,20 +354,44 @@ pub const VM = struct {
                     try self.execForIter(jump_offset, &self.legacy_ip);
                 },
 
+                // Phase 3 collection opcodes -- legacy mode.
+                .op_list => {
+                    const count = self.readU16Legacy();
+                    try self.execOpList(count);
+                },
+                .op_map => {
+                    const count = self.readU16Legacy();
+                    try self.execOpMap(count);
+                },
+                .op_tuple => {
+                    const count = self.readU16Legacy();
+                    try self.execOpTuple(count);
+                },
+                .op_record => {
+                    const count = self.readU16Legacy();
+                    try self.execOpRecordLegacy(count);
+                },
+                .op_record_spread => {
+                    const override_count = self.readByteLegacy();
+                    try self.execOpRecordSpreadLegacy(override_count);
+                },
+                .op_get_field => {
+                    const const_idx = self.readU16Legacy();
+                    const field_val = self.chunk.?.constants.items[const_idx];
+                    try self.execOpGetField(field_val);
+                },
+                .op_dup => {
+                    const top = self.peek(0);
+                    try self.push(top);
+                },
+
                 // Phase 3 opcodes -- not yet implemented in legacy mode.
-                .op_list,
-                .op_map,
-                .op_tuple,
-                .op_record,
-                .op_record_spread,
                 .op_adt_construct,
                 .op_adt_get_field,
-                .op_get_field,
                 .op_get_index,
                 .op_check_tag,
                 .op_list_len,
                 .op_list_slice,
-                .op_dup,
                 => {
                     try self.runtimeErrorLegacy(.E001, "Phase 3 opcodes not yet implemented");
                     return error.RuntimeErr;
@@ -558,20 +582,44 @@ pub const VM = struct {
                     try self.execForIterFrame(jump_offset);
                 },
 
+                // Phase 3 collection opcodes -- frame mode.
+                .op_list => {
+                    const count = self.readU16Frame();
+                    try self.execOpList(count);
+                },
+                .op_map => {
+                    const count = self.readU16Frame();
+                    try self.execOpMap(count);
+                },
+                .op_tuple => {
+                    const count = self.readU16Frame();
+                    try self.execOpTuple(count);
+                },
+                .op_record => {
+                    const count = self.readU16Frame();
+                    try self.execOpRecordFrame(count);
+                },
+                .op_record_spread => {
+                    const override_count = self.readByteFrame();
+                    try self.execOpRecordSpreadFrame(override_count);
+                },
+                .op_get_field => {
+                    const const_idx = self.readU16Frame();
+                    const field_val = self.frameChunk().constants.items[const_idx];
+                    try self.execOpGetField(field_val);
+                },
+                .op_dup => {
+                    const top = self.peek(0);
+                    try self.push(top);
+                },
+
                 // Phase 3 opcodes -- not yet implemented in frame mode.
-                .op_list,
-                .op_map,
-                .op_tuple,
-                .op_record,
-                .op_record_spread,
                 .op_adt_construct,
                 .op_adt_get_field,
-                .op_get_field,
                 .op_get_index,
                 .op_check_tag,
                 .op_list_len,
                 .op_list_slice,
-                .op_dup,
                 => {
                     try self.runtimeErrorFrame(.E001, "Phase 3 opcodes not yet implemented");
                     return error.RuntimeErr;
@@ -1013,6 +1061,278 @@ pub const VM = struct {
             }
         } else {
             try self.runtimeErrorAny(.E001, "value is not iterable");
+            return error.RuntimeErr;
+        }
+    }
+
+    // ── Collection opcode execution (Phase 3) ─────────────────────────
+
+    const ObjList = obj_mod.ObjList;
+    const ObjMap = obj_mod.ObjMap;
+    const ObjTuple = obj_mod.ObjTuple;
+    const ObjRecord = obj_mod.ObjRecord;
+
+    fn execOpList(self: *Self, count: u16) RuntimeError!void {
+        const lst = try ObjList.create(self.allocator);
+        self.trackObject(&lst.obj);
+
+        // Reserve capacity and fill from stack.
+        try lst.items.ensureTotalCapacity(self.allocator, count);
+        // Pop values in reverse order (first pushed is earliest in list).
+        var i: u16 = count;
+        while (i > 0) {
+            i -= 1;
+            lst.items.appendAssumeCapacity(self.stack[self.stack_top - count + i]);
+        }
+        self.stack_top -= count;
+
+        try self.push(Value.fromObj(&lst.obj));
+    }
+
+    fn execOpMap(self: *Self, pair_count: u16) RuntimeError!void {
+        const m = try ObjMap.create(self.allocator);
+        self.trackObject(&m.obj);
+
+        // Stack has: key0, val0, key1, val1, ... (2*pair_count values).
+        const total: u16 = pair_count * 2;
+        const base = self.stack_top - total;
+        var i: u16 = 0;
+        while (i < pair_count) : (i += 1) {
+            const key = self.stack[base + i * 2];
+            const val = self.stack[base + i * 2 + 1];
+            try m.entries.put(self.allocator, key, val);
+        }
+        self.stack_top -= total;
+
+        try self.push(Value.fromObj(&m.obj));
+    }
+
+    fn execOpTuple(self: *Self, count: u16) RuntimeError!void {
+        // Collect values from stack.
+        const values = try self.allocator.alloc(Value, count);
+        var i: u16 = 0;
+        while (i < count) : (i += 1) {
+            values[i] = self.stack[self.stack_top - count + i];
+        }
+        self.stack_top -= count;
+
+        const t = try ObjTuple.create(self.allocator, values);
+        self.allocator.free(values); // ObjTuple.create copies the slice
+        self.trackObject(&t.obj);
+
+        try self.push(Value.fromObj(&t.obj));
+    }
+
+    /// Execute op_record in legacy mode: read field name const indices from chunk.
+    fn execOpRecordLegacy(self: *Self, count: u16) RuntimeError!void {
+        // Read field name constant indices from bytecode.
+        const names = try self.allocator.alloc([]const u8, count);
+        defer self.allocator.free(names);
+
+        var i: u16 = 0;
+        while (i < count) : (i += 1) {
+            const ci = self.readU16Legacy();
+            const name_val = self.chunk.?.constants.items[ci];
+            if (name_val.isObj() and name_val.asObj().obj_type == .string) {
+                names[i] = ObjString.fromObj(name_val.asObj()).bytes;
+            } else {
+                names[i] = "<unknown>";
+            }
+        }
+
+        try self.createRecord(count, names);
+    }
+
+    /// Execute op_record in frame mode: read field name const indices from frame chunk.
+    fn execOpRecordFrame(self: *Self, count: u16) RuntimeError!void {
+        const names = try self.allocator.alloc([]const u8, count);
+        defer self.allocator.free(names);
+
+        var i: u16 = 0;
+        while (i < count) : (i += 1) {
+            const ci = self.readU16Frame();
+            const name_val = self.frameChunk().constants.items[ci];
+            if (name_val.isObj() and name_val.asObj().obj_type == .string) {
+                names[i] = ObjString.fromObj(name_val.asObj()).bytes;
+            } else {
+                names[i] = "<unknown>";
+            }
+        }
+
+        try self.createRecord(count, names);
+    }
+
+    /// Shared record creation helper.
+    fn createRecord(self: *Self, count: u16, names: []const []const u8) RuntimeError!void {
+        // Pop field values from stack (in order).
+        const values = try self.allocator.alloc(Value, count);
+        defer self.allocator.free(values);
+
+        var i: u16 = 0;
+        while (i < count) : (i += 1) {
+            values[i] = self.stack[self.stack_top - count + i];
+        }
+        self.stack_top -= count;
+
+        const rec = try ObjRecord.create(self.allocator, names, values);
+        self.trackObject(&rec.obj);
+
+        try self.push(Value.fromObj(&rec.obj));
+    }
+
+    /// Execute op_record_spread in legacy mode.
+    fn execOpRecordSpreadLegacy(self: *Self, override_count: u8) RuntimeError!void {
+        const names = try self.allocator.alloc([]const u8, override_count);
+        defer self.allocator.free(names);
+
+        var i: u8 = 0;
+        while (i < override_count) : (i += 1) {
+            const ci = self.readU16Legacy();
+            const name_val = self.chunk.?.constants.items[ci];
+            if (name_val.isObj() and name_val.asObj().obj_type == .string) {
+                names[i] = ObjString.fromObj(name_val.asObj()).bytes;
+            } else {
+                names[i] = "<unknown>";
+            }
+        }
+
+        try self.execRecordSpread(override_count, names);
+    }
+
+    /// Execute op_record_spread in frame mode.
+    fn execOpRecordSpreadFrame(self: *Self, override_count: u8) RuntimeError!void {
+        const names = try self.allocator.alloc([]const u8, override_count);
+        defer self.allocator.free(names);
+
+        var i: u8 = 0;
+        while (i < override_count) : (i += 1) {
+            const ci = self.readU16Frame();
+            const name_val = self.frameChunk().constants.items[ci];
+            if (name_val.isObj() and name_val.asObj().obj_type == .string) {
+                names[i] = ObjString.fromObj(name_val.asObj()).bytes;
+            } else {
+                names[i] = "<unknown>";
+            }
+        }
+
+        try self.execRecordSpread(override_count, names);
+    }
+
+    /// Shared record spread execution.
+    fn execRecordSpread(self: *Self, override_count: u8, override_names: []const []const u8) RuntimeError!void {
+        // Stack: [base_record, override_val_0, override_val_1, ...]
+        // Pop override values.
+        const override_values = try self.allocator.alloc(Value, override_count);
+        defer self.allocator.free(override_values);
+
+        var i: u8 = 0;
+        while (i < override_count) : (i += 1) {
+            override_values[override_count - 1 - i] = try self.pop();
+        }
+
+        // Pop base record.
+        const base_val = try self.pop();
+        if (!base_val.isObj() or base_val.asObj().obj_type != .record) {
+            try self.runtimeErrorAny(.E001, "spread base must be a record");
+            return error.RuntimeErr;
+        }
+        const base = ObjRecord.fromObj(base_val.asObj());
+
+        // Build new record: start with base fields, override matching ones, add new ones.
+        // Compute total field count.
+        var total: usize = base.field_count;
+        for (override_names) |oname| {
+            var found = false;
+            for (base.field_names[0..base.field_count]) |bname| {
+                if (std.mem.eql(u8, oname, bname)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) total += 1;
+        }
+
+        const new_names = try self.allocator.alloc([]const u8, total);
+        defer self.allocator.free(new_names);
+        const new_values = try self.allocator.alloc(Value, total);
+        defer self.allocator.free(new_values);
+
+        // Copy base fields.
+        var idx: usize = 0;
+        for (0..base.field_count) |fi| {
+            new_names[idx] = base.field_names[fi];
+            new_values[idx] = base.field_values[fi];
+            // Check if this field is overridden.
+            for (override_names, 0..) |oname, oi| {
+                if (std.mem.eql(u8, oname, base.field_names[fi])) {
+                    new_values[idx] = override_values[oi];
+                    break;
+                }
+            }
+            idx += 1;
+        }
+
+        // Add new fields not in base.
+        for (override_names, 0..) |oname, oi| {
+            var found = false;
+            for (base.field_names[0..base.field_count]) |bname| {
+                if (std.mem.eql(u8, oname, bname)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                new_names[idx] = oname;
+                new_values[idx] = override_values[oi];
+                idx += 1;
+            }
+        }
+
+        const rec = try ObjRecord.create(self.allocator, new_names[0..total], new_values[0..total]);
+        self.trackObject(&rec.obj);
+
+        try self.push(Value.fromObj(&rec.obj));
+    }
+
+    /// Execute op_get_field: pop object, look up field by name, push result.
+    fn execOpGetField(self: *Self, field_val: Value) RuntimeError!void {
+        const obj_val = try self.pop();
+
+        // Get field name string from the constant.
+        const field_name = if (field_val.isObj() and field_val.asObj().obj_type == .string)
+            ObjString.fromObj(field_val.asObj()).bytes
+        else
+            return error.RuntimeErr;
+
+        if (obj_val.isObj()) {
+            const obj_ptr = obj_val.asObj();
+            switch (obj_ptr.obj_type) {
+                .record => {
+                    const rec = ObjRecord.fromObj(obj_ptr);
+                    for (rec.field_names[0..rec.field_count], 0..) |name, idx| {
+                        if (std.mem.eql(u8, name, field_name)) {
+                            try self.push(rec.field_values[idx]);
+                            return;
+                        }
+                    }
+                    // Field not found: push nil.
+                    try self.push(Value.nil);
+                },
+                .map => {
+                    const m = ObjMap.fromObj(obj_ptr);
+                    if (m.entries.get(field_val)) |val| {
+                        try self.push(val);
+                    } else {
+                        try self.push(Value.nil);
+                    }
+                },
+                else => {
+                    try self.runtimeErrorAny(.E001, "field access on non-record/map value");
+                    return error.RuntimeErr;
+                },
+            }
+        } else {
+            try self.runtimeErrorAny(.E001, "field access on non-object value");
             return error.RuntimeErr;
         }
     }

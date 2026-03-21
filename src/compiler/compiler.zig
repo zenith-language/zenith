@@ -278,15 +278,17 @@ pub const Compiler = struct {
                 try self.emitError(node_idx, .E005, "unexpected named argument outside of function call");
             },
 
-            // Phase 3 collection/ADT/pattern matching nodes -- compilation implemented in later plans.
-            .list_literal,
-            .map_literal,
-            .tuple_literal,
-            .record_literal,
-            .record_spread,
+            // Phase 3 collection literals and dot access.
+            .list_literal => try self.compileListLiteral(node_data, node_idx),
+            .map_literal => try self.compileMapLiteral(node_data, node_idx),
+            .tuple_literal => try self.compileTupleLiteral(node_data, node_idx),
+            .record_literal => try self.compileRecordLiteral(node_data, node_idx),
+            .record_spread => try self.compileRecordSpread(node_data, node_idx),
+            .field_access => try self.compileFieldAccess(node_data, node_idx),
+
+            // Phase 3 ADT/pattern matching nodes -- compilation implemented in later plans.
             .type_decl,
             .adt_constructor,
-            .field_access,
             .match_expr,
             .match_arm,
             .match_arm_guarded,
@@ -766,6 +768,188 @@ pub const Compiler = struct {
             }
         }
         return null;
+    }
+
+    // ── Collection literal compilation (Phase 3) ──────────────────────
+
+    /// Known module names for compile-time dot access resolution.
+    const module_names = [_][]const u8{
+        "List", "Map", "String", "Result", "Option", "Tuple",
+    };
+
+    fn isKnownModule(name: []const u8) bool {
+        for (module_names) |m| {
+            if (std.mem.eql(u8, m, name)) return true;
+        }
+        return false;
+    }
+
+    fn compileListLiteral(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const elements = self.ast.extra_data.items[node_data.lhs..node_data.rhs];
+        // Compile each element (pushes values onto stack).
+        for (elements) |elem_idx| {
+            try self.compileNode(elem_idx);
+        }
+        // Emit op_list with element count as u16.
+        const count: u16 = @intCast(elements.len);
+        const line = self.getLine(node_idx);
+        try self.emitOp(.op_list, line);
+        try self.emitByte(@intCast((count >> 8) & 0xFF), line);
+        try self.emitByte(@intCast(count & 0xFF), line);
+    }
+
+    fn compileMapLiteral(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const pairs = self.ast.extra_data.items[node_data.lhs..node_data.rhs];
+        // pairs contains alternating key_node/value_node indices.
+        const pair_count = pairs.len / 2;
+        var i: usize = 0;
+        while (i < pairs.len) : (i += 2) {
+            try self.compileNode(pairs[i]); // key
+            try self.compileNode(pairs[i + 1]); // value
+        }
+        // Emit op_map with pair count as u16.
+        const count: u16 = @intCast(pair_count);
+        const line = self.getLine(node_idx);
+        try self.emitOp(.op_map, line);
+        try self.emitByte(@intCast((count >> 8) & 0xFF), line);
+        try self.emitByte(@intCast(count & 0xFF), line);
+    }
+
+    fn compileTupleLiteral(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const elements = self.ast.extra_data.items[node_data.lhs..node_data.rhs];
+        for (elements) |elem_idx| {
+            try self.compileNode(elem_idx);
+        }
+        const count: u16 = @intCast(elements.len);
+        const line = self.getLine(node_idx);
+        try self.emitOp(.op_tuple, line);
+        try self.emitByte(@intCast((count >> 8) & 0xFF), line);
+        try self.emitByte(@intCast(count & 0xFF), line);
+    }
+
+    fn compileRecordLiteral(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const pairs = self.ast.extra_data.items[node_data.lhs..node_data.rhs];
+        // pairs contains alternating name_token/value_node indices.
+        const field_count = pairs.len / 2;
+
+        // First, compile all field values (push onto stack).
+        var i: usize = 0;
+        while (i < pairs.len) : (i += 2) {
+            try self.compileNode(pairs[i + 1]); // value
+        }
+
+        // Collect constant pool indices for field names.
+        var name_const_indices: std.ArrayListUnmanaged(u16) = .empty;
+        defer name_const_indices.deinit(self.allocator);
+
+        i = 0;
+        while (i < pairs.len) : (i += 2) {
+            const name_tok = pairs[i];
+            const name = self.ast.tokenSlice(name_tok);
+            // Add field name string to constant pool.
+            const str_obj = try ObjString.create(self.allocator, name);
+            const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+            try name_const_indices.append(self.allocator, @intCast(const_idx));
+        }
+
+        // Emit op_record with field count as u16.
+        const count: u16 = @intCast(field_count);
+        const line = self.getLine(node_idx);
+        try self.emitOp(.op_record, line);
+        try self.emitByte(@intCast((count >> 8) & 0xFF), line);
+        try self.emitByte(@intCast(count & 0xFF), line);
+
+        // Emit field name constant indices (u16 each).
+        for (name_const_indices.items) |ci| {
+            try self.emitByte(@intCast((ci >> 8) & 0xFF), line);
+            try self.emitByte(@intCast(ci & 0xFF), line);
+        }
+    }
+
+    fn compileRecordSpread(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        // data.lhs = base record expression node
+        // data.rhs = extra_idx pointing to {override_start, override_end} in extra_data
+        try self.compileNode(node_data.lhs); // push base record
+
+        const extra_idx = node_data.rhs;
+        const override_start = self.ast.extra_data.items[extra_idx];
+        const override_end = self.ast.extra_data.items[extra_idx + 1];
+        const override_pairs = self.ast.extra_data.items[override_start..override_end];
+        const override_count = override_pairs.len / 2;
+
+        // Compile override values (push onto stack).
+        var i: usize = 0;
+        while (i < override_pairs.len) : (i += 2) {
+            try self.compileNode(override_pairs[i + 1]); // value
+        }
+
+        // Collect constant pool indices for override field names.
+        var name_const_indices: std.ArrayListUnmanaged(u16) = .empty;
+        defer name_const_indices.deinit(self.allocator);
+
+        i = 0;
+        while (i < override_pairs.len) : (i += 2) {
+            const name_tok = override_pairs[i];
+            const name = self.ast.tokenSlice(name_tok);
+            const str_obj = try ObjString.create(self.allocator, name);
+            const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+            try name_const_indices.append(self.allocator, @intCast(const_idx));
+        }
+
+        const line = self.getLine(node_idx);
+        try self.emitOp(.op_record_spread, line);
+        try self.emitByte(@intCast(override_count), line);
+
+        // Emit override field name constant indices (u16 each).
+        for (name_const_indices.items) |ci| {
+            try self.emitByte(@intCast((ci >> 8) & 0xFF), line);
+            try self.emitByte(@intCast(ci & 0xFF), line);
+        }
+    }
+
+    fn compileFieldAccess(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        // data.lhs = object expression node, data.rhs = field name token index
+        const field_tok = node_data.rhs;
+        const field_name = self.ast.tokenSlice(field_tok);
+
+        // Check if left side is an identifier that is a known module name.
+        const left_tag = self.ast.nodes.items(.tag)[node_data.lhs];
+        if (left_tag == .identifier) {
+            const left_tok = self.ast.nodes.items(.main_token)[node_data.lhs];
+            const left_name = self.ast.tokenSlice(left_tok);
+
+            if (isKnownModule(left_name)) {
+                // Build the dotted name (e.g., "List.get").
+                // Look up in builtins table.
+                const dotted = [_][]const u8{ left_name, ".", field_name };
+                var dotted_buf: [128]u8 = undefined;
+                var pos: usize = 0;
+                for (dotted) |part| {
+                    @memcpy(dotted_buf[pos..][0..part.len], part);
+                    pos += part.len;
+                }
+                const dotted_name = dotted_buf[0..pos];
+
+                if (self.resolveBuiltin(dotted_name)) |builtin_idx| {
+                    try self.emitOp(.op_get_builtin, self.getLine(node_idx));
+                    try self.emitByte(builtin_idx, self.getLine(node_idx));
+                    return;
+                }
+
+                // Module-qualified but not a known builtin -- emit error.
+                try self.emitError(node_idx, .E002, "unknown module function");
+                return;
+            }
+        }
+
+        // Runtime field access: compile left side, emit op_get_field.
+        try self.compileNode(node_data.lhs);
+        const str_obj = try ObjString.create(self.allocator, field_name);
+        const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+        const line = self.getLine(node_idx);
+        try self.emitOp(.op_get_field, line);
+        try self.emitByte(@intCast((const_idx >> 8) & 0xFF), line);
+        try self.emitByte(@intCast(const_idx & 0xFF), line);
     }
 
     // ── Binary operations ─────────────────────────────────────────────
