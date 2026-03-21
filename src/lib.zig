@@ -16,6 +16,7 @@ pub const parser = @import("parser");
 pub const compiler = @import("compiler");
 pub const builtins = @import("builtins");
 pub const vm = @import("vm");
+pub const gc = @import("gc");
 
 test {
     // Force the test runner to analyse all transitive dependencies so

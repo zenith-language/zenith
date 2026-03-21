@@ -10,6 +10,8 @@ const Diagnostic = zenith.err.Diagnostic;
 const ErrorCode = zenith.err.ErrorCode;
 const Value = zenith.value.Value;
 const builtins = zenith.builtins;
+const GC = zenith.gc.GC;
+const GCAllocator = zenith.gc.GCAllocator;
 
 const version_string = "Zenith v0.1.0";
 
@@ -140,8 +142,13 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     const adt_info = try buildAdtTypeInfo(&compile_result, allocator);
     defer allocator.free(adt_info);
 
-    // 4. Execute -- use closure-based VM.
-    var vm = VM.initWithClosure(compile_result.closure, allocator);
+    // 4. Execute -- use closure-based VM with GC.
+    var gc_state = try GC.init(allocator);
+    defer gc_state.deinit();
+    var gc_alloc = GCAllocator{ .gc = &gc_state };
+    const gc_allocator = gc_alloc.allocator();
+
+    var vm = VM.initWithClosure(compile_result.closure, gc_allocator, &gc_state, allocator);
     vm.trackCompilerObjects(compile_result.closure);
     compile_result.vm_owns_constants = true;
     try vm.setAtomNames(atom_names, allocator);

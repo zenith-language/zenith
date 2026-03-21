@@ -5,6 +5,11 @@ const obj_mod = @import("obj");
 const Obj = obj_mod.Obj;
 const intern_mod = @import("intern");
 const InternTable = intern_mod.InternTable;
+const gc_nursery_mod = @import("gc_nursery");
+const NurseryCollector = gc_nursery_mod.NurseryCollector;
+const gc_roots_mod = @import("gc_roots");
+const vm_mod = @import("vm");
+const VM = vm_mod.VM;
 
 /// Central GC state for generational garbage collection.
 ///
@@ -32,13 +37,25 @@ pub const GC = struct {
     // ── Backing allocator ────────────────────────────────────────────
     backing_allocator: Allocator,
 
+    // ── Nursery collector ─────────────────────────────────────────────
+    nursery_collector: NurseryCollector = NurseryCollector.init(),
+
+    // ── VM reference (set when VM starts execution) ──────────────────
+    vm: ?*VM = null,
+
     // ── Nursery config ───────────────────────────────────────────────
     nursery_capacity: usize,
     min_nursery: usize = 256 * 1024, // 256KB min
     max_nursery: usize = 16 * 1024 * 1024, // 16MB max
 
+    // ── Adaptive nursery tracking ────────────────────────────────────
+    low_survival_streak: u8 = 0,
+
     // ── GC logging ───────────────────────────────────────────────────
     log_enabled: bool,
+
+    // ── Collection lock (prevent re-entrant GC) ──────────────────────
+    collecting: bool = false,
 
     const DEFAULT_NURSERY_CAPACITY: usize = 1024 * 1024; // 1MB
 
@@ -60,6 +77,9 @@ pub const GC = struct {
     }
 
     pub fn deinit(self: *GC) void {
+        // Free nursery collector resources.
+        self.nursery_collector.deinit(self.backing_allocator);
+
         // Free all nursery objects.
         var obj = self.nursery_objects;
         while (obj) |o| {
@@ -87,9 +107,128 @@ pub const GC = struct {
         self.nursery_objects = obj;
     }
 
+    /// Track an object as old-gen (for long-lived compiler objects).
+    pub fn trackOldObject(self: *GC, obj: *Obj) void {
+        obj.promoteToOld();
+        obj.next = self.old_objects;
+        self.old_objects = obj;
+    }
+
     /// Get total heap size (bytes currently allocated).
     pub fn heapSize(self: *const GC) usize {
         return self.bytes_allocated;
+    }
+
+    /// Run nursery collection: scan roots, promote live objects to old-gen,
+    /// sweep dead nursery objects.
+    pub fn collectNursery(self: *GC) !void {
+        // Prevent re-entrant collection (allocation during GC).
+        if (self.collecting) return;
+        self.collecting = true;
+        defer self.collecting = false;
+
+        // Need a VM to scan roots.
+        const vm = self.vm orelse return;
+
+        const timer_start = std.time.nanoTimestamp();
+
+        // Count nursery objects before collection (for survival rate).
+        var nursery_before: usize = 0;
+        {
+            var obj = self.nursery_objects;
+            while (obj) |o| : (obj = o.next) {
+                nursery_before += 1;
+            }
+        }
+
+        // 1. Scan roots: marks reachable nursery objects by promoting them.
+        try gc_roots_mod.scanRoots(&self.nursery_collector, self, vm);
+
+        // 2. Process gray stack: scan promoted objects' references.
+        try self.nursery_collector.processGrayStack(self);
+
+        // 3. Sweep intern table: remove entries for dead nursery strings.
+        //    Must happen before sweepNursery destroys the strings.
+        _ = self.intern_table.removeUnmarked();
+
+        // 4. Migrate promoted objects from nursery list to old-gen list.
+        NurseryCollector.migratePromoted(self);
+
+        // 5. Sweep remaining nursery objects (unreachable).
+        const freed_count = NurseryCollector.sweepNursery(self);
+
+        // 6. Update statistics.
+        self.nursery_count += 1;
+        self.total_bytes_freed += freed_count;
+
+        const timer_end = std.time.nanoTimestamp();
+        self.last_pause_ns = @intCast(@as(i128, timer_end) - @as(i128, timer_start));
+
+        // 7. Adaptive nursery sizing.
+        const promoted: usize = if (nursery_before > freed_count) nursery_before - freed_count else 0;
+        self.adaptNurserySize(nursery_before, promoted);
+
+        // 8. Log if enabled.
+        if (self.log_enabled) {
+            self.logCollection(nursery_before, promoted, freed_count);
+        }
+
+        // 9. Clear mark bits on old-gen objects (used by intern table sweep).
+        self.clearOldGenMarks();
+    }
+
+    /// Adjust nursery capacity based on survival rate.
+    /// - If survival > 50%, double capacity (up to max).
+    /// - If survival < 10% for 3 consecutive collections, halve (down to min).
+    fn adaptNurserySize(self: *GC, total: usize, promoted: usize) void {
+        if (total == 0) return;
+
+        const survival_pct = (promoted * 100) / total;
+
+        if (survival_pct > 50) {
+            // High survival: nursery too small, double it.
+            const new_cap = @min(self.nursery_capacity * 2, self.max_nursery);
+            self.nursery_capacity = new_cap;
+            self.next_nursery_gc = self.bytes_allocated + new_cap;
+            self.low_survival_streak = 0;
+        } else if (survival_pct < 10) {
+            self.low_survival_streak += 1;
+            if (self.low_survival_streak >= 3) {
+                // Consistently low survival: nursery too large, halve it.
+                const new_cap = @max(self.nursery_capacity / 2, self.min_nursery);
+                self.nursery_capacity = new_cap;
+                self.next_nursery_gc = self.bytes_allocated + new_cap;
+                self.low_survival_streak = 0;
+            } else {
+                self.next_nursery_gc = self.bytes_allocated + self.nursery_capacity;
+            }
+        } else {
+            self.low_survival_streak = 0;
+            self.next_nursery_gc = self.bytes_allocated + self.nursery_capacity;
+        }
+    }
+
+    /// Log collection details to stderr.
+    fn logCollection(self: *const GC, total: usize, promoted: usize, freed: usize) void {
+        const stderr = std.fs.File.stderr();
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "[GC] nursery #{d}: {d} total, {d} promoted, {d} freed, pause {d}ns, heap {d}B\n", .{
+            self.nursery_count,
+            total,
+            promoted,
+            freed,
+            self.last_pause_ns,
+            self.bytes_allocated,
+        }) catch return;
+        stderr.writeAll(msg) catch {};
+    }
+
+    /// Clear mark bits on all old-gen objects after collection.
+    fn clearOldGenMarks(self: *GC) void {
+        var obj = self.old_objects;
+        while (obj) |o| : (obj = o.next) {
+            o.setMarked(false);
+        }
     }
 };
 
@@ -117,8 +256,10 @@ pub const GCAllocator = struct {
         const self: *GCAllocator = @ptrCast(@alignCast(ctx));
         const gc = self.gc;
 
-        // TODO(plan-02): trigger nursery collection here when
-        // gc.bytes_allocated + len > gc.next_nursery_gc
+        // Trigger nursery collection if threshold exceeded.
+        if (gc.bytes_allocated + len > gc.next_nursery_gc) {
+            gc.collectNursery() catch {};
+        }
 
         const result = gc.backing_allocator.vtable.alloc(gc.backing_allocator.ptr, len, alignment, ret_addr);
         if (result != null) {

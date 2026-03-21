@@ -17,6 +17,8 @@ const ErrorCode = error_mod.ErrorCode;
 const Label = error_mod.Label;
 const builtins_mod = @import("builtins");
 const NativeFn = builtins_mod.NativeFn;
+const gc_mod = @import("gc");
+const GC = gc_mod.GC;
 
 const STACK_MAX: u32 = 65536;
 const FRAMES_MAX: u32 = 256;
@@ -44,11 +46,15 @@ pub const VM = struct {
     stack_top: u32,
     frames: [FRAMES_MAX]CallFrame,
     frame_count: u32,
-    objects: ?*obj_mod.Obj, // Head of allocated objects linked list
+    objects: ?*obj_mod.Obj, // Head of allocated objects linked list (legacy mode)
     open_upvalues: ?*ObjUpvalue, // Head of sorted open upvalue list
     atom_names: std.ArrayListUnmanaged([]const u8),
     adt_type_info: ?[]const builtins_mod.AdtTypeInfo,
-    allocator: Allocator,
+    allocator: Allocator, // Heap allocator (GC allocator in GC mode)
+    /// Infrastructure allocator for non-GC bookkeeping (errors, atom_names).
+    /// Same as allocator in legacy mode; raw backing allocator in GC mode.
+    infra_allocator: Allocator,
+    gc: ?*GC, // GC instance (null for legacy raw-chunk mode)
     errors: std.ArrayListUnmanaged(Diagnostic),
     // Output writer for tests (captures print output instead of stdout).
     output_buf: ?*std.ArrayListUnmanaged(u8),
@@ -69,13 +75,19 @@ pub const VM = struct {
             .atom_names = .empty,
             .adt_type_info = null,
             .allocator = allocator,
+            .infra_allocator = allocator,
+            .gc = null,
             .errors = .empty,
             .output_buf = null,
         };
     }
 
-    /// Initialize VM with an ObjClosure (Phase 2 mode).
-    pub fn initWithClosure(closure: *ObjClosure, allocator: Allocator) VM {
+    /// Initialize VM with an ObjClosure (Phase 2+ mode).
+    /// When `gc` is non-null, all object tracking goes through the GC
+    /// and nursery collection is triggered automatically on allocation.
+    /// `heap_allocator` is the GC-aware allocator for object creation.
+    /// `infra_alloc` is the raw allocator for bookkeeping (errors, atom names).
+    pub fn initWithClosure(closure: *ObjClosure, heap_allocator: Allocator, gc: ?*GC, infra_alloc: Allocator) VM {
         var vm = VM{
             .chunk = null,
             .legacy_ip = 0,
@@ -87,10 +99,16 @@ pub const VM = struct {
             .open_upvalues = null,
             .atom_names = .empty,
             .adt_type_info = null,
-            .allocator = allocator,
+            .allocator = heap_allocator,
+            .infra_allocator = infra_alloc,
+            .gc = gc,
             .errors = .empty,
             .output_buf = null,
         };
+        // Register VM with GC for root scanning.
+        if (gc) |g| {
+            g.vm = &vm;
+        }
         // Push the script closure as slot 0.
         vm.stack[0] = Value.fromObj(&closure.obj);
         vm.stack_top = 1;
@@ -105,9 +123,10 @@ pub const VM = struct {
     }
 
     /// Initialize VM and push a placeholder for slot 0 (script function).
-    /// Used by the pipeline when running compiler output via raw chunk.
+    /// Used by the pipeline when running compiler output via raw chunk (legacy).
     pub fn initForScript(chunk: *const Chunk, allocator: Allocator) VM {
         var vm = init(chunk, allocator);
+        // Legacy mode: gc is already null from init.
         vm.stack[0] = Value.nil;
         vm.stack_top = 1;
         return vm;
@@ -115,10 +134,17 @@ pub const VM = struct {
 
     /// Free VM resources.
     pub fn deinit(self: *VM) void {
-        // Free allocated objects.
-        self.freeObjects();
-        self.atom_names.deinit(self.allocator);
-        self.errors.deinit(self.allocator);
+        if (self.gc != null) {
+            // GC mode: disconnect VM from GC (GC owns the objects).
+            if (self.gc) |g| {
+                g.vm = null;
+            }
+        } else {
+            // Legacy mode: free allocated objects directly.
+            self.freeObjects();
+        }
+        self.atom_names.deinit(self.infra_allocator);
+        self.errors.deinit(self.infra_allocator);
         // Clear module-level ADT type info to avoid stale references.
         if (self.adt_type_info != null) {
             builtins_mod.clearAdtTypes();
@@ -140,13 +166,20 @@ pub const VM = struct {
     }
 
     /// Register a heap-allocated object for cleanup.
+    /// In GC mode, delegates to gc.trackObject (nursery list).
+    /// In legacy mode, uses the VM's own linked list.
     fn trackObject(self: *VM, obj: *obj_mod.Obj) void {
-        obj.next = self.objects;
-        self.objects = obj;
+        if (self.gc) |g| {
+            g.trackObject(obj);
+        } else {
+            obj.next = self.objects;
+            self.objects = obj;
+        }
     }
 
     /// Register all heap objects from the compiled constant pools so the VM
     /// owns them for cleanup. Must be called once after initWithClosure.
+    /// In GC mode, these are tracked as old-gen objects (long-lived).
     pub fn trackCompilerObjects(self: *Self, closure: *ObjClosure) void {
         self.trackConstantsRecursive(closure.function);
     }
@@ -160,17 +193,24 @@ pub const VM = struct {
                     // object itself (CompileResult.deinit frees ObjFunction structs).
                     self.trackConstantsRecursive(ObjFunction.fromObj(obj_ptr));
                 } else {
-                    // Track non-function objects (strings, etc.) if not already tracked.
-                    var cur = self.objects;
-                    var found = false;
-                    while (cur) |o| {
-                        if (o == obj_ptr) {
-                            found = true;
-                            break;
+                    if (self.gc) |g| {
+                        // GC mode: track as old-gen (long-lived compiler constants).
+                        if (!obj_ptr.isOldGen()) {
+                            g.trackOldObject(obj_ptr);
                         }
-                        cur = o.next;
+                    } else {
+                        // Legacy mode: track in VM's linked list.
+                        var cur = self.objects;
+                        var found = false;
+                        while (cur) |o| {
+                            if (o == obj_ptr) {
+                                found = true;
+                                break;
+                            }
+                            cur = o.next;
+                        }
+                        if (!found) self.trackObject(obj_ptr);
                     }
-                    if (!found) self.trackObject(obj_ptr);
                 }
             }
         }
@@ -1013,10 +1053,25 @@ pub const VM = struct {
             // may return objects already registered via the VM's normal execution).
             const obj_ptr = result.asObj();
             var already_tracked = false;
-            var cur = self.objects;
-            while (cur) |o| {
-                if (o == obj_ptr) { already_tracked = true; break; }
-                cur = o.next;
+            if (self.gc) |g| {
+                var cur: ?*obj_mod.Obj = g.nursery_objects;
+                while (cur) |o| {
+                    if (o == obj_ptr) { already_tracked = true; break; }
+                    cur = o.next;
+                }
+                if (!already_tracked) {
+                    cur = g.old_objects;
+                    while (cur) |o| {
+                        if (o == obj_ptr) { already_tracked = true; break; }
+                        cur = o.next;
+                    }
+                }
+            } else {
+                var cur = self.objects;
+                while (cur) |o| {
+                    if (o == obj_ptr) { already_tracked = true; break; }
+                    cur = o.next;
+                }
             }
             if (!already_tracked) self.trackObject(obj_ptr);
         }
@@ -1028,13 +1083,28 @@ pub const VM = struct {
     /// Callback function for builtins to register intermediate heap objects.
     fn trackObjectFromBuiltin(vm_ptr: *anyopaque, obj: *obj_mod.Obj) void {
         const vm: *Self = @ptrCast(@alignCast(vm_ptr));
-        // Check if already tracked to avoid double-free.
-        var cur = vm.objects;
-        while (cur) |o| {
-            if (o == obj) return;
-            cur = o.next;
+        if (vm.gc) |g| {
+            // GC mode: check nursery + old lists.
+            var cur: ?*obj_mod.Obj = g.nursery_objects;
+            while (cur) |o| {
+                if (o == obj) return;
+                cur = o.next;
+            }
+            cur = g.old_objects;
+            while (cur) |o| {
+                if (o == obj) return;
+                cur = o.next;
+            }
+            g.trackObject(obj);
+        } else {
+            // Legacy mode: check VM's list.
+            var cur = vm.objects;
+            while (cur) |o| {
+                if (o == obj) return;
+                cur = o.next;
+            }
+            vm.trackObject(obj);
         }
-        vm.trackObject(obj);
     }
 
     /// Callback function for builtins to invoke user closures through the VM.
@@ -1825,12 +1895,12 @@ pub const VM = struct {
     // ── Output ────────────────────────────────────────────────────────
 
     fn printValue(self: *Self, val: Value) !void {
-        const text = try builtins_mod.formatValue(val, self.allocator, if (self.atom_names.items.len > 0) self.atom_names.items else null);
-        defer self.allocator.free(text);
+        const text = try builtins_mod.formatValue(val, self.infra_allocator, if (self.atom_names.items.len > 0) self.atom_names.items else null);
+        defer self.infra_allocator.free(text);
 
         if (self.output_buf) |buf| {
-            try buf.appendSlice(self.allocator, text);
-            try buf.append(self.allocator, '\n');
+            try buf.appendSlice(self.infra_allocator, text);
+            try buf.append(self.infra_allocator, '\n');
         } else {
             const stdout = std.fs.File.stdout();
             stdout.writeAll(text) catch {};
@@ -1843,7 +1913,7 @@ pub const VM = struct {
     fn runtimeErrorLegacy(self: *Self, code: ErrorCode, message: []const u8) !void {
         const line = if (self.chunk) |c| c.getLine(if (self.legacy_ip > 0) self.legacy_ip - 1 else 0) else 0;
         _ = line;
-        try self.errors.append(self.allocator, .{
+        try self.errors.append(self.infra_allocator, .{
             .error_code = code,
             .severity = .@"error",
             .message = message,
@@ -1861,7 +1931,7 @@ pub const VM = struct {
     }
 
     fn runtimeErrorAny(self: *Self, code: ErrorCode, message: []const u8) !void {
-        try self.errors.append(self.allocator, .{
+        try self.errors.append(self.infra_allocator, .{
             .error_code = code,
             .severity = .@"error",
             .message = message,

@@ -218,6 +218,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "compiler", .module = compiler_mod },
             .{ .name = "builtins", .module = builtins_mod },
             .{ .name = "vm", .module = vm_mod },
+            .{ .name = "gc", .module = gc_mod },
         },
     });
 
