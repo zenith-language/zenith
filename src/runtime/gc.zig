@@ -3,10 +3,15 @@ const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const obj_mod = @import("obj");
 const Obj = obj_mod.Obj;
+const value_mod = @import("value");
+const Value = value_mod.Value;
 const intern_mod = @import("intern");
 const InternTable = intern_mod.InternTable;
 const gc_nursery_mod = @import("gc_nursery");
 const NurseryCollector = gc_nursery_mod.NurseryCollector;
+const gc_oldgen_mod = @import("gc_oldgen");
+const OldGenCollector = gc_oldgen_mod.OldGenCollector;
+const WriteBarrier = gc_oldgen_mod.WriteBarrier;
 const gc_roots_mod = @import("gc_roots");
 const vm_mod = @import("vm");
 const VM = vm_mod.VM;
@@ -39,6 +44,17 @@ pub const GC = struct {
 
     // ── Nursery collector ─────────────────────────────────────────────
     nursery_collector: NurseryCollector = NurseryCollector.init(),
+
+    // ── Old-gen collector ─────────────────────────────────────────────
+    oldgen_collector: OldGenCollector = OldGenCollector.init(),
+
+    // ── Write barrier (remembered set) ────────────────────────────────
+    write_barrier: WriteBarrier = WriteBarrier.init(),
+
+    // ── Old-gen sizing ────────────────────────────────────────────────
+    old_gen_size: usize = 0, // count of objects in old gen
+    old_gen_threshold: usize = 2048, // trigger threshold (initial: 2048 objects)
+    old_gen_last_size: usize = 0, // size after last old-gen collection
 
     // ── VM reference (set when VM starts execution) ──────────────────
     vm: ?*VM = null,
@@ -77,8 +93,10 @@ pub const GC = struct {
     }
 
     pub fn deinit(self: *GC) void {
-        // Free nursery collector resources.
+        // Free collector resources.
         self.nursery_collector.deinit(self.backing_allocator);
+        self.oldgen_collector.deinit(self.backing_allocator);
+        self.write_barrier.deinit(self.backing_allocator);
 
         // Free all nursery objects.
         var obj = self.nursery_objects;
@@ -112,6 +130,7 @@ pub const GC = struct {
         obj.promoteToOld();
         obj.next = self.old_objects;
         self.old_objects = obj;
+        self.old_gen_size += 1;
     }
 
     /// Get total heap size (bytes currently allocated).
@@ -144,6 +163,11 @@ pub const GC = struct {
         // 1. Scan roots: marks reachable nursery objects by promoting them.
         try gc_roots_mod.scanRoots(&self.nursery_collector, self, vm);
 
+        // 1b. Scan dirty old-gen objects from write barrier for additional
+        //     nursery roots (old-to-young references).
+        try self.write_barrier.scanDirtyObjects(&self.nursery_collector, self);
+        self.write_barrier.clear();
+
         // 2. Process gray stack: scan promoted objects' references.
         try self.nursery_collector.processGrayStack(self);
 
@@ -152,7 +176,20 @@ pub const GC = struct {
         _ = self.intern_table.removeUnmarked();
 
         // 4. Migrate promoted objects from nursery list to old-gen list.
+        //    Count how many get promoted to update old_gen_size.
+        const old_gen_before = self.old_gen_size;
         NurseryCollector.migratePromoted(self);
+        // Count promoted objects by counting new old_objects.
+        {
+            var count: usize = 0;
+            var obj = self.old_objects;
+            while (obj) |o| : (obj = o.next) {
+                count += 1;
+            }
+            self.old_gen_size = count;
+        }
+        const promoted_to_old = self.old_gen_size - old_gen_before;
+        _ = promoted_to_old;
 
         // 5. Sweep remaining nursery objects (unreachable).
         const freed_count = NurseryCollector.sweepNursery(self);
@@ -229,6 +266,92 @@ pub const GC = struct {
         while (obj) |o| : (obj = o.next) {
             o.setMarked(false);
         }
+    }
+
+    // ── Old-gen collection ─────────────────────────────────────────────
+
+    /// Run old-gen mark-sweep collection.
+    /// Orchestrates: mark -> sweep intern table -> sweep old gen.
+    pub fn collectOldGen(self: *GC) !void {
+        // Prevent re-entrant collection.
+        if (self.collecting) return;
+        self.collecting = true;
+        defer self.collecting = false;
+
+        const vm = self.vm orelse return;
+
+        const timer_start = std.time.nanoTimestamp();
+
+        // Run old-gen mark-sweep (handles mark, intern sweep, old-gen sweep).
+        const freed = try self.oldgen_collector.collect(self, vm);
+
+        // Update statistics.
+        self.oldgen_count += 1;
+        self.total_bytes_freed += freed;
+
+        const timer_end = std.time.nanoTimestamp();
+        self.last_pause_ns = @intCast(@as(i128, timer_end) - @as(i128, timer_start));
+
+        // Update threshold: 2x post-collection size (per user decision).
+        self.old_gen_last_size = self.old_gen_size;
+        self.old_gen_threshold = if (self.old_gen_size > 0) self.old_gen_size * 2 else 2048;
+
+        // Log if enabled.
+        if (self.log_enabled) {
+            self.logOldGenCollection(freed);
+        }
+    }
+
+    /// Run a full collection: nursery first, then old-gen.
+    pub fn collectFull(self: *GC) !void {
+        try self.collectNursery();
+        try self.collectOldGen();
+    }
+
+    /// Write barrier: called when storing a reference value into a container object.
+    /// If the container is old-gen and the value references a nursery object,
+    /// records the container in the remembered set so nursery collection
+    /// will scan it for additional roots.
+    ///
+    /// Write barrier sites in the VM (as of Phase 4):
+    /// - closeUpvalues: copies stack value into uv.closed
+    /// - op_set_upvalue: stores value into upvalue location
+    ///
+    /// Note: All Zenith collections are immutable (per design decision).
+    /// List.append, Map.set, etc. return NEW collections, never mutate.
+    /// Therefore no write barriers are needed in builtins.
+    /// If mutable collection operations are added in the future,
+    /// write barriers must be inserted at those sites.
+    pub fn writeBarrier(self: *GC, container: *Obj, val: Value) void {
+        // Only needed if container is old-gen and value is a nursery object.
+        if (!container.isOldGen()) return;
+        if (!val.isObj()) return;
+        const ref_obj = val.asObj();
+        if (ref_obj.isOldGen()) return;
+
+        // Container is old-gen, value is a nursery object reference.
+        self.write_barrier.recordStore(container, self.backing_allocator) catch {};
+    }
+
+    /// Check if old-gen size exceeds threshold and trigger collection if so.
+    pub fn checkOldGenThreshold(self: *GC) void {
+        if (self.old_gen_size > self.old_gen_threshold) {
+            self.collectOldGen() catch {};
+        }
+    }
+
+    /// Log old-gen collection details to stderr.
+    fn logOldGenCollection(self: *const GC, freed: usize) void {
+        const stderr = std.fs.File.stderr();
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "[GC] oldgen #{d}: {d} freed, old_size {d}, threshold {d}, pause {d}ns\n", .{
+            self.oldgen_count,
+            freed,
+            self.old_gen_size,
+            self.old_gen_threshold,
+            self.last_pause_ns,
+        }) catch return;
+        stderr.writeAll(msg) catch {};
     }
 };
 

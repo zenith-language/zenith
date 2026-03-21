@@ -7,6 +7,8 @@ const gc_mod = @import("gc");
 const GC = gc_mod.GC;
 const gc_nursery_mod = @import("gc_nursery");
 const NurseryCollector = gc_nursery_mod.NurseryCollector;
+const gc_oldgen_mod = @import("gc_oldgen");
+const OldGenCollector = gc_oldgen_mod.OldGenCollector;
 const vm_mod = @import("vm");
 const VM = vm_mod.VM;
 
@@ -44,6 +46,34 @@ pub fn scanRoots(nursery: *NurseryCollector, gc: *GC, vm: *VM) !void {
         // scan the closed value as well.
         if (@intFromPtr(u.location) == @intFromPtr(&u.closed)) {
             try nursery.processValue(&u.closed, gc);
+        }
+        uv = u.next;
+    }
+}
+
+/// Scan all GC roots for old-gen collection.
+///
+/// Same root set as nursery scanning, but marks old-gen objects via
+/// OldGenCollector.markObj() instead of promoting nursery objects.
+/// This is used during full old-gen mark-sweep collection.
+pub fn scanRootsForOldGen(oldgen: *OldGenCollector, gc: *GC, vm: *VM) !void {
+    // 1. Value stack: scan all active stack slots.
+    for (vm.stack[0..vm.stack_top]) |*val| {
+        try oldgen.processValue(val, gc);
+    }
+
+    // 2. Call frame closures: each active frame holds a closure reference.
+    for (vm.frames[0..vm.frame_count]) |*frame| {
+        try oldgen.markObj(&frame.closure.obj, gc);
+    }
+
+    // 3. Open upvalue list: upvalues that reference live stack slots.
+    var uv = vm.open_upvalues;
+    while (uv) |u| {
+        try oldgen.markObj(&u.obj, gc);
+        // If the upvalue is closed, scan the closed value.
+        if (@intFromPtr(u.location) == @intFromPtr(&u.closed)) {
+            try oldgen.processValue(&u.closed, gc);
         }
         uv = u.next;
     }
