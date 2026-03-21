@@ -1,0 +1,29 @@
+-- STRM-01: source() reads file line-by-line
+let lines = source("tests/zen/fixtures/sample.txt") |> collect()
+print(lines)
+print(source("tests/zen/fixtures/sample.txt") |> count())
+
+-- STRM-15: JSONL codec -- source with format: :jsonl parses each line as JSON
+-- Each line returns ok/err Result
+let records = source("tests/zen/fixtures/sample.jsonl", :jsonl) |> collect()
+print(len(records))
+
+-- First record should be Ok (valid JSON)
+let first = Option.unwrap_or(List.get(records, 0), nil)
+print(Result.is_ok(first))
+
+-- Third record should be Err (malformed JSON: "not valid json")
+let third = Option.unwrap_or(List.get(records, 2), nil)
+print(Result.is_err(third))
+
+-- ERR-04: partition_result splits ok and err streams
+let parts = source("tests/zen/fixtures/sample.jsonl", :jsonl) |> partition_result()
+let ok_records = parts.ok |> collect()
+let err_records = parts.err |> collect()
+print(len(ok_records))
+print(len(err_records))
+
+-- STRM-09: sink writes stream to file, then read back
+range(1, 4) |> sink("/tmp/zen_e2e_jsonl_sink.txt")
+let written = source("/tmp/zen_e2e_jsonl_sink.txt") |> collect()
+print(written)

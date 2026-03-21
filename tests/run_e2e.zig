@@ -62,6 +62,10 @@ const normal_tests = [_]TestCase{
     .{ .name = "streams_partition", .zen_path = "tests/zen/streams_partition.zen", .expected_path = "tests/zen/streams_partition.expected", .is_error_test = false },
     .{ .name = "json", .zen_path = "tests/zen/json.zen", .expected_path = "tests/zen/json.expected", .is_error_test = false },
     .{ .name = "file_io", .zen_path = "tests/zen/file_io.zen", .expected_path = "tests/zen/file_io.expected", .is_error_test = false },
+    // Phase 5 comprehensive e2e tests
+    .{ .name = "streams", .zen_path = "tests/zen/streams.zen", .expected_path = "tests/zen/streams.expected", .is_error_test = false },
+    .{ .name = "streams_lazy", .zen_path = "tests/zen/streams_lazy.zen", .expected_path = "tests/zen/streams_lazy.expected", .is_error_test = false },
+    .{ .name = "jsonl", .zen_path = "tests/zen/jsonl.zen", .expected_path = "tests/zen/jsonl.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
@@ -459,6 +463,18 @@ test "e2e: json" {
 
 test "e2e: file_io" {
     try runNormalTest(normal_tests[28]);
+}
+
+test "e2e: streams" {
+    try runNormalTest(normal_tests[29]);
+}
+
+test "e2e: streams_lazy" {
+    try runNormalTest(normal_tests[30]);
+}
+
+test "e2e: jsonl" {
+    try runNormalTest(normal_tests[31]);
 }
 
 // ── Phase 3 error tests ──────────────────────────────────────────────────
