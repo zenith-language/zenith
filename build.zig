@@ -72,6 +72,24 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const gc_nursery_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/gc_nursery.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "gc", .module = gc_mod },
+        },
+    });
+
+    // gc_nursery needs chunk for ObjFunction.chunk.constants (via obj -> chunk).
+    gc_nursery_mod.addImport("chunk", chunk_mod);
+
+    // gc_mod needs gc_nursery and gc_roots (added after vm_mod is created below).
+    gc_mod.addImport("gc_nursery", gc_nursery_mod);
+    gc_mod.addImport("value", value_mod);
+
     // Wire memory_mod to import gc for createGC function.
     memory_mod.addImport("gc", gc_mod);
 
@@ -146,6 +164,24 @@ pub fn build(b: *std.Build) void {
             .{ .name = "gc", .module = gc_mod },
         },
     });
+
+    const gc_roots_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/gc_roots.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "gc_nursery", .module = gc_nursery_mod },
+            .{ .name = "vm", .module = vm_mod },
+        },
+    });
+
+    // Wire gc_mod to import gc_roots (for collectNursery orchestration).
+    gc_mod.addImport("gc_roots", gc_roots_mod);
+    // Wire gc_mod to import vm for VM type access.
+    gc_mod.addImport("vm", vm_mod);
 
     const compiler_mod = b.createModule(.{
         .root_source_file = b.path("src/compiler/compiler.zig"),
@@ -227,6 +263,8 @@ pub fn build(b: *std.Build) void {
         memory_mod,
         intern_mod,
         gc_mod,
+        gc_nursery_mod,
+        gc_roots_mod,
         obj_mod,
         value_mod,
         chunk_mod,
