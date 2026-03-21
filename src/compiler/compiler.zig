@@ -27,10 +27,13 @@ pub const CompileResult = struct {
     atom_table: std.StringHashMapUnmanaged(u32),
     atom_count: u32,
     adt_types: std.ArrayListUnmanaged(AdtTypeMeta),
+    /// When true, the VM owns non-function heap constants (strings, etc.)
+    /// and will free them via freeObjects(). Set by VM.trackCompilerObjects().
+    vm_owns_constants: bool = false,
 
     pub fn deinit(self: *CompileResult, allocator: Allocator) void {
         // Recursively destroy the closure and all nested functions.
-        destroyFunction(self.closure.function, allocator);
+        destroyFunction(self.closure.function, allocator, self.vm_owns_constants);
         allocator.free(self.closure.upvalues);
         allocator.destroy(self.closure);
         self.errors.deinit(allocator);
@@ -44,16 +47,20 @@ pub const CompileResult = struct {
     }
 
     /// Recursively destroy an ObjFunction and its nested function constants.
-    fn destroyFunction(func: *ObjFunction, allocator: Allocator) void {
+    /// When vm_owns is true, non-function constants (strings, etc.) are NOT
+    /// destroyed here because the VM tracks and frees them via freeObjects().
+    fn destroyFunction(func: *ObjFunction, allocator: Allocator, vm_owns: bool) void {
         // First, recursively destroy any nested ObjFunction constants.
         for (func.chunk.constants.items) |val| {
             if (val.isObj()) {
                 const obj_ptr = val.asObj();
                 if (obj_ptr.obj_type == .function) {
-                    destroyFunction(ObjFunction.fromObj(obj_ptr), allocator);
-                } else {
+                    destroyFunction(ObjFunction.fromObj(obj_ptr), allocator, vm_owns);
+                } else if (!vm_owns) {
+                    // No VM to take ownership -- compiler must free directly.
                     obj_ptr.destroy(allocator);
                 }
+                // When vm_owns is true, the VM tracks and frees these via freeObjects().
             }
         }
         // Deinit the chunk (code, constants list, lines, etc.) but constants already freed above.

@@ -142,6 +142,8 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
 
     // 4. Execute -- use closure-based VM.
     var vm = VM.initWithClosure(compile_result.closure, allocator);
+    vm.trackCompilerObjects(compile_result.closure);
+    compile_result.vm_owns_constants = true;
     try vm.setAtomNames(atom_names, allocator);
     if (adt_info.len > 0) {
         vm.setAdtTypes(adt_info);

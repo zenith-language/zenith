@@ -145,6 +145,36 @@ pub const VM = struct {
         self.objects = obj;
     }
 
+    /// Register all heap objects from the compiled constant pools so the VM
+    /// owns them for cleanup. Must be called once after initWithClosure.
+    pub fn trackCompilerObjects(self: *Self, closure: *ObjClosure) void {
+        self.trackConstantsRecursive(closure.function);
+    }
+
+    fn trackConstantsRecursive(self: *Self, func: *ObjFunction) void {
+        for (func.chunk.constants.items) |val| {
+            if (val.isObj()) {
+                const obj_ptr = val.asObj();
+                if (obj_ptr.obj_type == .function) {
+                    // Recurse into nested functions but don't track the function
+                    // object itself (CompileResult.deinit frees ObjFunction structs).
+                    self.trackConstantsRecursive(ObjFunction.fromObj(obj_ptr));
+                } else {
+                    // Track non-function objects (strings, etc.) if not already tracked.
+                    var cur = self.objects;
+                    var found = false;
+                    while (cur) |o| {
+                        if (o == obj_ptr) {
+                            found = true;
+                            break;
+                        }
+                        cur = o.next;
+                    }
+                    if (!found) self.trackObject(obj_ptr);
+                }
+            }
+        }
+    }
 
     /// Free all tracked heap objects.
     fn freeObjects(self: *VM) void {
