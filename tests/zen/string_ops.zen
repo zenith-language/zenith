@@ -1,0 +1,28 @@
+-- String.split
+print(String.split("a,b,c", ","))
+
+-- String.trim
+print(String.trim("  hello  "))
+
+-- String.join
+print(String.join(["x", "y", "z"], "-"))
+
+-- String.contains
+print(String.contains("hello world", "world"))
+print(String.contains("hello", "xyz"))
+
+-- String.replace
+print(String.replace("aabbcc", "bb", "XX"))
+
+-- String.starts_with / ends_with
+print(String.starts_with("hello", "hel"))
+print(String.ends_with("hello", "llo"))
+
+-- String.to_lower / to_upper
+print(String.to_lower("Hello World"))
+print(String.to_upper("Hello World"))
+
+-- Edge cases
+print(String.split("", ","))
+print(String.trim(""))
+print(String.join([], ","))

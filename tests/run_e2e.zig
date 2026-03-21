@@ -42,6 +42,15 @@ const normal_tests = [_]TestCase{
     .{ .name = "lambdas", .zen_path = "tests/zen/lambdas.zen", .expected_path = "tests/zen/lambdas.expected", .is_error_test = false },
     .{ .name = "named_args", .zen_path = "tests/zen/named_args.zen", .expected_path = "tests/zen/named_args.expected", .is_error_test = false },
     .{ .name = "tail_calls", .zen_path = "tests/zen/tail_calls.zen", .expected_path = "tests/zen/tail_calls.expected", .is_error_test = false },
+    // Phase 3 tests
+    .{ .name = "lists", .zen_path = "tests/zen/lists.zen", .expected_path = "tests/zen/lists.expected", .is_error_test = false },
+    .{ .name = "maps", .zen_path = "tests/zen/maps.zen", .expected_path = "tests/zen/maps.expected", .is_error_test = false },
+    .{ .name = "tuples", .zen_path = "tests/zen/tuples.zen", .expected_path = "tests/zen/tuples.expected", .is_error_test = false },
+    .{ .name = "records", .zen_path = "tests/zen/records.zen", .expected_path = "tests/zen/records.expected", .is_error_test = false },
+    .{ .name = "adts", .zen_path = "tests/zen/adts.zen", .expected_path = "tests/zen/adts.expected", .is_error_test = false },
+    .{ .name = "pattern_matching", .zen_path = "tests/zen/pattern_matching.zen", .expected_path = "tests/zen/pattern_matching.expected", .is_error_test = false },
+    .{ .name = "result_option", .zen_path = "tests/zen/result_option.zen", .expected_path = "tests/zen/result_option.expected", .is_error_test = false },
+    .{ .name = "string_ops", .zen_path = "tests/zen/string_ops.zen", .expected_path = "tests/zen/string_ops.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
@@ -53,6 +62,13 @@ const error_tests = [_]TestCase{
     // Phase 2 error tests
     .{ .name = "not_callable", .zen_path = "tests/zen/errors/not_callable.zen", .expected_path = "tests/zen/errors/not_callable.expected", .is_error_test = true },
     .{ .name = "arity_mismatch", .zen_path = "tests/zen/errors/arity_mismatch.zen", .expected_path = "tests/zen/errors/arity_mismatch.expected", .is_error_test = true },
+    // Phase 3 error tests
+    .{ .name = "match_fail", .zen_path = "tests/zen/errors/match_fail.zen", .expected_path = "tests/zen/errors/match_fail.expected", .is_error_test = true },
+};
+
+/// Warning tests: pipeline succeeds but error output contains expected warning fragments.
+const warning_tests = [_]TestCase{
+    .{ .name = "non_exhaustive", .zen_path = "tests/zen/errors/non_exhaustive.zen", .expected_path = "tests/zen/errors/non_exhaustive.expected", .is_error_test = false },
 };
 
 // ── Pipeline runner ────────────────────────────────────────────────────────
@@ -120,6 +136,13 @@ fn runPipeline(source: []const u8, file_name: []const u8, allocator: std.mem.All
             .error_output = try error_buf.toOwnedSlice(allocator),
             .succeeded = false,
         };
+    }
+
+    // Render any compiler warnings to error_buf (for warning tests).
+    for (compile_result.errors.items) |diag| {
+        if (diag.severity == .warning) {
+            diag.render(source, file_name, error_buf.writer(allocator), false) catch {};
+        }
     }
 
     // Build atom name list.
@@ -352,6 +375,87 @@ test "e2e error: not_callable" {
 
 test "e2e error: arity_mismatch" {
     try runErrorTest(error_tests[5]);
+}
+
+// ── Phase 3 normal tests ──────────────────────────────────────────────────
+
+test "e2e: lists" {
+    try runNormalTest(normal_tests[14]);
+}
+
+test "e2e: maps" {
+    try runNormalTest(normal_tests[15]);
+}
+
+test "e2e: tuples" {
+    try runNormalTest(normal_tests[16]);
+}
+
+test "e2e: records" {
+    try runNormalTest(normal_tests[17]);
+}
+
+test "e2e: adts" {
+    try runNormalTest(normal_tests[18]);
+}
+
+test "e2e: pattern_matching" {
+    try runNormalTest(normal_tests[19]);
+}
+
+test "e2e: result_option" {
+    try runNormalTest(normal_tests[20]);
+}
+
+test "e2e: string_ops" {
+    try runNormalTest(normal_tests[21]);
+}
+
+// ── Phase 3 error tests ──────────────────────────────────────────────────
+
+test "e2e error: match_fail" {
+    try runErrorTest(error_tests[6]);
+}
+
+// ── Warning tests ─────────────────────────────────────────────────────────
+
+fn runWarningTest(tc: TestCase) !void {
+    const allocator = std.testing.allocator;
+
+    const source = try std.fs.cwd().readFileAlloc(allocator, tc.zen_path, 10 * 1024 * 1024);
+    defer allocator.free(source);
+
+    const expected = try std.fs.cwd().readFileAlloc(allocator, tc.expected_path, 10 * 1024 * 1024);
+    defer allocator.free(expected);
+
+    const result = try runPipeline(source, tc.zen_path, allocator);
+    defer allocator.free(result.output);
+    defer allocator.free(result.error_output);
+
+    // Warning tests: pipeline should succeed but error output should contain warning fragments.
+    if (!result.succeeded) {
+        std.debug.print("\n[FAIL] {s}: expected success but pipeline failed\n", .{tc.name});
+        if (result.error_output.len > 0) {
+            std.debug.print("Error output:\n{s}\n", .{result.error_output});
+        }
+        return error.TestFailed;
+    }
+
+    // Check that error output contains each expected fragment.
+    var lines = std.mem.splitSequence(u8, expected, "\n");
+    while (lines.next()) |line_raw| {
+        const trimmed = trimTrailing(line_raw);
+        if (trimmed.len == 0) continue;
+        if (std.mem.indexOf(u8, result.error_output, trimmed) == null) {
+            std.debug.print("\n[FAIL] {s}: warning output missing fragment: '{s}'\n", .{ tc.name, trimmed });
+            std.debug.print("Full error output:\n{s}\n", .{result.error_output});
+            return error.TestFailed;
+        }
+    }
+}
+
+test "e2e warning: non_exhaustive" {
+    try runWarningTest(warning_tests[0]);
 }
 
 // ── Bytecode roundtrip test ────────────────────────────────────────────────

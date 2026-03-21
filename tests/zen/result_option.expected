@@ -1,0 +1,25 @@
+Result.Ok(42)
+Result.Err(not found)
+Result.Ok(84)
+Result.Err(not found)
+Result.Err(Error: not found)
+42
+0
+Result.Ok(5)
+Result.Err(division by zero)
+true
+true
+30
+Option.Some(hello)
+Option.None
+Option.Some(HELLO)
+hello
+default
+true
+true
+Result.Ok(hello)
+Result.Err(no value)
+10
+0
+got: 42
+error: oops

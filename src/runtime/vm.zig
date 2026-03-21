@@ -979,7 +979,16 @@ pub const VM = struct {
         };
 
         if (result.isObj()) {
-            self.trackObject(result.asObj());
+            // Only track if not already tracked (closures called from builtins
+            // may return objects already registered via the VM's normal execution).
+            const obj_ptr = result.asObj();
+            var already_tracked = false;
+            var cur = self.objects;
+            while (cur) |o| {
+                if (o == obj_ptr) { already_tracked = true; break; }
+                cur = o.next;
+            }
+            if (!already_tracked) self.trackObject(obj_ptr);
         }
 
         self.stack_top -= (@as(u32, arg_count) + 1);
@@ -989,6 +998,12 @@ pub const VM = struct {
     /// Callback function for builtins to register intermediate heap objects.
     fn trackObjectFromBuiltin(vm_ptr: *anyopaque, obj: *obj_mod.Obj) void {
         const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+        // Check if already tracked to avoid double-free.
+        var cur = vm.objects;
+        while (cur) |o| {
+            if (o == obj) return;
+            cur = o.next;
+        }
         vm.trackObject(obj);
     }
 

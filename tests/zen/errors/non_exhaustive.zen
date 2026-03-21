@@ -1,0 +1,9 @@
+-- Non-exhaustive match: Blue variant is missing
+-- Compiler should produce a warning but program should still work
+type Color = | Red | Green | Blue
+let describe = fn(c) {
+  match c
+    | Color.Red -> "red"
+    | Color.Green -> "green"
+}
+print(describe(Color.Red))

@@ -1,0 +1,79 @@
+-- Result creation
+let ok = Result.Ok(42)
+print(ok)
+let err = Result.Err("not found")
+print(err)
+
+-- Result.map_ok
+let doubled = Result.map_ok(ok, |x| x * 2)
+print(doubled)
+let still_err = Result.map_ok(err, |x| x * 2)
+print(still_err)
+
+-- Result.map_err
+let mapped_err = Result.map_err(err, |e| "Error: " ++ e)
+print(mapped_err)
+
+-- Result.unwrap_or
+print(Result.unwrap_or(ok, 0))
+print(Result.unwrap_or(err, 0))
+
+-- Result.then (flatmap)
+let safe_div = fn(a, b) {
+  match b
+    | 0 -> Result.Err("division by zero")
+    | _ -> Result.Ok(a / b)
+}
+let chained = Result.then(Result.Ok(10), |x| safe_div(x, 2))
+print(chained)
+let chain_err = Result.then(Result.Ok(10), |x| safe_div(x, 0))
+print(chain_err)
+
+-- Result.is_ok / Result.is_err
+print(Result.is_ok(ok))
+print(Result.is_err(err))
+
+-- Pipe-friendly chaining
+let result = Result.Ok(10)
+  |> Result.map_ok(|x| x + 5)
+  |> Result.map_ok(|x| x * 2)
+  |> Result.unwrap_or(0)
+print(result)
+
+-- Option creation and usage
+let some = Option.Some("hello")
+print(some)
+let none = Option.None
+print(none)
+
+-- Option.map
+let upper = Option.map(some, |s| String.to_upper(s))
+print(upper)
+
+-- Option.unwrap_or
+print(Option.unwrap_or(some, "default"))
+print(Option.unwrap_or(none, "default"))
+
+-- Option.is_some / Option.is_none
+print(Option.is_some(some))
+print(Option.is_none(none))
+
+-- Option.to_result
+print(Option.to_result(some, "no value"))
+print(Option.to_result(none, "no value"))
+
+-- Integration: List.get returns Option, use with combinators
+let xs = [10, 20, 30]
+let val = List.get(xs, 0) |> Option.unwrap_or(0)
+print(val)
+let missing = List.get(xs, 99) |> Option.unwrap_or(0)
+print(missing)
+
+-- Pattern matching on Result
+let handle = fn(r) {
+  match r
+    | Result.Ok(v) -> "got: " ++ str(v)
+    | Result.Err(e) -> "error: " ++ e
+}
+print(handle(Result.Ok(42)))
+print(handle(Result.Err("oops")))
