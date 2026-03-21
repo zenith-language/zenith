@@ -142,9 +142,30 @@ pub const Compiler = struct {
     /// Explicit error set for recursive compilation functions (Zig 0.15 requirement).
     pub const Error = error{Overflow} || Allocator.Error;
 
-    // Names of built-in functions.
+    // Names of built-in functions. Must match the order in builtins.zig.
     const builtin_names = [_][]const u8{
-        "print", "str", "len", "type_of", "assert", "panic", "range", "show",
+        // Core (0-7)
+        "print",     "str",         "len",              "type_of",
+        "assert",    "panic",       "range",            "show",
+        // List (8-19)
+        "List.get",  "List.set",    "List.append",      "List.length",
+        "List.map",  "List.filter", "List.reduce",      "List.sort",
+        "List.reverse", "List.zip", "List.flatten",     "List.contains",
+        // Map (20-27)
+        "Map.get",   "Map.set",     "Map.delete",       "Map.keys",
+        "Map.values", "Map.merge",  "Map.contains",     "Map.length",
+        // Tuple (28-29)
+        "Tuple.get", "Tuple.length",
+        // String (30-39)
+        "String.split", "String.trim", "String.join",   "String.contains",
+        "String.replace", "String.starts_with", "String.ends_with", "String.to_lower",
+        "String.to_upper", "String.length",
+        // Result (40-47)
+        "Result.Ok", "Result.Err",  "Result.map_ok",    "Result.map_err",
+        "Result.then", "Result.unwrap_or", "Result.is_ok", "Result.is_err",
+        // Option (48-54)
+        "Option.Some", "Option.None", "Option.map",     "Option.unwrap_or",
+        "Option.is_some", "Option.is_none", "Option.to_result",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-6 to match
@@ -991,8 +1012,14 @@ pub const Compiler = struct {
                         return;
                     }
                 }
-                try self.emitError(node_idx, .E002, "unknown variant for type");
-                return;
+                // Variant not found -- fall through to module check.
+                // Types like Option and Result are both ADT types AND module names,
+                // so Option.map, Result.map_ok etc. should resolve as builtins.
+                if (!isKnownModule(left_name)) {
+                    try self.emitError(node_idx, .E002, "unknown variant for type");
+                    return;
+                }
+                // Fall through to the module check below.
             }
 
             if (isKnownModule(left_name)) {

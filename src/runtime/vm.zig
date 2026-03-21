@@ -947,6 +947,10 @@ pub const VM = struct {
             return;
         }
 
+        // Set VM pointer for higher-order builtins that need to invoke closures.
+        builtins_mod.setVM(@ptrCast(self), &callClosureFromBuiltin);
+        defer builtins_mod.clearVM();
+
         var err_msg: []const u8 = "";
         const result = builtin.func(args, self.allocator, &err_msg) catch |err| {
             switch (err) {
@@ -964,6 +968,281 @@ pub const VM = struct {
 
         self.stack_top -= (@as(u32, arg_count) + 1);
         try self.push(result);
+    }
+
+    /// Callback function for builtins to invoke user closures through the VM.
+    /// This is passed to builtins via setVM() and called when List.map, etc.
+    /// need to apply a user-provided function to values.
+    fn callClosureFromBuiltin(vm_ptr: *anyopaque, closure_val: Value, cb_args: []const Value) ?Value {
+        const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+
+        // Validate: must be a closure.
+        if (!closure_val.isObj() or closure_val.asObj().obj_type != .closure) {
+            vm.runtimeErrorAny(.E001, "expected a function argument") catch {};
+            return null;
+        }
+        const closure = ObjClosure.fromObj(closure_val.asObj());
+
+        // Save current frame count to detect when the closure returns.
+        const saved_frame_count = vm.frame_count;
+
+        // Push closure (callee slot) + arguments onto the stack.
+        vm.push(closure_val) catch return null;
+        for (cb_args) |arg| {
+            vm.push(arg) catch return null;
+        }
+
+        // Set up the call frame.
+        vm.callClosure(closure, @intCast(cb_args.len)) catch return null;
+
+        // Run the VM until this frame returns.
+        while (vm.frame_count > saved_frame_count) {
+            const frame = vm.currentFrame();
+            const code = frame.closure.function.chunk.code.items;
+
+            if (frame.ip >= code.len) {
+                // End of function code: implicit nil return.
+                vm.frame_count -= 1;
+                if (vm.frame_count > saved_frame_count) {
+                    // Inner frame returned; push nil and continue.
+                    const base = frame.base_slot;
+                    vm.stack_top = base;
+                    vm.push(Value.nil) catch return null;
+                    continue;
+                }
+                // Our target frame returned.
+                vm.stack_top = frame.base_slot;
+                return Value.nil;
+            }
+
+            const opcode: OpCode = @enumFromInt(code[frame.ip]);
+            frame.ip += 1;
+
+            // Re-dispatch the single instruction.
+            // For op_return, intercept to stop at our saved frame level.
+            if (opcode == .op_return) {
+                const ret = vm.pop() catch return null;
+                vm.closeUpvalues(frame.base_slot);
+                vm.frame_count -= 1;
+                if (vm.frame_count <= saved_frame_count) {
+                    // Our closure has returned. Restore stack.
+                    vm.stack_top = frame.base_slot;
+                    return ret;
+                }
+                // Nested function returned.
+                vm.stack_top = frame.base_slot;
+                vm.push(ret) catch return null;
+                continue;
+            }
+
+            // For all other opcodes, rewind ip and dispatch via runSingleOp.
+            frame.ip -= 1;
+            vm.runSingleFrameOp() catch return null;
+        }
+
+        return Value.nil;
+    }
+
+    /// Execute a single opcode from the current frame (used by callClosureFromBuiltin).
+    fn runSingleFrameOp(self: *Self) RuntimeError!void {
+        const frame = self.currentFrame();
+        const code = frame.closure.function.chunk.code.items;
+        const opcode: OpCode = @enumFromInt(code[frame.ip]);
+        frame.ip += 1;
+
+        switch (opcode) {
+            .op_constant => {
+                const val = self.readConstantFrame();
+                try self.push(val);
+            },
+            .op_constant_long => {
+                const val = self.readConstantLongFrame();
+                try self.push(val);
+            },
+            .op_nil => try self.push(Value.nil),
+            .op_true => try self.push(Value.true_val),
+            .op_false => try self.push(Value.false_val),
+            .op_add => try self.binaryAdd(),
+            .op_subtract => try self.binarySub(),
+            .op_multiply => try self.binaryMul(),
+            .op_divide => try self.binaryDiv(),
+            .op_modulo => try self.binaryMod(),
+            .op_negate => try self.execNegate(),
+            .op_not => {
+                const val = try self.pop();
+                try self.push(Value.fromBool(builtins_mod.isFalsy(val)));
+            },
+            .op_equal => {
+                const b = try self.pop();
+                const a = try self.pop();
+                try self.push(Value.fromBool(Value.eql(a, b)));
+            },
+            .op_not_equal => {
+                const b = try self.pop();
+                const a = try self.pop();
+                try self.push(Value.fromBool(!Value.eql(a, b)));
+            },
+            .op_less => try self.binaryCompare(.lt),
+            .op_greater => try self.binaryCompare(.gt),
+            .op_less_equal => try self.binaryCompare(.le),
+            .op_greater_equal => try self.binaryCompare(.ge),
+            .op_concat => try self.stringConcat(),
+            .op_pop => {
+                _ = try self.pop();
+            },
+            .op_get_local => {
+                const slot = self.readByteFrame();
+                try self.push(self.stack[frame.base_slot + slot]);
+            },
+            .op_set_local => {
+                const slot = self.readByteFrame();
+                self.stack[frame.base_slot + slot] = self.peek(0);
+            },
+            .op_get_global, .op_set_global, .op_define_global => {
+                try self.runtimeErrorAny(.E002, "globals not supported");
+                return error.RuntimeErr;
+            },
+            .op_jump => {
+                const offset = self.readU16Frame();
+                self.currentFrame().ip += offset;
+            },
+            .op_jump_if_false => {
+                const offset = self.readU16Frame();
+                if (builtins_mod.isFalsy(self.peek(0))) {
+                    self.currentFrame().ip += offset;
+                }
+            },
+            .op_loop => {
+                const offset = self.readU16Frame();
+                self.currentFrame().ip -= offset;
+            },
+            .op_print => {
+                const val = try self.pop();
+                try self.printValue(val);
+            },
+            .op_get_builtin => {
+                const idx = self.readByteFrame();
+                try self.push(Value.fromAtom(BUILTIN_BASE + @as(u32, idx)));
+            },
+            .op_call => {
+                const arg_count = self.readByteFrame();
+                try self.callValue(arg_count);
+            },
+            .op_closure => {
+                const const_idx = self.readByteFrame();
+                const func_val = self.frameChunk().constants.items[const_idx];
+                const func = ObjFunction.fromObj(func_val.asObj());
+                const closure = try ObjClosure.create(self.allocator, func);
+                self.trackObject(&closure.obj);
+                for (0..func.upvalue_count) |i| {
+                    const is_local = self.readByteFrame();
+                    const index = self.readByteFrame();
+                    if (is_local == 1) {
+                        closure.upvalues[i] = try self.captureUpvalue(frame.base_slot + index);
+                    } else {
+                        closure.upvalues[i] = frame.closure.upvalues[index];
+                    }
+                }
+                try self.push(Value.fromObj(&closure.obj));
+            },
+            .op_get_upvalue => {
+                const slot = self.readByteFrame();
+                if (frame.closure.upvalues[slot]) |uv| {
+                    try self.push(uv.location.*);
+                } else {
+                    try self.push(Value.nil);
+                }
+            },
+            .op_set_upvalue => {
+                const slot = self.readByteFrame();
+                if (frame.closure.upvalues[slot]) |uv| {
+                    uv.location.* = self.peek(0);
+                }
+            },
+            .op_close_upvalue => {
+                self.closeUpvalues(self.stack_top - 1);
+                _ = try self.pop();
+            },
+            .op_close_upvalue_at => {
+                const slot = self.readByteFrame();
+                self.closeUpvalues(frame.base_slot + slot);
+            },
+            .op_return => {
+                // This should be handled by callClosureFromBuiltin, but just in case:
+                const ret = try self.pop();
+                self.closeUpvalues(frame.base_slot);
+                self.frame_count -= 1;
+                self.stack_top = frame.base_slot;
+                try self.push(ret);
+            },
+            .op_tail_call => {
+                const arg_count = self.readByteFrame();
+                try self.execTailCall(arg_count);
+            },
+            .op_atom => {
+                const val = self.readConstantFrame();
+                try self.push(val);
+            },
+            .op_for_iter => {
+                const jump_offset = self.readU16Frame();
+                try self.execForIterFrame(jump_offset);
+            },
+            .op_list => {
+                const count = self.readU16Frame();
+                try self.execOpList(count);
+            },
+            .op_map => {
+                const count = self.readU16Frame();
+                try self.execOpMap(count);
+            },
+            .op_tuple => {
+                const count = self.readU16Frame();
+                try self.execOpTuple(count);
+            },
+            .op_record => {
+                const count = self.readU16Frame();
+                try self.execOpRecordFrame(count);
+            },
+            .op_record_spread => {
+                const override_count = self.readByteFrame();
+                try self.execOpRecordSpreadFrame(override_count);
+            },
+            .op_get_field => {
+                const const_idx = self.readU16Frame();
+                const field_val = self.frameChunk().constants.items[const_idx];
+                try self.execOpGetField(field_val);
+            },
+            .op_dup => {
+                const top = self.peek(0);
+                try self.push(top);
+            },
+            .op_adt_construct => {
+                const type_id = self.readU16Frame();
+                const variant_idx = self.readU16Frame();
+                const arity = self.readByteFrame();
+                try self.execOpAdtConstruct(type_id, variant_idx, arity);
+            },
+            .op_adt_get_field => {
+                const field_idx = self.readByteFrame();
+                try self.execOpAdtGetField(field_idx);
+            },
+            .op_check_tag => {
+                const type_id = self.readU16Frame();
+                const variant_idx = self.readU16Frame();
+                try self.execOpCheckTag(type_id, variant_idx);
+            },
+            .op_get_index => {
+                const index = self.readU16Frame();
+                try self.execOpGetIndex(index);
+            },
+            .op_list_len => {
+                try self.execOpListLen();
+            },
+            .op_list_slice => {
+                const start = self.readU16Frame();
+                try self.execOpListSlice(start);
+            },
+        }
     }
 
     // ── Tail call dispatch ────────────────────────────────────────────

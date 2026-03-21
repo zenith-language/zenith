@@ -4,6 +4,10 @@ const value_mod = @import("value");
 const Value = value_mod.Value;
 const obj_mod = @import("obj");
 const ObjString = obj_mod.ObjString;
+const ObjList = obj_mod.ObjList;
+const ObjMap = obj_mod.ObjMap;
+const ObjTuple = obj_mod.ObjTuple;
+const ObjAdt = obj_mod.ObjAdt;
 
 /// Error type for native function execution.
 pub const NativeError = error{
@@ -23,8 +27,79 @@ pub const BuiltinDesc = struct {
     arity_max: u8,
 };
 
-/// All built-in functions available in Phase 1.
+// ── VM Callback Mechanism ─────────────────────────────────────────────
+// Higher-order builtins (List.map, List.filter, etc.) need to invoke user
+// closures. Since builtins.zig cannot import vm.zig (circular dependency),
+// we use a callback function pointer that the VM registers before calling
+// any builtin.
+
+/// Callback type: invoke a closure Value with given arguments, return result.
+/// Returns null on error (the VM will have already recorded the error).
+pub const CallClosureFn = *const fn (vm_ptr: *anyopaque, closure_val: Value, args: []const Value) ?Value;
+
+/// Module-level state set by the VM before calling builtins.
+var current_vm: ?*anyopaque = null;
+var call_closure_fn: ?CallClosureFn = null;
+
+/// Called by the VM before dispatching a builtin function.
+pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn) void {
+    current_vm = vm_ptr;
+    call_closure_fn = closure_fn;
+}
+
+/// Called by the VM after a builtin returns.
+pub fn clearVM() void {
+    current_vm = null;
+    call_closure_fn = null;
+}
+
+/// Internal helper: invoke a closure from within a builtin.
+fn callClosure(closure_val: Value, args: []const Value) NativeError!Value {
+    const vm_ptr = current_vm orelse return error.RuntimeError;
+    const fn_ptr = call_closure_fn orelse return error.RuntimeError;
+    return fn_ptr(vm_ptr, closure_val, args) orelse return error.RuntimeError;
+}
+
+// ── ADT Helper Functions ──────────────────────────────────────────────
+// Option: type_id=0, Some=variant_idx 0 (arity 1), None=variant_idx 1 (arity 0)
+// Result: type_id=1, Ok=variant_idx 0 (arity 1), Err=variant_idx 1 (arity 1)
+
+fn makeNone(allocator: Allocator) NativeError!Value {
+    const adt = try ObjAdt.create(allocator, 0, 1, &[_]Value{});
+    return Value.fromObj(&adt.obj);
+}
+
+fn makeSome(val: Value, allocator: Allocator) NativeError!Value {
+    const adt = try ObjAdt.create(allocator, 0, 0, &[_]Value{val});
+    return Value.fromObj(&adt.obj);
+}
+
+fn makeOk(val: Value, allocator: Allocator) NativeError!Value {
+    const adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{val});
+    return Value.fromObj(&adt.obj);
+}
+
+fn makeErr(val: Value, allocator: Allocator) NativeError!Value {
+    const adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{val});
+    return Value.fromObj(&adt.obj);
+}
+
+/// Check if value is an ADT with given type_id and variant_idx.
+fn isAdtVariant(val: Value, type_id: u16, variant_idx: u16) bool {
+    if (!val.isObjType(.adt)) return false;
+    const adt = ObjAdt.fromObj(val.asObj());
+    return adt.type_id == type_id and adt.variant_idx == variant_idx;
+}
+
+/// Get payload from ADT at given index.
+fn adtPayload(val: Value, idx: usize) Value {
+    const adt = ObjAdt.fromObj(val.asObj());
+    return adt.payload[idx];
+}
+
+/// All built-in functions.
 pub const builtins = [_]BuiltinDesc{
+    // ── Core builtins (indices 0-7) ──────────────────────────────────
     .{ .name = "print", .func = &builtinPrint, .arity_min = 1, .arity_max = 1 },
     .{ .name = "str", .func = &builtinStr, .arity_min = 1, .arity_max = 1 },
     .{ .name = "len", .func = &builtinLen, .arity_min = 1, .arity_max = 1 },
@@ -33,6 +108,65 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "panic", .func = &builtinPanic, .arity_min = 1, .arity_max = 1 },
     .{ .name = "range", .func = &builtinRange, .arity_min = 1, .arity_max = 3 },
     .{ .name = "show", .func = &builtinShow, .arity_min = 1, .arity_max = 1 },
+
+    // ── List module (indices 8-19) ───────────────────────────────────
+    .{ .name = "List.get", .func = &builtinListGet, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "List.set", .func = &builtinListSet, .arity_min = 3, .arity_max = 3 },
+    .{ .name = "List.append", .func = &builtinListAppend, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "List.length", .func = &builtinListLength, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "List.map", .func = &builtinListMap, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "List.filter", .func = &builtinListFilter, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "List.reduce", .func = &builtinListReduce, .arity_min = 3, .arity_max = 3 },
+    .{ .name = "List.sort", .func = &builtinListSort, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "List.reverse", .func = &builtinListReverse, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "List.zip", .func = &builtinListZip, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "List.flatten", .func = &builtinListFlatten, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "List.contains", .func = &builtinListContains, .arity_min = 2, .arity_max = 2 },
+
+    // ── Map module (indices 20-27) ───────────────────────────────────
+    .{ .name = "Map.get", .func = &builtinMapGet, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Map.set", .func = &builtinMapSet, .arity_min = 3, .arity_max = 3 },
+    .{ .name = "Map.delete", .func = &builtinMapDelete, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Map.keys", .func = &builtinMapKeys, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Map.values", .func = &builtinMapValues, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Map.merge", .func = &builtinMapMerge, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Map.contains", .func = &builtinMapContains, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Map.length", .func = &builtinMapLength, .arity_min = 1, .arity_max = 1 },
+
+    // ── Tuple module (indices 28-29) ─────────────────────────────────
+    .{ .name = "Tuple.get", .func = &builtinTupleGet, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Tuple.length", .func = &builtinTupleLength, .arity_min = 1, .arity_max = 1 },
+
+    // ── String module (indices 30-39) ────────────────────────────────
+    .{ .name = "String.split", .func = &builtinStringSplit, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "String.trim", .func = &builtinStringTrim, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "String.join", .func = &builtinStringJoin, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "String.contains", .func = &builtinStringContains, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "String.replace", .func = &builtinStringReplace, .arity_min = 3, .arity_max = 3 },
+    .{ .name = "String.starts_with", .func = &builtinStringStartsWith, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "String.ends_with", .func = &builtinStringEndsWith, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "String.to_lower", .func = &builtinStringToLower, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "String.to_upper", .func = &builtinStringToUpper, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "String.length", .func = &builtinStringLength, .arity_min = 1, .arity_max = 1 },
+
+    // ── Result module (indices 40-47) ────────────────────────────────
+    .{ .name = "Result.Ok", .func = &builtinResultOk, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Result.Err", .func = &builtinResultErr, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Result.map_ok", .func = &builtinResultMapOk, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Result.map_err", .func = &builtinResultMapErr, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Result.then", .func = &builtinResultThen, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Result.unwrap_or", .func = &builtinResultUnwrapOr, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Result.is_ok", .func = &builtinResultIsOk, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Result.is_err", .func = &builtinResultIsErr, .arity_min = 1, .arity_max = 1 },
+
+    // ── Option module (indices 48-54) ────────────────────────────────
+    .{ .name = "Option.Some", .func = &builtinOptionSome, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Option.None", .func = &builtinOptionNone, .arity_min = 0, .arity_max = 0 },
+    .{ .name = "Option.map", .func = &builtinOptionMap, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Option.unwrap_or", .func = &builtinOptionUnwrapOr, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "Option.is_some", .func = &builtinOptionIsSome, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Option.is_none", .func = &builtinOptionIsNone, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Option.to_result", .func = &builtinOptionToResult, .arity_min = 2, .arity_max = 2 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -107,7 +241,7 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
                 try writer.writeAll("<upvalue>");
             },
             .list => {
-                const lst = obj_mod.ObjList.fromObj(obj_ptr);
+                const lst = ObjList.fromObj(obj_ptr);
                 try writer.writeByte('[');
                 for (lst.items.items, 0..) |item, i| {
                     if (i > 0) try writer.writeAll(", ");
@@ -118,7 +252,7 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
                 try writer.writeByte(']');
             },
             .map => {
-                const m = obj_mod.ObjMap.fromObj(obj_ptr);
+                const m = ObjMap.fromObj(obj_ptr);
                 try writer.writeByte('{');
                 var it = m.entries.iterator();
                 var first = true;
@@ -136,7 +270,7 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
                 try writer.writeByte('}');
             },
             .tuple => {
-                const t = obj_mod.ObjTuple.fromObj(obj_ptr);
+                const t = ObjTuple.fromObj(obj_ptr);
                 try writer.writeByte('(');
                 for (t.fields, 0..) |field, i| {
                     if (i > 0) try writer.writeAll(", ");
@@ -160,7 +294,7 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
                 try writer.writeAll("}");
             },
             .adt => {
-                const a = obj_mod.ObjAdt.fromObj(obj_ptr);
+                const a = ObjAdt.fromObj(obj_ptr);
                 try writer.print("ADT({d}.{d})", .{ a.type_id, a.variant_idx });
                 if (a.payload.len > 0) {
                     try writer.writeByte('(');
@@ -181,7 +315,7 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
     return buf.toOwnedSlice(allocator);
 }
 
-// ── Built-in implementations ──────────────────────────────────────────
+// ── Core built-in implementations ────────────────────────────────────
 
 /// print(value) -- format value, write to stdout with newline. Returns nil.
 fn builtinPrint(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
@@ -212,15 +346,15 @@ fn builtinLen(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
         return Value.fromInt(@intCast(str.bytes.len));
     }
     if (val.isObjType(.list)) {
-        const lst = obj_mod.ObjList.fromObj(val.asObj());
+        const lst = ObjList.fromObj(val.asObj());
         return Value.fromInt(@intCast(lst.items.items.len));
     }
     if (val.isObjType(.map)) {
-        const m = obj_mod.ObjMap.fromObj(val.asObj());
+        const m = ObjMap.fromObj(val.asObj());
         return Value.fromInt(@intCast(m.entries.count()));
     }
     if (val.isObjType(.tuple)) {
-        const t = obj_mod.ObjTuple.fromObj(val.asObj());
+        const t = ObjTuple.fromObj(val.asObj());
         return Value.fromInt(@intCast(t.fields.len));
     }
     if (val.isObjType(.record)) {
@@ -331,6 +465,716 @@ fn builtinShow(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     return args[0]; // return the value itself
 }
 
+// ── List module implementations ──────────────────────────────────────
+
+/// List.get(list, index) -> Option: return Some(element) or None if out of bounds.
+fn builtinListGet(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.get expects a list as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isInt()) {
+        err_msg.* = "List.get expects an integer index";
+        return error.RuntimeError;
+    }
+    const lst = ObjList.fromObj(args[0].asObj());
+    const idx = args[1].asInt();
+    if (idx < 0 or idx >= @as(i32, @intCast(lst.items.items.len))) {
+        return makeNone(allocator);
+    }
+    return makeSome(lst.items.items[@intCast(idx)], allocator);
+}
+
+/// List.set(list, index, value) -> List: return new list with element replaced.
+fn builtinListSet(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.set expects a list as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isInt()) {
+        err_msg.* = "List.set expects an integer index";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const idx = args[1].asInt();
+    if (idx < 0 or idx >= @as(i32, @intCast(src.items.items.len))) {
+        err_msg.* = "List.set index out of bounds";
+        return error.RuntimeError;
+    }
+    const new_list = try ObjList.create(allocator);
+    try new_list.items.appendSlice(allocator, src.items.items);
+    new_list.items.items[@intCast(idx)] = args[2];
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.append(list, value) -> List: return new list with element appended.
+fn builtinListAppend(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.append expects a list as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const new_list = try ObjList.create(allocator);
+    try new_list.items.appendSlice(allocator, src.items.items);
+    try new_list.items.append(allocator, args[1]);
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.length(list) -> Int: return list length.
+fn builtinListLength(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.length expects a list argument";
+        return error.RuntimeError;
+    }
+    const lst = ObjList.fromObj(args[0].asObj());
+    return Value.fromInt(@intCast(lst.items.items.len));
+}
+
+/// List.map(list, fn) -> List: apply fn to each element, return new list.
+fn builtinListMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.map expects a list as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const closure_val = args[1];
+    const new_list = try ObjList.create(allocator);
+    try new_list.items.ensureTotalCapacity(allocator, src.items.items.len);
+    for (src.items.items) |item| {
+        const result = try callClosure(closure_val, &[_]Value{item});
+        new_list.items.appendAssumeCapacity(result);
+    }
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.filter(list, fn) -> List: keep elements where fn returns true.
+fn builtinListFilter(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.filter expects a list as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const closure_val = args[1];
+    const new_list = try ObjList.create(allocator);
+    for (src.items.items) |item| {
+        const result = try callClosure(closure_val, &[_]Value{item});
+        if (!isFalsy(result)) {
+            try new_list.items.append(allocator, item);
+        }
+    }
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.reduce(list, init, fn) -> Value: fold with accumulator.
+fn builtinListReduce(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.reduce expects a list as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    var acc = args[1];
+    const closure_val = args[2];
+    for (src.items.items) |item| {
+        acc = try callClosure(closure_val, &[_]Value{ acc, item });
+    }
+    return acc;
+}
+
+/// List.sort(list) -> List: return sorted list.
+fn builtinListSort(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.sort expects a list argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const new_list = try ObjList.create(allocator);
+    try new_list.items.appendSlice(allocator, src.items.items);
+    std.mem.sort(Value, new_list.items.items, {}, valueCompare);
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.reverse(list) -> List: return reversed list.
+fn builtinListReverse(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.reverse expects a list argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const new_list = try ObjList.create(allocator);
+    try new_list.items.ensureTotalCapacity(allocator, src.items.items.len);
+    var i: usize = src.items.items.len;
+    while (i > 0) {
+        i -= 1;
+        new_list.items.appendAssumeCapacity(src.items.items[i]);
+    }
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.zip(list1, list2) -> List: return list of tuples.
+fn builtinListZip(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list) or !args[1].isObjType(.list)) {
+        err_msg.* = "List.zip expects two list arguments";
+        return error.RuntimeError;
+    }
+    const lst1 = ObjList.fromObj(args[0].asObj());
+    const lst2 = ObjList.fromObj(args[1].asObj());
+    const min_len = @min(lst1.items.items.len, lst2.items.items.len);
+    const new_list = try ObjList.create(allocator);
+    try new_list.items.ensureTotalCapacity(allocator, min_len);
+    for (0..min_len) |i| {
+        const pair = [_]Value{ lst1.items.items[i], lst2.items.items[i] };
+        const tup = try ObjTuple.create(allocator, &pair);
+        new_list.items.appendAssumeCapacity(Value.fromObj(&tup.obj));
+    }
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.flatten(list) -> List: flatten one level of nested lists.
+fn builtinListFlatten(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.flatten expects a list argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const new_list = try ObjList.create(allocator);
+    for (src.items.items) |item| {
+        if (item.isObjType(.list)) {
+            const inner = ObjList.fromObj(item.asObj());
+            try new_list.items.appendSlice(allocator, inner.items.items);
+        } else {
+            try new_list.items.append(allocator, item);
+        }
+    }
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.contains(list, value) -> Bool: check if value exists in list.
+fn builtinListContains(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.contains expects a list as first argument";
+        return error.RuntimeError;
+    }
+    const lst = ObjList.fromObj(args[0].asObj());
+    for (lst.items.items) |item| {
+        if (Value.eql(item, args[1])) return Value.true_val;
+    }
+    return Value.false_val;
+}
+
+// ── Map module implementations ───────────────────────────────────────
+
+/// Map.get(map, key) -> Option: return Some(value) or None.
+fn builtinMapGet(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.map)) {
+        err_msg.* = "Map.get expects a map as first argument";
+        return error.RuntimeError;
+    }
+    const m = ObjMap.fromObj(args[0].asObj());
+    if (m.entries.get(args[1])) |val| {
+        return makeSome(val, allocator);
+    }
+    return makeNone(allocator);
+}
+
+/// Map.set(map, key, value) -> Map: return new map with key set.
+fn builtinMapSet(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.map)) {
+        err_msg.* = "Map.set expects a map as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjMap.fromObj(args[0].asObj());
+    const new_map = try ObjMap.create(allocator);
+    // Copy all existing entries.
+    var it = src.entries.iterator();
+    while (it.next()) |entry| {
+        try new_map.entries.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    // Set/overwrite the key.
+    try new_map.entries.put(allocator, args[1], args[2]);
+    return Value.fromObj(&new_map.obj);
+}
+
+/// Map.delete(map, key) -> Map: return new map without key.
+fn builtinMapDelete(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.map)) {
+        err_msg.* = "Map.delete expects a map as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjMap.fromObj(args[0].asObj());
+    const new_map = try ObjMap.create(allocator);
+    var it_src = src.entries.iterator();
+    while (it_src.next()) |entry| {
+        if (!Value.eql(entry.key_ptr.*, args[1])) {
+            try new_map.entries.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    return Value.fromObj(&new_map.obj);
+}
+
+/// Map.keys(map) -> List: return list of keys.
+fn builtinMapKeys(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.map)) {
+        err_msg.* = "Map.keys expects a map argument";
+        return error.RuntimeError;
+    }
+    const m = ObjMap.fromObj(args[0].asObj());
+    const new_list = try ObjList.create(allocator);
+    var it = m.entries.iterator();
+    while (it.next()) |entry| {
+        try new_list.items.append(allocator, entry.key_ptr.*);
+    }
+    return Value.fromObj(&new_list.obj);
+}
+
+/// Map.values(map) -> List: return list of values.
+fn builtinMapValues(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.map)) {
+        err_msg.* = "Map.values expects a map argument";
+        return error.RuntimeError;
+    }
+    const m = ObjMap.fromObj(args[0].asObj());
+    const new_list = try ObjList.create(allocator);
+    var it = m.entries.iterator();
+    while (it.next()) |entry| {
+        try new_list.items.append(allocator, entry.value_ptr.*);
+    }
+    return Value.fromObj(&new_list.obj);
+}
+
+/// Map.merge(map1, map2) -> Map: return new map with entries from both (map2 wins on conflict).
+fn builtinMapMerge(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.map) or !args[1].isObjType(.map)) {
+        err_msg.* = "Map.merge expects two map arguments";
+        return error.RuntimeError;
+    }
+    const m1 = ObjMap.fromObj(args[0].asObj());
+    const m2 = ObjMap.fromObj(args[1].asObj());
+    const new_map = try ObjMap.create(allocator);
+    // Copy m1.
+    var it1 = m1.entries.iterator();
+    while (it1.next()) |entry| {
+        try new_map.entries.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    // Copy m2 (overwrites m1 on conflict).
+    var it2 = m2.entries.iterator();
+    while (it2.next()) |entry| {
+        try new_map.entries.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return Value.fromObj(&new_map.obj);
+}
+
+/// Map.contains(map, key) -> Bool: check if key exists.
+fn builtinMapContains(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isObjType(.map)) {
+        err_msg.* = "Map.contains expects a map as first argument";
+        return error.RuntimeError;
+    }
+    const m = ObjMap.fromObj(args[0].asObj());
+    return Value.fromBool(m.entries.get(args[1]) != null);
+}
+
+/// Map.length(map) -> Int: return entry count.
+fn builtinMapLength(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isObjType(.map)) {
+        err_msg.* = "Map.length expects a map argument";
+        return error.RuntimeError;
+    }
+    const m = ObjMap.fromObj(args[0].asObj());
+    return Value.fromInt(@intCast(m.entries.count()));
+}
+
+// ── Tuple module implementations ─────────────────────────────────────
+
+/// Tuple.get(tuple, index) -> Option: return Some(element) or None if out of bounds.
+fn builtinTupleGet(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.tuple)) {
+        err_msg.* = "Tuple.get expects a tuple as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isInt()) {
+        err_msg.* = "Tuple.get expects an integer index";
+        return error.RuntimeError;
+    }
+    const t = ObjTuple.fromObj(args[0].asObj());
+    const idx = args[1].asInt();
+    if (idx < 0 or idx >= @as(i32, @intCast(t.fields.len))) {
+        return makeNone(allocator);
+    }
+    return makeSome(t.fields[@intCast(idx)], allocator);
+}
+
+/// Tuple.length(tuple) -> Int: return tuple size.
+fn builtinTupleLength(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isObjType(.tuple)) {
+        err_msg.* = "Tuple.length expects a tuple argument";
+        return error.RuntimeError;
+    }
+    const t = ObjTuple.fromObj(args[0].asObj());
+    return Value.fromInt(@intCast(t.fields.len));
+}
+
+// ── String module implementations ────────────────────────────────────
+
+/// String.split(str, sep) -> List: split string by separator.
+fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isString() or !args[1].isString()) {
+        err_msg.* = "String.split expects two string arguments";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    const sep_bytes = ObjString.fromObj(args[1].asObj()).bytes;
+    const new_list = try ObjList.create(allocator);
+
+    if (sep_bytes.len == 0) {
+        // Empty separator: split into individual characters.
+        for (str_bytes) |byte| {
+            const s = try ObjString.create(allocator, &[_]u8{byte});
+            try new_list.items.append(allocator, Value.fromObj(&s.obj));
+        }
+    } else if (sep_bytes.len == 1) {
+        // Single-byte separator: use splitScalar.
+        var it = std.mem.splitScalar(u8, str_bytes, sep_bytes[0]);
+        while (it.next()) |part| {
+            const s = try ObjString.create(allocator, part);
+            try new_list.items.append(allocator, Value.fromObj(&s.obj));
+        }
+    } else {
+        // Multi-byte separator: manual scan.
+        var pos: usize = 0;
+        var seg_start: usize = 0;
+        while (pos + sep_bytes.len <= str_bytes.len) {
+            if (std.mem.eql(u8, str_bytes[pos..][0..sep_bytes.len], sep_bytes)) {
+                const s = try ObjString.create(allocator, str_bytes[seg_start..pos]);
+                try new_list.items.append(allocator, Value.fromObj(&s.obj));
+                pos += sep_bytes.len;
+                seg_start = pos;
+            } else {
+                pos += 1;
+            }
+        }
+        // Remaining segment.
+        const s = try ObjString.create(allocator, str_bytes[seg_start..]);
+        try new_list.items.append(allocator, Value.fromObj(&s.obj));
+    }
+
+    return Value.fromObj(&new_list.obj);
+}
+
+/// String.trim(str) -> String: trim leading/trailing whitespace.
+fn builtinStringTrim(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isString()) {
+        err_msg.* = "String.trim expects a string argument";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    const trimmed = std.mem.trim(u8, str_bytes, " \t\n\r");
+    const s = try ObjString.create(allocator, trimmed);
+    return Value.fromObj(&s.obj);
+}
+
+/// String.join(list, sep) -> String: join list of strings with separator.
+fn builtinStringJoin(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "String.join expects a list as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isString()) {
+        err_msg.* = "String.join expects a string separator";
+        return error.RuntimeError;
+    }
+    const lst = ObjList.fromObj(args[0].asObj());
+    const sep = ObjString.fromObj(args[1].asObj()).bytes;
+
+    var buf = std.ArrayListUnmanaged(u8){};
+    for (lst.items.items, 0..) |item, i| {
+        if (i > 0) try buf.appendSlice(allocator, sep);
+        if (item.isString()) {
+            try buf.appendSlice(allocator, ObjString.fromObj(item.asObj()).bytes);
+        } else {
+            const formatted = try formatValue(item, allocator, null);
+            defer allocator.free(formatted);
+            try buf.appendSlice(allocator, formatted);
+        }
+    }
+    const result_bytes = try buf.toOwnedSlice(allocator);
+    defer allocator.free(result_bytes);
+    const s = try ObjString.create(allocator, result_bytes);
+    return Value.fromObj(&s.obj);
+}
+
+/// String.contains(str, sub) -> Bool: check if substring exists.
+fn builtinStringContains(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isString() or !args[1].isString()) {
+        err_msg.* = "String.contains expects two string arguments";
+        return error.RuntimeError;
+    }
+    const haystack = ObjString.fromObj(args[0].asObj()).bytes;
+    const needle = ObjString.fromObj(args[1].asObj()).bytes;
+    return Value.fromBool(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+/// String.replace(str, old, new) -> String: replace all occurrences.
+fn builtinStringReplace(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isString() or !args[1].isString() or !args[2].isString()) {
+        err_msg.* = "String.replace expects three string arguments";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    const old_bytes = ObjString.fromObj(args[1].asObj()).bytes;
+    const new_bytes = ObjString.fromObj(args[2].asObj()).bytes;
+
+    if (old_bytes.len == 0) {
+        // Empty old string: return original.
+        const s = try ObjString.create(allocator, str_bytes);
+        return Value.fromObj(&s.obj);
+    }
+
+    var buf = std.ArrayListUnmanaged(u8){};
+    var pos: usize = 0;
+    while (pos <= str_bytes.len) {
+        if (pos + old_bytes.len <= str_bytes.len and
+            std.mem.eql(u8, str_bytes[pos..][0..old_bytes.len], old_bytes))
+        {
+            try buf.appendSlice(allocator, new_bytes);
+            pos += old_bytes.len;
+        } else {
+            if (pos < str_bytes.len) {
+                try buf.append(allocator, str_bytes[pos]);
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    const result_bytes = try buf.toOwnedSlice(allocator);
+    defer allocator.free(result_bytes);
+    const s = try ObjString.create(allocator, result_bytes);
+    return Value.fromObj(&s.obj);
+}
+
+/// String.starts_with(str, prefix) -> Bool.
+fn builtinStringStartsWith(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isString() or !args[1].isString()) {
+        err_msg.* = "String.starts_with expects two string arguments";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    const prefix = ObjString.fromObj(args[1].asObj()).bytes;
+    return Value.fromBool(std.mem.startsWith(u8, str_bytes, prefix));
+}
+
+/// String.ends_with(str, suffix) -> Bool.
+fn builtinStringEndsWith(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isString() or !args[1].isString()) {
+        err_msg.* = "String.ends_with expects two string arguments";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    const suffix = ObjString.fromObj(args[1].asObj()).bytes;
+    return Value.fromBool(std.mem.endsWith(u8, str_bytes, suffix));
+}
+
+/// String.to_lower(str) -> String: lowercase ASCII characters.
+fn builtinStringToLower(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isString()) {
+        err_msg.* = "String.to_lower expects a string argument";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    const lowered = try allocator.alloc(u8, str_bytes.len);
+    defer allocator.free(lowered);
+    for (str_bytes, 0..) |byte, i| {
+        lowered[i] = std.ascii.toLower(byte);
+    }
+    const s = try ObjString.create(allocator, lowered);
+    return Value.fromObj(&s.obj);
+}
+
+/// String.to_upper(str) -> String: uppercase ASCII characters.
+fn builtinStringToUpper(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isString()) {
+        err_msg.* = "String.to_upper expects a string argument";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    const uppered = try allocator.alloc(u8, str_bytes.len);
+    defer allocator.free(uppered);
+    for (str_bytes, 0..) |byte, i| {
+        uppered[i] = std.ascii.toUpper(byte);
+    }
+    const s = try ObjString.create(allocator, uppered);
+    return Value.fromObj(&s.obj);
+}
+
+/// String.length(str) -> Int: byte length.
+fn builtinStringLength(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isString()) {
+        err_msg.* = "String.length expects a string argument";
+        return error.RuntimeError;
+    }
+    const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
+    return Value.fromInt(@intCast(str_bytes.len));
+}
+
+// ── Result module implementations ────────────────────────────────────
+
+/// Result.Ok(value) -> Result: create Ok variant.
+fn builtinResultOk(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = err_msg;
+    return makeOk(args[0], allocator);
+}
+
+/// Result.Err(error_val) -> Result: create Err variant.
+fn builtinResultErr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = err_msg;
+    return makeErr(args[0], allocator);
+}
+
+/// Result.map_ok(result, fn) -> Result: if Ok, apply fn to payload and wrap in Ok.
+fn builtinResultMapOk(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.adt)) {
+        err_msg.* = "Result.map_ok expects a Result as first argument";
+        return error.RuntimeError;
+    }
+    // Ok: type_id=1, variant_idx=0
+    if (isAdtVariant(args[0], 1, 0)) {
+        const payload = adtPayload(args[0], 0);
+        const result = try callClosure(args[1], &[_]Value{payload});
+        return makeOk(result, allocator);
+    }
+    // Err: return unchanged.
+    return args[0];
+}
+
+/// Result.map_err(result, fn) -> Result: if Err, apply fn to error payload and wrap in Err.
+fn builtinResultMapErr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.adt)) {
+        err_msg.* = "Result.map_err expects a Result as first argument";
+        return error.RuntimeError;
+    }
+    // Err: type_id=1, variant_idx=1
+    if (isAdtVariant(args[0], 1, 1)) {
+        const payload = adtPayload(args[0], 0);
+        const result = try callClosure(args[1], &[_]Value{payload});
+        return makeErr(result, allocator);
+    }
+    // Ok: return unchanged.
+    return args[0];
+}
+
+/// Result.then(result, fn) -> Result: if Ok, apply fn to payload (fn must return a Result).
+fn builtinResultThen(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (!args[0].isObjType(.adt)) {
+        err_msg.* = "Result.then expects a Result as first argument";
+        return error.RuntimeError;
+    }
+    if (isAdtVariant(args[0], 1, 0)) {
+        const payload = adtPayload(args[0], 0);
+        return callClosure(args[1], &[_]Value{payload});
+    }
+    // Err: return unchanged.
+    return args[0];
+}
+
+/// Result.unwrap_or(result, default) -> Value: if Ok, return payload. If Err, return default.
+fn builtinResultUnwrapOr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    if (args[0].isObjType(.adt) and isAdtVariant(args[0], 1, 0)) {
+        return adtPayload(args[0], 0);
+    }
+    return args[1];
+}
+
+/// Result.is_ok(result) -> Bool.
+fn builtinResultIsOk(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    return Value.fromBool(args[0].isObjType(.adt) and isAdtVariant(args[0], 1, 0));
+}
+
+/// Result.is_err(result) -> Bool.
+fn builtinResultIsErr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    return Value.fromBool(args[0].isObjType(.adt) and isAdtVariant(args[0], 1, 1));
+}
+
+// ── Option module implementations ────────────────────────────────────
+
+/// Option.Some(value) -> Option: create Some variant.
+fn builtinOptionSome(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = err_msg;
+    return makeSome(args[0], allocator);
+}
+
+/// Option.None -> Option: create None variant.
+fn builtinOptionNone(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = args;
+    _ = err_msg;
+    return makeNone(allocator);
+}
+
+/// Option.map(option, fn) -> Option: if Some, apply fn and wrap in Some. If None, return None.
+fn builtinOptionMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.adt)) {
+        err_msg.* = "Option.map expects an Option as first argument";
+        return error.RuntimeError;
+    }
+    // Some: type_id=0, variant_idx=0
+    if (isAdtVariant(args[0], 0, 0)) {
+        const payload = adtPayload(args[0], 0);
+        const result = try callClosure(args[1], &[_]Value{payload});
+        return makeSome(result, allocator);
+    }
+    // None: return None.
+    return makeNone(allocator);
+}
+
+/// Option.unwrap_or(option, default) -> Value: if Some, return payload. If None, return default.
+fn builtinOptionUnwrapOr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    if (args[0].isObjType(.adt) and isAdtVariant(args[0], 0, 0)) {
+        return adtPayload(args[0], 0);
+    }
+    return args[1];
+}
+
+/// Option.is_some(option) -> Bool.
+fn builtinOptionIsSome(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    return Value.fromBool(args[0].isObjType(.adt) and isAdtVariant(args[0], 0, 0));
+}
+
+/// Option.is_none(option) -> Bool.
+fn builtinOptionIsNone(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    return Value.fromBool(args[0].isObjType(.adt) and isAdtVariant(args[0], 0, 1));
+}
+
+/// Option.to_result(option, error_val) -> Result: Some(v) -> Ok(v), None -> Err(error_val).
+fn builtinOptionToResult(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = err_msg;
+    if (args[0].isObjType(.adt) and isAdtVariant(args[0], 0, 0)) {
+        return makeOk(adtPayload(args[0], 0), allocator);
+    }
+    return makeErr(args[1], allocator);
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /// Check if a value is "falsy" (nil or false).
@@ -338,6 +1182,27 @@ pub fn isFalsy(val: Value) bool {
     if (val.isNil()) return true;
     if (val.isBool()) return !val.asBool();
     return false;
+}
+
+/// Compare two Values for sorting. Returns true if a < b.
+/// int/float are numeric, strings are lexicographic, other types by raw bits.
+fn valueCompare(ctx: void, a: Value, b: Value) bool {
+    _ = ctx;
+    // Both ints.
+    if (a.isInt() and b.isInt()) return a.asInt() < b.asInt();
+    // Both floats.
+    if (a.isFloat() and b.isFloat()) return a.asFloat() < b.asFloat();
+    // Int vs float.
+    if (a.isInt() and b.isFloat()) return @as(f64, @floatFromInt(a.asInt())) < b.asFloat();
+    if (a.isFloat() and b.isInt()) return a.asFloat() < @as(f64, @floatFromInt(b.asInt()));
+    // Both strings.
+    if (a.isString() and b.isString()) {
+        const sa = ObjString.fromObj(a.asObj()).bytes;
+        const sb = ObjString.fromObj(b.asObj()).bytes;
+        return std.mem.order(u8, sa, sb) == .lt;
+    }
+    // Fallback: compare raw bits.
+    return a.bits < b.bits;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -539,4 +1404,381 @@ test "builtins: formatValue for various types" {
     defer allocator.free(float_str);
     // Just check it contains "3.14"
     try std.testing.expect(std.mem.indexOf(u8, float_str, "3.14") != null);
+}
+
+// ── List module tests ────────────────────────────────────────────────
+
+test "builtins: List.get returns Some for valid index" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    try lst.items.append(allocator, Value.fromInt(10));
+    try lst.items.append(allocator, Value.fromInt(20));
+    try lst.items.append(allocator, Value.fromInt(30));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListGet(&[_]Value{ Value.fromObj(&lst.obj), Value.fromInt(1) }, allocator, &err_msg);
+    // Should be Some(20) = ADT(0.0)(20)
+    try std.testing.expect(result.isObjType(.adt));
+    const adt = ObjAdt.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(u16, 0), adt.type_id); // Option
+    try std.testing.expectEqual(@as(u16, 0), adt.variant_idx); // Some
+    try std.testing.expectEqual(@as(i32, 20), adt.payload[0].asInt());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: List.get returns None for out of bounds" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    try lst.items.append(allocator, Value.fromInt(10));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListGet(&[_]Value{ Value.fromObj(&lst.obj), Value.fromInt(5) }, allocator, &err_msg);
+    // Should be None = ADT(0.1)
+    try std.testing.expect(result.isObjType(.adt));
+    const adt = ObjAdt.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(u16, 0), adt.type_id); // Option
+    try std.testing.expectEqual(@as(u16, 1), adt.variant_idx); // None
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: List.append creates new list" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    try lst.items.append(allocator, Value.fromInt(1));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListAppend(&[_]Value{ Value.fromObj(&lst.obj), Value.fromInt(2) }, allocator, &err_msg);
+    const new_lst = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(usize, 2), new_lst.items.items.len);
+    try std.testing.expectEqual(@as(i32, 1), new_lst.items.items[0].asInt());
+    try std.testing.expectEqual(@as(i32, 2), new_lst.items.items[1].asInt());
+    // Original unchanged.
+    try std.testing.expectEqual(@as(usize, 1), lst.items.items.len);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: List.reverse creates reversed list" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    try lst.items.append(allocator, Value.fromInt(1));
+    try lst.items.append(allocator, Value.fromInt(2));
+    try lst.items.append(allocator, Value.fromInt(3));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListReverse(&[_]Value{Value.fromObj(&lst.obj)}, allocator, &err_msg);
+    const rev = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(i32, 3), rev.items.items[0].asInt());
+    try std.testing.expectEqual(@as(i32, 2), rev.items.items[1].asInt());
+    try std.testing.expectEqual(@as(i32, 1), rev.items.items[2].asInt());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: List.contains finds element" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    try lst.items.append(allocator, Value.fromInt(10));
+    try lst.items.append(allocator, Value.fromInt(20));
+
+    var err_msg: []const u8 = "";
+    const found = try builtinListContains(&[_]Value{ Value.fromObj(&lst.obj), Value.fromInt(20) }, allocator, &err_msg);
+    try std.testing.expect(found.asBool() == true);
+    const not_found = try builtinListContains(&[_]Value{ Value.fromObj(&lst.obj), Value.fromInt(99) }, allocator, &err_msg);
+    try std.testing.expect(not_found.asBool() == false);
+}
+
+test "builtins: List.sort sorts integers" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+    try lst.items.append(allocator, Value.fromInt(3));
+    try lst.items.append(allocator, Value.fromInt(1));
+    try lst.items.append(allocator, Value.fromInt(2));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinListSort(&[_]Value{Value.fromObj(&lst.obj)}, allocator, &err_msg);
+    const sorted = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(i32, 1), sorted.items.items[0].asInt());
+    try std.testing.expectEqual(@as(i32, 2), sorted.items.items[1].asInt());
+    try std.testing.expectEqual(@as(i32, 3), sorted.items.items[2].asInt());
+    result.asObj().destroy(allocator);
+}
+
+// ── Map module tests ─────────────────────────────────────────────────
+
+test "builtins: Map.get returns Some for existing key" {
+    const allocator = std.testing.allocator;
+    const m = try ObjMap.create(allocator);
+    defer m.obj.destroy(allocator);
+    try m.entries.put(allocator, Value.fromInt(1), Value.fromInt(100));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinMapGet(&[_]Value{ Value.fromObj(&m.obj), Value.fromInt(1) }, allocator, &err_msg);
+    try std.testing.expect(isAdtVariant(result, 0, 0)); // Some
+    try std.testing.expectEqual(@as(i32, 100), adtPayload(result, 0).asInt());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: Map.get returns None for missing key" {
+    const allocator = std.testing.allocator;
+    const m = try ObjMap.create(allocator);
+    defer m.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinMapGet(&[_]Value{ Value.fromObj(&m.obj), Value.fromInt(1) }, allocator, &err_msg);
+    try std.testing.expect(isAdtVariant(result, 0, 1)); // None
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: Map.set creates new map with entry" {
+    const allocator = std.testing.allocator;
+    const m = try ObjMap.create(allocator);
+    defer m.obj.destroy(allocator);
+    try m.entries.put(allocator, Value.fromInt(1), Value.fromInt(10));
+
+    var err_msg: []const u8 = "";
+    const result = try builtinMapSet(&[_]Value{ Value.fromObj(&m.obj), Value.fromInt(2), Value.fromInt(20) }, allocator, &err_msg);
+    const new_m = ObjMap.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(u32, 2), new_m.entries.count());
+    // Original unchanged.
+    try std.testing.expectEqual(@as(u32, 1), m.entries.count());
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: Map.contains checks key existence" {
+    const allocator = std.testing.allocator;
+    const m = try ObjMap.create(allocator);
+    defer m.obj.destroy(allocator);
+    try m.entries.put(allocator, Value.fromInt(42), Value.true_val);
+
+    var err_msg: []const u8 = "";
+    const found = try builtinMapContains(&[_]Value{ Value.fromObj(&m.obj), Value.fromInt(42) }, allocator, &err_msg);
+    try std.testing.expect(found.asBool() == true);
+    const not_found = try builtinMapContains(&[_]Value{ Value.fromObj(&m.obj), Value.fromInt(99) }, allocator, &err_msg);
+    try std.testing.expect(not_found.asBool() == false);
+}
+
+// ── String module tests ──────────────────────────────────────────────
+
+test "builtins: String.split splits by separator" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "a,b,c");
+    defer s.obj.destroy(allocator);
+    const sep = try ObjString.create(allocator, ",");
+    defer sep.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringSplit(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&sep.obj) }, allocator, &err_msg);
+    const lst = ObjList.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(usize, 3), lst.items.items.len);
+    try std.testing.expectEqualStrings("a", ObjString.fromObj(lst.items.items[0].asObj()).bytes);
+    try std.testing.expectEqualStrings("b", ObjString.fromObj(lst.items.items[1].asObj()).bytes);
+    try std.testing.expectEqualStrings("c", ObjString.fromObj(lst.items.items[2].asObj()).bytes);
+    // Clean up all created objects.
+    for (lst.items.items) |item| item.asObj().destroy(allocator);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: String.trim removes whitespace" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "  hello  ");
+    defer s.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringTrim(&[_]Value{Value.fromObj(&s.obj)}, allocator, &err_msg);
+    try std.testing.expectEqualStrings("hello", ObjString.fromObj(result.asObj()).bytes);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: String.contains checks substring" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "hello world");
+    defer s.obj.destroy(allocator);
+    const sub = try ObjString.create(allocator, "world");
+    defer sub.obj.destroy(allocator);
+    const missing = try ObjString.create(allocator, "xyz");
+    defer missing.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const found = try builtinStringContains(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&sub.obj) }, allocator, &err_msg);
+    try std.testing.expect(found.asBool() == true);
+    const not_found = try builtinStringContains(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&missing.obj) }, allocator, &err_msg);
+    try std.testing.expect(not_found.asBool() == false);
+}
+
+test "builtins: String.to_lower lowercases" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "Hello WORLD");
+    defer s.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringToLower(&[_]Value{Value.fromObj(&s.obj)}, allocator, &err_msg);
+    try std.testing.expectEqualStrings("hello world", ObjString.fromObj(result.asObj()).bytes);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: String.to_upper uppercases" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "Hello world");
+    defer s.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringToUpper(&[_]Value{Value.fromObj(&s.obj)}, allocator, &err_msg);
+    try std.testing.expectEqualStrings("HELLO WORLD", ObjString.fromObj(result.asObj()).bytes);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: String.replace replaces all occurrences" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "aXbXc");
+    defer s.obj.destroy(allocator);
+    const old = try ObjString.create(allocator, "X");
+    defer old.obj.destroy(allocator);
+    const new_str = try ObjString.create(allocator, "--");
+    defer new_str.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const result = try builtinStringReplace(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&old.obj), Value.fromObj(&new_str.obj) }, allocator, &err_msg);
+    try std.testing.expectEqualStrings("a--b--c", ObjString.fromObj(result.asObj()).bytes);
+    result.asObj().destroy(allocator);
+}
+
+test "builtins: String.starts_with and String.ends_with" {
+    const allocator = std.testing.allocator;
+    const s = try ObjString.create(allocator, "hello world");
+    defer s.obj.destroy(allocator);
+    const prefix = try ObjString.create(allocator, "hello");
+    defer prefix.obj.destroy(allocator);
+    const suffix = try ObjString.create(allocator, "world");
+    defer suffix.obj.destroy(allocator);
+
+    var err_msg: []const u8 = "";
+    const sw = try builtinStringStartsWith(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&prefix.obj) }, allocator, &err_msg);
+    try std.testing.expect(sw.asBool() == true);
+    const ew = try builtinStringEndsWith(&[_]Value{ Value.fromObj(&s.obj), Value.fromObj(&suffix.obj) }, allocator, &err_msg);
+    try std.testing.expect(ew.asBool() == true);
+}
+
+// ── Result module tests ──────────────────────────────────────────────
+
+test "builtins: Result.Ok and Result.is_ok" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const ok_val = try builtinResultOk(&[_]Value{Value.fromInt(42)}, allocator, &err_msg);
+    defer ok_val.asObj().destroy(allocator);
+    try std.testing.expect(isAdtVariant(ok_val, 1, 0));
+    try std.testing.expectEqual(@as(i32, 42), adtPayload(ok_val, 0).asInt());
+
+    const is_ok = try builtinResultIsOk(&[_]Value{ok_val}, allocator, &err_msg);
+    try std.testing.expect(is_ok.asBool() == true);
+    const is_err = try builtinResultIsErr(&[_]Value{ok_val}, allocator, &err_msg);
+    try std.testing.expect(is_err.asBool() == false);
+}
+
+test "builtins: Result.Err and Result.is_err" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const err_str = try ObjString.create(allocator, "oops");
+    defer err_str.obj.destroy(allocator);
+    const err_val = try builtinResultErr(&[_]Value{Value.fromObj(&err_str.obj)}, allocator, &err_msg);
+    defer err_val.asObj().destroy(allocator);
+    try std.testing.expect(isAdtVariant(err_val, 1, 1));
+
+    const is_err = try builtinResultIsErr(&[_]Value{err_val}, allocator, &err_msg);
+    try std.testing.expect(is_err.asBool() == true);
+    const is_ok = try builtinResultIsOk(&[_]Value{err_val}, allocator, &err_msg);
+    try std.testing.expect(is_ok.asBool() == false);
+}
+
+test "builtins: Result.unwrap_or returns payload for Ok" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const ok_val = try builtinResultOk(&[_]Value{Value.fromInt(42)}, allocator, &err_msg);
+    defer ok_val.asObj().destroy(allocator);
+
+    const unwrapped = try builtinResultUnwrapOr(&[_]Value{ ok_val, Value.fromInt(0) }, allocator, &err_msg);
+    try std.testing.expectEqual(@as(i32, 42), unwrapped.asInt());
+}
+
+test "builtins: Result.unwrap_or returns default for Err" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const err_val = try builtinResultErr(&[_]Value{Value.fromInt(0)}, allocator, &err_msg);
+    defer err_val.asObj().destroy(allocator);
+
+    const unwrapped = try builtinResultUnwrapOr(&[_]Value{ err_val, Value.fromInt(99) }, allocator, &err_msg);
+    try std.testing.expectEqual(@as(i32, 99), unwrapped.asInt());
+}
+
+// ── Option module tests ──────────────────────────────────────────────
+
+test "builtins: Option.Some and Option.is_some" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const some_val = try builtinOptionSome(&[_]Value{Value.fromInt(42)}, allocator, &err_msg);
+    defer some_val.asObj().destroy(allocator);
+    try std.testing.expect(isAdtVariant(some_val, 0, 0));
+
+    const is_some = try builtinOptionIsSome(&[_]Value{some_val}, allocator, &err_msg);
+    try std.testing.expect(is_some.asBool() == true);
+}
+
+test "builtins: Option.None and Option.is_none" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const none_val = try builtinOptionNone(&[_]Value{}, allocator, &err_msg);
+    defer none_val.asObj().destroy(allocator);
+    try std.testing.expect(isAdtVariant(none_val, 0, 1));
+
+    const is_none = try builtinOptionIsNone(&[_]Value{none_val}, allocator, &err_msg);
+    try std.testing.expect(is_none.asBool() == true);
+}
+
+test "builtins: Option.unwrap_or returns payload for Some" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const some_val = try builtinOptionSome(&[_]Value{Value.fromInt(42)}, allocator, &err_msg);
+    defer some_val.asObj().destroy(allocator);
+
+    const unwrapped = try builtinOptionUnwrapOr(&[_]Value{ some_val, Value.fromInt(0) }, allocator, &err_msg);
+    try std.testing.expectEqual(@as(i32, 42), unwrapped.asInt());
+}
+
+test "builtins: Option.unwrap_or returns default for None" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const none_val = try builtinOptionNone(&[_]Value{}, allocator, &err_msg);
+    defer none_val.asObj().destroy(allocator);
+
+    const unwrapped = try builtinOptionUnwrapOr(&[_]Value{ none_val, Value.fromInt(99) }, allocator, &err_msg);
+    try std.testing.expectEqual(@as(i32, 99), unwrapped.asInt());
+}
+
+test "builtins: Option.to_result converts Some to Ok" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const some_val = try builtinOptionSome(&[_]Value{Value.fromInt(42)}, allocator, &err_msg);
+    defer some_val.asObj().destroy(allocator);
+
+    const result = try builtinOptionToResult(&[_]Value{ some_val, Value.fromInt(0) }, allocator, &err_msg);
+    defer result.asObj().destroy(allocator);
+    try std.testing.expect(isAdtVariant(result, 1, 0)); // Ok
+    try std.testing.expectEqual(@as(i32, 42), adtPayload(result, 0).asInt());
+}
+
+test "builtins: Option.to_result converts None to Err" {
+    const allocator = std.testing.allocator;
+    var err_msg: []const u8 = "";
+    const none_val = try builtinOptionNone(&[_]Value{}, allocator, &err_msg);
+    defer none_val.asObj().destroy(allocator);
+
+    const err_str = try ObjString.create(allocator, "missing");
+    defer err_str.obj.destroy(allocator);
+    const result = try builtinOptionToResult(&[_]Value{ none_val, Value.fromObj(&err_str.obj) }, allocator, &err_msg);
+    defer result.asObj().destroy(allocator);
+    try std.testing.expect(isAdtVariant(result, 1, 1)); // Err
 }
