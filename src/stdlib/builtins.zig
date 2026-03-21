@@ -8,6 +8,7 @@ const ObjList = obj_mod.ObjList;
 const ObjMap = obj_mod.ObjMap;
 const ObjTuple = obj_mod.ObjTuple;
 const ObjAdt = obj_mod.ObjAdt;
+const ObjRecord = obj_mod.ObjRecord;
 
 /// Error type for native function execution.
 pub const NativeError = error{
@@ -40,10 +41,28 @@ pub const CallClosureFn = *const fn (vm_ptr: *anyopaque, closure_val: Value, arg
 /// Callback type: register a heap object with the VM for cleanup.
 pub const TrackObjFn = *const fn (vm_ptr: *anyopaque, obj: *obj_mod.Obj) void;
 
+/// Callback type: trigger a full GC collection.
+pub const TriggerGCFn = *const fn (vm_ptr: *anyopaque) void;
+
+/// GC statistics returned by the getGCStats callback.
+pub const GCStats = struct {
+    nursery_collections: u64,
+    oldgen_collections: u64,
+    bytes_freed: u64,
+    last_pause_ns: u64,
+    heap_size: usize,
+    nursery_size: usize,
+};
+
+/// Callback type: get GC statistics from the VM.
+pub const GetGCStatsFn = *const fn (vm_ptr: *anyopaque) GCStats;
+
 /// Module-level state set by the VM before calling builtins.
 var current_vm: ?*anyopaque = null;
 var call_closure_fn: ?CallClosureFn = null;
 var track_obj_fn: ?TrackObjFn = null;
+var trigger_gc_fn: ?TriggerGCFn = null;
+var get_gc_stats_fn: ?GetGCStatsFn = null;
 
 /// Called by the VM before dispatching a builtin function.
 pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {
@@ -52,11 +71,19 @@ pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn
     track_obj_fn = track_fn;
 }
 
+/// Set GC callback functions (called separately since not all VMs have GC).
+pub fn setGCCallbacks(gc_fn: TriggerGCFn, stats_fn: GetGCStatsFn) void {
+    trigger_gc_fn = gc_fn;
+    get_gc_stats_fn = stats_fn;
+}
+
 /// Called by the VM after a builtin returns.
 pub fn clearVM() void {
     current_vm = null;
     call_closure_fn = null;
     track_obj_fn = null;
+    trigger_gc_fn = null;
+    get_gc_stats_fn = null;
 }
 
 /// Track an intermediate heap object with the VM (called by builtins that
@@ -210,6 +237,10 @@ pub const builtins = [_]BuiltinDesc{
 
     // ── List.filter_map (index 55) ──────────────────────────────────
     .{ .name = "List.filter_map", .func = &builtinListFilterMap, .arity_min = 2, .arity_max = 2 },
+
+    // ── GC (indices 56-57) ──────────────────────────────────────────
+    .{ .name = "gc", .func = &builtinGC, .arity_min = 0, .arity_max = 0 },
+    .{ .name = "gc_stats", .func = &builtinGCStats, .arity_min = 0, .arity_max = 0 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -746,6 +777,74 @@ fn builtinListFilterMap(args: []const Value, allocator: Allocator, err_msg: *[]c
     }
 
     return Value.fromObj(&new_list.obj);
+}
+
+// ── GC module implementations ────────────────────────────────────────
+
+/// Convert a u64 stat value to a Value. Uses inline i32 for small values,
+/// heap-allocated ObjInt for large values.
+fn u64ToValue(v: u64, allocator: Allocator) !Value {
+    if (v <= @as(u64, @intCast(std.math.maxInt(i32)))) {
+        return Value.fromInt(@intCast(v));
+    }
+    // Value exceeds i32 range; use i64 path (heap-allocates ObjInt if > i32).
+    if (v <= @as(u64, @intCast(std.math.maxInt(i64)))) {
+        return Value.fromI64(@intCast(v), allocator);
+    }
+    // Extremely large u64; just return 0 (unlikely in practice).
+    return Value.fromInt(0);
+}
+
+/// gc() -> nil: trigger a full garbage collection cycle.
+fn builtinGC(_: []const Value, _: Allocator, _: *[]const u8) NativeError!Value {
+    if (current_vm) |vm_ptr| {
+        if (trigger_gc_fn) |f| {
+            f(vm_ptr);
+        }
+    }
+    return Value.nil;
+}
+
+/// gc_stats() -> record: return a record with GC statistics.
+/// Fields: nursery_collections, oldgen_collections, bytes_freed,
+///         last_pause_ns, heap_size, nursery_size.
+fn builtinGCStats(_: []const Value, allocator: Allocator, _: *[]const u8) NativeError!Value {
+    const stats: GCStats = blk: {
+        if (current_vm) |vm_ptr| {
+            if (get_gc_stats_fn) |f| {
+                break :blk f(vm_ptr);
+            }
+        }
+        // No GC available: return zeros.
+        break :blk GCStats{
+            .nursery_collections = 0,
+            .oldgen_collections = 0,
+            .bytes_freed = 0,
+            .last_pause_ns = 0,
+            .heap_size = 0,
+            .nursery_size = 0,
+        };
+    };
+
+    const field_names = [_][]const u8{
+        "nursery_collections",
+        "oldgen_collections",
+        "bytes_freed",
+        "last_pause_ns",
+        "heap_size",
+        "nursery_size",
+    };
+    const field_values = [_]Value{
+        try u64ToValue(stats.nursery_collections, allocator),
+        try u64ToValue(stats.oldgen_collections, allocator),
+        try u64ToValue(stats.bytes_freed, allocator),
+        try u64ToValue(stats.last_pause_ns, allocator),
+        try u64ToValue(stats.heap_size, allocator),
+        try u64ToValue(stats.nursery_size, allocator),
+    };
+
+    const rec = try ObjRecord.create(allocator, &field_names, &field_values);
+    return Value.fromObj(&rec.obj);
 }
 
 // ── Map module implementations ───────────────────────────────────────

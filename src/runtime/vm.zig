@@ -1040,6 +1040,9 @@ pub const VM = struct {
         // Set VM pointer for higher-order builtins that need to invoke closures
         // and track intermediate heap objects.
         builtins_mod.setVM(@ptrCast(self), &callClosureFromBuiltin, &trackObjectFromBuiltin);
+        if (self.gc != null) {
+            builtins_mod.setGCCallbacks(&triggerGCFromBuiltin, &getGCStatsFromBuiltin);
+        }
         defer builtins_mod.clearVM();
 
         var err_msg: []const u8 = "";
@@ -1110,6 +1113,37 @@ pub const VM = struct {
             }
             vm.trackObject(obj);
         }
+    }
+
+    /// Callback function for builtins to trigger a full GC collection.
+    fn triggerGCFromBuiltin(vm_ptr: *anyopaque) void {
+        const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+        if (vm.gc) |g| {
+            g.collectFull() catch {};
+        }
+    }
+
+    /// Callback function for builtins to retrieve GC statistics.
+    fn getGCStatsFromBuiltin(vm_ptr: *anyopaque) builtins_mod.GCStats {
+        const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+        if (vm.gc) |g| {
+            return .{
+                .nursery_collections = g.nursery_count,
+                .oldgen_collections = g.oldgen_count,
+                .bytes_freed = g.total_bytes_freed,
+                .last_pause_ns = g.last_pause_ns,
+                .heap_size = g.heapSize(),
+                .nursery_size = g.nursery_capacity,
+            };
+        }
+        return .{
+            .nursery_collections = 0,
+            .oldgen_collections = 0,
+            .bytes_freed = 0,
+            .last_pause_ns = 0,
+            .heap_size = 0,
+            .nursery_size = 0,
+        };
     }
 
     /// Callback function for builtins to invoke user closures through the VM.

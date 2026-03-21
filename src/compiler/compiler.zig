@@ -175,6 +175,8 @@ pub const Compiler = struct {
         "Option.is_some", "Option.is_none", "Option.to_result",
         // List.filter_map (55)
         "List.filter_map",
+        // GC (56-57)
+        "gc", "gc_stats",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-6 to match

@@ -1,0 +1,12 @@
+-- Test gc() builtin triggers collection
+gc()
+print("gc ok")
+
+-- Test gc_stats() returns a record with expected fields
+let stats = gc_stats()
+print(stats.nursery_collections >= 0)
+print(stats.heap_size >= 0)
+print(stats.nursery_size >= 0)
+print(stats.bytes_freed >= 0)
+print(stats.last_pause_ns >= 0)
+print(stats.oldgen_collections >= 0)

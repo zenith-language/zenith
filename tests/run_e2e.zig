@@ -53,6 +53,9 @@ const normal_tests = [_]TestCase{
     .{ .name = "pattern_matching", .zen_path = "tests/zen/pattern_matching.zen", .expected_path = "tests/zen/pattern_matching.expected", .is_error_test = false },
     .{ .name = "result_option", .zen_path = "tests/zen/result_option.zen", .expected_path = "tests/zen/result_option.expected", .is_error_test = false },
     .{ .name = "string_ops", .zen_path = "tests/zen/string_ops.zen", .expected_path = "tests/zen/string_ops.expected", .is_error_test = false },
+    // Phase 4 tests
+    .{ .name = "gc", .zen_path = "tests/zen/gc.zen", .expected_path = "tests/zen/gc.expected", .is_error_test = false },
+    .{ .name = "gc_stress", .zen_path = "tests/zen/gc_stress.zen", .expected_path = "tests/zen/gc_stress.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{

@@ -1,0 +1,15 @@
+-- Stress test: allocate many objects, verify GC handles it
+let i = 0
+while i < 10000 {
+  let lst = [1, 2, 3, i]
+  let tup = (i, i + 1, i + 2)
+  let rec = {x: i, y: i + 1}
+  i = i + 1
+}
+
+-- Force collection
+gc()
+let stats = gc_stats()
+print("stress ok")
+print(stats.nursery_collections > 0)
+print(stats.bytes_freed > 0)
