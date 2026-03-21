@@ -384,6 +384,9 @@ pub const GCAllocator = struct {
             gc.collectNursery() catch {};
         }
 
+        // Check old-gen threshold after nursery collection may have promoted objects.
+        gc.checkOldGenThreshold();
+
         const result = gc.backing_allocator.vtable.alloc(gc.backing_allocator.ptr, len, alignment, ret_addr);
         if (result != null) {
             gc.bytes_allocated += len;

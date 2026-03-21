@@ -640,7 +640,12 @@ pub const VM = struct {
                 .op_set_upvalue => {
                     const slot = self.readByteFrame();
                     if (frame.closure.upvalues[slot]) |uv| {
-                        uv.location.* = self.peek(0);
+                        const val = self.peek(0);
+                        uv.location.* = val;
+                        // Write barrier: upvalue (possibly old-gen) stores a new value.
+                        if (self.gc) |g| {
+                            g.writeBarrier(&uv.obj, val);
+                        }
                     }
                 },
 
@@ -1293,7 +1298,12 @@ pub const VM = struct {
             .op_set_upvalue => {
                 const slot = self.readByteFrame();
                 if (frame.closure.upvalues[slot]) |uv| {
-                    uv.location.* = self.peek(0);
+                    const val = self.peek(0);
+                    uv.location.* = val;
+                    // Write barrier: upvalue (possibly old-gen) stores a new value.
+                    if (self.gc) |g| {
+                        g.writeBarrier(&uv.obj, val);
+                    }
                 }
             },
             .op_close_upvalue => {
@@ -1467,6 +1477,11 @@ pub const VM = struct {
             // Close: copy value from stack to closed field.
             uv.closed = uv.location.*;
             uv.location = &uv.closed;
+            // Write barrier: upvalue (possibly old-gen) now stores a value
+            // that may reference a nursery object.
+            if (self.gc) |g| {
+                g.writeBarrier(&uv.obj, uv.closed);
+            }
             self.open_upvalues = uv.next;
         }
     }
