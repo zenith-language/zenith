@@ -385,16 +385,32 @@ pub const VM = struct {
                     try self.push(top);
                 },
 
-                // Phase 3 opcodes -- not yet implemented in legacy mode.
-                .op_adt_construct,
-                .op_adt_get_field,
-                .op_get_index,
-                .op_check_tag,
-                .op_list_len,
-                .op_list_slice,
-                => {
-                    try self.runtimeErrorLegacy(.E001, "Phase 3 opcodes not yet implemented");
-                    return error.RuntimeErr;
+                // Phase 3 ADT/pattern matching opcodes -- legacy mode.
+                .op_adt_construct => {
+                    const type_id = self.readU16Legacy();
+                    const variant_idx = self.readU16Legacy();
+                    const arity = self.readByteLegacy();
+                    try self.execOpAdtConstruct(type_id, variant_idx, arity);
+                },
+                .op_adt_get_field => {
+                    const field_idx = self.readByteLegacy();
+                    try self.execOpAdtGetField(field_idx);
+                },
+                .op_check_tag => {
+                    const type_id = self.readU16Legacy();
+                    const variant_idx = self.readU16Legacy();
+                    try self.execOpCheckTag(type_id, variant_idx);
+                },
+                .op_get_index => {
+                    const index = self.readU16Legacy();
+                    try self.execOpGetIndex(index);
+                },
+                .op_list_len => {
+                    try self.execOpListLen();
+                },
+                .op_list_slice => {
+                    const start = self.readU16Legacy();
+                    try self.execOpListSlice(start);
                 },
             }
         }
@@ -613,16 +629,32 @@ pub const VM = struct {
                     try self.push(top);
                 },
 
-                // Phase 3 opcodes -- not yet implemented in frame mode.
-                .op_adt_construct,
-                .op_adt_get_field,
-                .op_get_index,
-                .op_check_tag,
-                .op_list_len,
-                .op_list_slice,
-                => {
-                    try self.runtimeErrorFrame(.E001, "Phase 3 opcodes not yet implemented");
-                    return error.RuntimeErr;
+                // Phase 3 ADT/pattern matching opcodes -- frame mode.
+                .op_adt_construct => {
+                    const type_id = self.readU16Frame();
+                    const variant_idx = self.readU16Frame();
+                    const arity = self.readByteFrame();
+                    try self.execOpAdtConstruct(type_id, variant_idx, arity);
+                },
+                .op_adt_get_field => {
+                    const field_idx = self.readByteFrame();
+                    try self.execOpAdtGetField(field_idx);
+                },
+                .op_check_tag => {
+                    const type_id = self.readU16Frame();
+                    const variant_idx = self.readU16Frame();
+                    try self.execOpCheckTag(type_id, variant_idx);
+                },
+                .op_get_index => {
+                    const index = self.readU16Frame();
+                    try self.execOpGetIndex(index);
+                },
+                .op_list_len => {
+                    try self.execOpListLen();
+                },
+                .op_list_slice => {
+                    const start = self.readU16Frame();
+                    try self.execOpListSlice(start);
                 },
             }
         }
@@ -1337,6 +1369,114 @@ pub const VM = struct {
         }
     }
 
+    // ── ADT and pattern matching opcodes ─────────────────────────────
+
+    const ObjAdt = obj_mod.ObjAdt;
+
+    fn execOpAdtConstruct(self: *Self, type_id: u16, variant_idx: u16, arity: u8) RuntimeError!void {
+        // Pop arity values from stack into payload.
+        const payload = try self.allocator.alloc(Value, arity);
+        defer self.allocator.free(payload);
+
+        // Pop in reverse order to match push order.
+        var i: u8 = arity;
+        while (i > 0) {
+            i -= 1;
+            payload[i] = try self.pop();
+        }
+
+        const adt = try ObjAdt.create(self.allocator, type_id, variant_idx, payload);
+        self.trackObject(&adt.obj);
+        try self.push(Value.fromObj(&adt.obj));
+    }
+
+    fn execOpAdtGetField(self: *Self, field_idx: u8) RuntimeError!void {
+        const val = try self.pop();
+        if (!val.isObj() or val.asObj().obj_type != .adt) {
+            try self.runtimeErrorAny(.E001, "op_adt_get_field: expected ADT value");
+            return error.RuntimeErr;
+        }
+        const adt = ObjAdt.fromObj(val.asObj());
+        if (field_idx >= adt.payload.len) {
+            try self.runtimeErrorAny(.E001, "ADT field index out of bounds");
+            return error.RuntimeErr;
+        }
+        try self.push(adt.payload[field_idx]);
+    }
+
+    fn execOpCheckTag(self: *Self, type_id: u16, variant_idx: u16) RuntimeError!void {
+        // Peek top of stack (don't pop).
+        const val = self.peek(0);
+        if (val.isObj() and val.asObj().obj_type == .adt) {
+            const adt = ObjAdt.fromObj(val.asObj());
+            if (adt.type_id == type_id and adt.variant_idx == variant_idx) {
+                try self.push(Value.true_val);
+                return;
+            }
+        }
+        try self.push(Value.false_val);
+    }
+
+    fn execOpGetIndex(self: *Self, index: u16) RuntimeError!void {
+        const val = try self.pop();
+        if (val.isObj()) {
+            const obj_ptr = val.asObj();
+            switch (obj_ptr.obj_type) {
+                .list => {
+                    const lst = ObjList.fromObj(obj_ptr);
+                    if (index >= lst.items.items.len) {
+                        try self.push(Value.nil);
+                    } else {
+                        try self.push(lst.items.items[index]);
+                    }
+                },
+                .tuple => {
+                    const t = ObjTuple.fromObj(obj_ptr);
+                    if (index >= t.fields.len) {
+                        try self.push(Value.nil);
+                    } else {
+                        try self.push(t.fields[index]);
+                    }
+                },
+                else => {
+                    try self.runtimeErrorAny(.E001, "op_get_index: expected list or tuple");
+                    return error.RuntimeErr;
+                },
+            }
+        } else {
+            try self.runtimeErrorAny(.E001, "op_get_index: expected object");
+            return error.RuntimeErr;
+        }
+    }
+
+    fn execOpListLen(self: *Self) RuntimeError!void {
+        const val = try self.pop();
+        if (!val.isObj() or val.asObj().obj_type != .list) {
+            try self.runtimeErrorAny(.E001, "op_list_len: expected list");
+            return error.RuntimeErr;
+        }
+        const lst = ObjList.fromObj(val.asObj());
+        try self.push(Value.fromInt(@intCast(lst.items.items.len)));
+    }
+
+    fn execOpListSlice(self: *Self, start: u16) RuntimeError!void {
+        const val = try self.pop();
+        if (!val.isObj() or val.asObj().obj_type != .list) {
+            try self.runtimeErrorAny(.E001, "op_list_slice: expected list");
+            return error.RuntimeErr;
+        }
+        const src = ObjList.fromObj(val.asObj());
+        const new_list = try ObjList.create(self.allocator);
+        self.trackObject(&new_list.obj);
+
+        if (start < src.items.items.len) {
+            const slice = src.items.items[start..];
+            try new_list.items.appendSlice(self.allocator, slice);
+        }
+
+        try self.push(Value.fromObj(&new_list.obj));
+    }
+
     // ── Output ────────────────────────────────────────────────────────
 
     fn printValue(self: *Self, val: Value) !void {
@@ -1946,4 +2086,136 @@ test "vm: greater, less_equal, greater_equal" {
         const result = try tc.run();
         try std.testing.expect(!result.asBool());
     }
+}
+
+// ── Phase 3: ADT and pattern matching opcode tests ────────────────────
+
+test "vm: op_adt_construct creates ADT value" {
+    const allocator = std.testing.allocator;
+    var tc = TestChunk.init(allocator);
+    defer tc.deinit();
+
+    // Construct an ADT: type_id=2, variant_idx=0, arity=0 (nullary)
+    try tc.emitOp(.op_adt_construct);
+    try tc.emit(0); try tc.emit(2); // type_id = 2
+    try tc.emit(0); try tc.emit(0); // variant_idx = 0
+    try tc.emit(0); // arity = 0
+    try tc.emitReturn();
+
+    var vm = VM.init(&tc.chunk, allocator);
+    defer vm.deinit();
+    const result = try vm.run();
+    try std.testing.expect(result.isObjType(.adt));
+    const adt = obj_mod.ObjAdt.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(u16, 2), adt.type_id);
+    try std.testing.expectEqual(@as(u16, 0), adt.variant_idx);
+    try std.testing.expectEqual(@as(usize, 0), adt.payload.len);
+}
+
+test "vm: op_adt_construct with payload" {
+    const allocator = std.testing.allocator;
+    var tc = TestChunk.init(allocator);
+    defer tc.deinit();
+
+    // Push payload value, then construct ADT with arity=1
+    try tc.emitConstant(Value.fromInt(42));
+    try tc.emitOp(.op_adt_construct);
+    try tc.emit(0); try tc.emit(0); // type_id = 0 (Option)
+    try tc.emit(0); try tc.emit(0); // variant_idx = 0 (Some)
+    try tc.emit(1); // arity = 1
+    try tc.emitReturn();
+
+    var vm = VM.init(&tc.chunk, allocator);
+    defer vm.deinit();
+    const result = try vm.run();
+    try std.testing.expect(result.isObjType(.adt));
+    const adt = obj_mod.ObjAdt.fromObj(result.asObj());
+    try std.testing.expectEqual(@as(u16, 0), adt.type_id);
+    try std.testing.expectEqual(@as(u16, 0), adt.variant_idx);
+    try std.testing.expectEqual(@as(usize, 1), adt.payload.len);
+    try std.testing.expectEqual(@as(i32, 42), adt.payload[0].asInt());
+}
+
+test "vm: op_check_tag matches correctly" {
+    const allocator = std.testing.allocator;
+    var tc = TestChunk.init(allocator);
+    defer tc.deinit();
+
+    // Construct ADT type_id=1, variant=0, then check tag
+    try tc.emitOp(.op_adt_construct);
+    try tc.emit(0); try tc.emit(1); // type_id = 1
+    try tc.emit(0); try tc.emit(0); // variant_idx = 0
+    try tc.emit(0); // arity = 0
+
+    // Check for matching tag
+    try tc.emitOp(.op_check_tag);
+    try tc.emit(0); try tc.emit(1); // type_id = 1
+    try tc.emit(0); try tc.emit(0); // variant_idx = 0
+    try tc.emitReturn();
+
+    var vm = VM.init(&tc.chunk, allocator);
+    defer vm.deinit();
+    const result = try vm.run();
+    try std.testing.expect(result.asBool());
+}
+
+test "vm: op_check_tag rejects wrong variant" {
+    const allocator = std.testing.allocator;
+    var tc = TestChunk.init(allocator);
+    defer tc.deinit();
+
+    // Construct ADT type_id=1, variant=0
+    try tc.emitOp(.op_adt_construct);
+    try tc.emit(0); try tc.emit(1);
+    try tc.emit(0); try tc.emit(0);
+    try tc.emit(0);
+
+    // Check for variant 1 (should fail)
+    try tc.emitOp(.op_check_tag);
+    try tc.emit(0); try tc.emit(1);
+    try tc.emit(0); try tc.emit(1); // variant_idx = 1 (different)
+    try tc.emitReturn();
+
+    var vm = VM.init(&tc.chunk, allocator);
+    defer vm.deinit();
+    const result = try vm.run();
+    try std.testing.expect(!result.asBool());
+}
+
+test "vm: op_adt_get_field extracts payload" {
+    const allocator = std.testing.allocator;
+    var tc = TestChunk.init(allocator);
+    defer tc.deinit();
+
+    // Construct ADT with payload [42, 99]
+    try tc.emitConstant(Value.fromInt(42));
+    try tc.emitConstant(Value.fromInt(99));
+    try tc.emitOp(.op_adt_construct);
+    try tc.emit(0); try tc.emit(0);
+    try tc.emit(0); try tc.emit(0);
+    try tc.emit(2); // arity = 2
+
+    // Get field 1
+    try tc.emitOp(.op_adt_get_field);
+    try tc.emit(1);
+    try tc.emitReturn();
+
+    var vm = VM.init(&tc.chunk, allocator);
+    defer vm.deinit();
+    const result = try vm.run();
+    try std.testing.expectEqual(@as(i32, 99), result.asInt());
+}
+
+test "vm: op_dup duplicates stack top" {
+    const allocator = std.testing.allocator;
+    var tc = TestChunk.init(allocator);
+    defer tc.deinit();
+
+    try tc.emitConstant(Value.fromInt(7));
+    try tc.emitOp(.op_dup);
+    try tc.emitOp(.op_add);
+    try tc.emitReturn();
+
+    const result = try tc.run();
+    try std.testing.expectEqual(@as(i32, 14), result.asInt());
 }
