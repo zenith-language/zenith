@@ -2133,7 +2133,7 @@ test "vm: type mismatch error" {
     const allocator = std.testing.allocator;
     var tc = TestChunk.init(allocator);
     defer tc.deinit();
-    const s = try ObjString.create(allocator, "hello");
+    const s = try ObjString.create(allocator, "hello", null);
     defer s.obj.destroy(allocator);
     try tc.emitConstant(Value.fromInt(1));
     try tc.emitConstant(Value.fromObj(&s.obj));
@@ -2341,7 +2341,7 @@ test "vm: len builtin" {
     const allocator = std.testing.allocator;
     var tc = TestChunk.init(allocator);
     defer tc.deinit();
-    const s = try ObjString.create(allocator, "hello");
+    const s = try ObjString.create(allocator, "hello", null);
     try tc.emitOp(.op_get_builtin); try tc.emit(2);
     try tc.emitConstant(Value.fromObj(&s.obj));
     try tc.emitOp(.op_call); try tc.emit(1);
@@ -2370,8 +2370,8 @@ test "vm: string concatenation" {
     const allocator = std.testing.allocator;
     var tc = TestChunk.init(allocator);
     defer tc.deinit();
-    const s1 = try ObjString.create(allocator, "hello");
-    const s2 = try ObjString.create(allocator, " world");
+    const s1 = try ObjString.create(allocator, "hello", null);
+    const s2 = try ObjString.create(allocator, " world", null);
     try tc.emitConstant(Value.fromObj(&s1.obj));
     try tc.emitConstant(Value.fromObj(&s2.obj));
     try tc.emitOp(.op_concat);

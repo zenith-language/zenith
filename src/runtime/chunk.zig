@@ -365,7 +365,7 @@ pub const Chunk = struct {
                     const idx = try readU32LE(reader);
                     if (idx >= string_count) return error.InvalidFormat;
                     // Create an ObjString from the string table data.
-                    const str_obj = try ObjString.create(allocator, string_table[idx]);
+                    const str_obj = try ObjString.create(allocator, string_table[idx], null);
                     break :blk Value.fromObj(&str_obj.obj);
                 },
                 TAG_ATOM => blk: {
@@ -595,7 +595,7 @@ test "Chunk serialize and deserialize round-trip" {
     _ = try original.addConstant(Value.fromAtom(0), allocator);
 
     // Add a string constant.
-    const str_obj = try ObjString.create(allocator, "hello");
+    const str_obj = try ObjString.create(allocator, "hello", null);
     _ = try original.addConstant(Value.fromObj(&str_obj.obj), allocator);
 
     // Add bytecodes.

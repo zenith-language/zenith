@@ -488,7 +488,7 @@ test "type checks are mutually exclusive" {
 
 test "ObjString value round-trip via fromObj" {
     const allocator = std.testing.allocator;
-    const str = try ObjString.create(allocator, "hello");
+    const str = try ObjString.create(allocator, "hello", null);
     defer str.obj.destroy(allocator);
 
     const v = Value.fromObj(&str.obj);
@@ -520,11 +520,11 @@ test "Value.eql different types" {
 
 test "Value.eql strings by content" {
     const allocator = std.testing.allocator;
-    const a = try ObjString.create(allocator, "hello");
+    const a = try ObjString.create(allocator, "hello", null);
     defer a.obj.destroy(allocator);
-    const b = try ObjString.create(allocator, "hello");
+    const b = try ObjString.create(allocator, "hello", null);
     defer b.obj.destroy(allocator);
-    const c = try ObjString.create(allocator, "world");
+    const c = try ObjString.create(allocator, "world", null);
     defer c.obj.destroy(allocator);
 
     const va = Value.fromObj(&a.obj);

@@ -392,7 +392,7 @@ fn builtinStr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     _ = err_msg;
     const text = try formatValue(args[0], allocator, null);
     defer allocator.free(text);
-    const str_obj = try ObjString.create(allocator, text);
+    const str_obj = try ObjString.create(allocator, text, null);
     return Value.fromObj(&str_obj.obj);
 }
 
@@ -918,7 +918,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
     if (sep_bytes.len == 0) {
         // Empty separator: split into individual characters.
         for (str_bytes) |byte| {
-            const s = try ObjString.create(allocator, &[_]u8{byte});
+            const s = try ObjString.create(allocator, &[_]u8{byte}, null);
             trackObj(&s.obj);
             try new_list.items.append(allocator, Value.fromObj(&s.obj));
         }
@@ -926,7 +926,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
         // Single-byte separator: use splitScalar.
         var it = std.mem.splitScalar(u8, str_bytes, sep_bytes[0]);
         while (it.next()) |part| {
-            const s = try ObjString.create(allocator, part);
+            const s = try ObjString.create(allocator, part, null);
             trackObj(&s.obj);
             try new_list.items.append(allocator, Value.fromObj(&s.obj));
         }
@@ -936,7 +936,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
         var seg_start: usize = 0;
         while (pos + sep_bytes.len <= str_bytes.len) {
             if (std.mem.eql(u8, str_bytes[pos..][0..sep_bytes.len], sep_bytes)) {
-                const s = try ObjString.create(allocator, str_bytes[seg_start..pos]);
+                const s = try ObjString.create(allocator, str_bytes[seg_start..pos], null);
                 trackObj(&s.obj);
                 try new_list.items.append(allocator, Value.fromObj(&s.obj));
                 pos += sep_bytes.len;
@@ -946,7 +946,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
             }
         }
         // Remaining segment.
-        const s = try ObjString.create(allocator, str_bytes[seg_start..]);
+        const s = try ObjString.create(allocator, str_bytes[seg_start..], null);
         trackObj(&s.obj);
         try new_list.items.append(allocator, Value.fromObj(&s.obj));
     }
@@ -962,7 +962,7 @@ fn builtinStringTrim(args: []const Value, allocator: Allocator, err_msg: *[]cons
     }
     const str_bytes = ObjString.fromObj(args[0].asObj()).bytes;
     const trimmed = std.mem.trim(u8, str_bytes, " \t\n\r");
-    const s = try ObjString.create(allocator, trimmed);
+    const s = try ObjString.create(allocator, trimmed, null);
     return Value.fromObj(&s.obj);
 }
 
@@ -992,7 +992,7 @@ fn builtinStringJoin(args: []const Value, allocator: Allocator, err_msg: *[]cons
     }
     const result_bytes = try buf.toOwnedSlice(allocator);
     defer allocator.free(result_bytes);
-    const s = try ObjString.create(allocator, result_bytes);
+    const s = try ObjString.create(allocator, result_bytes, null);
     return Value.fromObj(&s.obj);
 }
 
@@ -1020,7 +1020,7 @@ fn builtinStringReplace(args: []const Value, allocator: Allocator, err_msg: *[]c
 
     if (old_bytes.len == 0) {
         // Empty old string: return original.
-        const s = try ObjString.create(allocator, str_bytes);
+        const s = try ObjString.create(allocator, str_bytes, null);
         return Value.fromObj(&s.obj);
     }
 
@@ -1043,7 +1043,7 @@ fn builtinStringReplace(args: []const Value, allocator: Allocator, err_msg: *[]c
     }
     const result_bytes = try buf.toOwnedSlice(allocator);
     defer allocator.free(result_bytes);
-    const s = try ObjString.create(allocator, result_bytes);
+    const s = try ObjString.create(allocator, result_bytes, null);
     return Value.fromObj(&s.obj);
 }
 
@@ -1083,7 +1083,7 @@ fn builtinStringToLower(args: []const Value, allocator: Allocator, err_msg: *[]c
     for (str_bytes, 0..) |byte, i| {
         lowered[i] = std.ascii.toLower(byte);
     }
-    const s = try ObjString.create(allocator, lowered);
+    const s = try ObjString.create(allocator, lowered, null);
     return Value.fromObj(&s.obj);
 }
 
@@ -1099,7 +1099,7 @@ fn builtinStringToUpper(args: []const Value, allocator: Allocator, err_msg: *[]c
     for (str_bytes, 0..) |byte, i| {
         uppered[i] = std.ascii.toUpper(byte);
     }
-    const s = try ObjString.create(allocator, uppered);
+    const s = try ObjString.create(allocator, uppered, null);
     return Value.fromObj(&s.obj);
 }
 
@@ -1330,7 +1330,7 @@ test "builtins: str converts nil to string" {
 
 test "builtins: len returns string length" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "hello");
+    const s = try ObjString.create(allocator, "hello", null);
     defer s.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1369,7 +1369,7 @@ test "builtins: type_of returns correct atoms" {
     try std.testing.expectEqual(@as(u32, 3), t_nil.asAtom()); // :nil
 
     // string -> atom 4
-    const s = try ObjString.create(allocator, "test");
+    const s = try ObjString.create(allocator, "test", null);
     defer s.obj.destroy(allocator);
     const t_str = try builtinTypeOf(&[_]Value{Value.fromObj(&s.obj)}, allocator, &err_msg);
     try std.testing.expectEqual(@as(u32, 4), t_str.asAtom()); // :string
@@ -1403,7 +1403,7 @@ test "builtins: assert fails on nil" {
 
 test "builtins: panic always errors" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "oh no");
+    const s = try ObjString.create(allocator, "oh no", null);
     defer s.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1654,9 +1654,9 @@ test "builtins: Map.contains checks key existence" {
 
 test "builtins: String.split splits by separator" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "a,b,c");
+    const s = try ObjString.create(allocator, "a,b,c", null);
     defer s.obj.destroy(allocator);
-    const sep = try ObjString.create(allocator, ",");
+    const sep = try ObjString.create(allocator, ",", null);
     defer sep.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1673,7 +1673,7 @@ test "builtins: String.split splits by separator" {
 
 test "builtins: String.trim removes whitespace" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "  hello  ");
+    const s = try ObjString.create(allocator, "  hello  ", null);
     defer s.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1684,11 +1684,11 @@ test "builtins: String.trim removes whitespace" {
 
 test "builtins: String.contains checks substring" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "hello world");
+    const s = try ObjString.create(allocator, "hello world", null);
     defer s.obj.destroy(allocator);
-    const sub = try ObjString.create(allocator, "world");
+    const sub = try ObjString.create(allocator, "world", null);
     defer sub.obj.destroy(allocator);
-    const missing = try ObjString.create(allocator, "xyz");
+    const missing = try ObjString.create(allocator, "xyz", null);
     defer missing.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1700,7 +1700,7 @@ test "builtins: String.contains checks substring" {
 
 test "builtins: String.to_lower lowercases" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "Hello WORLD");
+    const s = try ObjString.create(allocator, "Hello WORLD", null);
     defer s.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1711,7 +1711,7 @@ test "builtins: String.to_lower lowercases" {
 
 test "builtins: String.to_upper uppercases" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "Hello world");
+    const s = try ObjString.create(allocator, "Hello world", null);
     defer s.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1722,11 +1722,11 @@ test "builtins: String.to_upper uppercases" {
 
 test "builtins: String.replace replaces all occurrences" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "aXbXc");
+    const s = try ObjString.create(allocator, "aXbXc", null);
     defer s.obj.destroy(allocator);
-    const old = try ObjString.create(allocator, "X");
+    const old = try ObjString.create(allocator, "X", null);
     defer old.obj.destroy(allocator);
-    const new_str = try ObjString.create(allocator, "--");
+    const new_str = try ObjString.create(allocator, "--", null);
     defer new_str.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1737,11 +1737,11 @@ test "builtins: String.replace replaces all occurrences" {
 
 test "builtins: String.starts_with and String.ends_with" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "hello world");
+    const s = try ObjString.create(allocator, "hello world", null);
     defer s.obj.destroy(allocator);
-    const prefix = try ObjString.create(allocator, "hello");
+    const prefix = try ObjString.create(allocator, "hello", null);
     defer prefix.obj.destroy(allocator);
-    const suffix = try ObjString.create(allocator, "world");
+    const suffix = try ObjString.create(allocator, "world", null);
     defer suffix.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1770,7 +1770,7 @@ test "builtins: Result.Ok and Result.is_ok" {
 test "builtins: Result.Err and Result.is_err" {
     const allocator = std.testing.allocator;
     var err_msg: []const u8 = "";
-    const err_str = try ObjString.create(allocator, "oops");
+    const err_str = try ObjString.create(allocator, "oops", null);
     defer err_str.obj.destroy(allocator);
     const err_val = try builtinResultErr(&[_]Value{Value.fromObj(&err_str.obj)}, allocator, &err_msg);
     defer err_val.asObj().destroy(allocator);
@@ -1864,7 +1864,7 @@ test "builtins: Option.to_result converts None to Err" {
     const none_val = try builtinOptionNone(&[_]Value{}, allocator, &err_msg);
     defer none_val.asObj().destroy(allocator);
 
-    const err_str = try ObjString.create(allocator, "missing");
+    const err_str = try ObjString.create(allocator, "missing", null);
     defer err_str.obj.destroy(allocator);
     const result = try builtinOptionToResult(&[_]Value{ none_val, Value.fromObj(&err_str.obj) }, allocator, &err_msg);
     defer result.asObj().destroy(allocator);
@@ -1877,11 +1877,11 @@ test "builtins: String.join joins list elements" {
     const allocator = std.testing.allocator;
     const lst = try ObjList.create(allocator);
     defer lst.obj.destroy(allocator);
-    const s1 = try ObjString.create(allocator, "hello");
+    const s1 = try ObjString.create(allocator, "hello", null);
     try lst.items.append(allocator, Value.fromObj(&s1.obj));
-    const s2 = try ObjString.create(allocator, "world");
+    const s2 = try ObjString.create(allocator, "world", null);
     try lst.items.append(allocator, Value.fromObj(&s2.obj));
-    const sep = try ObjString.create(allocator, " ");
+    const sep = try ObjString.create(allocator, " ", null);
     defer sep.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1894,9 +1894,9 @@ test "builtins: String.join joins list elements" {
 
 test "builtins: String.split with multi-byte separator" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "a::b::c");
+    const s = try ObjString.create(allocator, "a::b::c", null);
     defer s.obj.destroy(allocator);
-    const sep = try ObjString.create(allocator, "::");
+    const sep = try ObjString.create(allocator, "::", null);
     defer sep.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1912,11 +1912,11 @@ test "builtins: String.split with multi-byte separator" {
 
 test "builtins: String.replace with empty old returns original" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "hello");
+    const s = try ObjString.create(allocator, "hello", null);
     defer s.obj.destroy(allocator);
-    const old = try ObjString.create(allocator, "");
+    const old = try ObjString.create(allocator, "", null);
     defer old.obj.destroy(allocator);
-    const new_s = try ObjString.create(allocator, "X");
+    const new_s = try ObjString.create(allocator, "X", null);
     defer new_s.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";
@@ -1927,7 +1927,7 @@ test "builtins: String.replace with empty old returns original" {
 
 test "builtins: String.length returns byte count" {
     const allocator = std.testing.allocator;
-    const s = try ObjString.create(allocator, "hello");
+    const s = try ObjString.create(allocator, "hello", null);
     defer s.obj.destroy(allocator);
 
     var err_msg: []const u8 = "";

@@ -722,7 +722,7 @@ pub const Compiler = struct {
         // Strip quotes from the token text.
         if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
             const content = text[1 .. text.len - 1];
-            const str_obj = try ObjString.create(self.allocator, content);
+            const str_obj = try ObjString.create(self.allocator, content, null);
             try self.emitConstant(Value.fromObj(&str_obj.obj), self.getLine(node_idx));
         } else {
             try self.emitError(node_idx, .E007, "invalid string literal");
@@ -922,7 +922,7 @@ pub const Compiler = struct {
             const name_tok = pairs[i];
             const name = self.ast.tokenSlice(name_tok);
             // Add field name string to constant pool.
-            const str_obj = try ObjString.create(self.allocator, name);
+            const str_obj = try ObjString.create(self.allocator, name, null);
             const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
             try name_const_indices.append(self.allocator, @intCast(const_idx));
         }
@@ -966,7 +966,7 @@ pub const Compiler = struct {
         while (i < override_pairs.len) : (i += 2) {
             const name_tok = override_pairs[i];
             const name = self.ast.tokenSlice(name_tok);
-            const str_obj = try ObjString.create(self.allocator, name);
+            const str_obj = try ObjString.create(self.allocator, name, null);
             const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
             try name_const_indices.append(self.allocator, @intCast(const_idx));
         }
@@ -1057,7 +1057,7 @@ pub const Compiler = struct {
 
         // Runtime field access: compile left side, emit op_get_field.
         try self.compileNode(node_data.lhs);
-        const str_obj = try ObjString.create(self.allocator, field_name);
+        const str_obj = try ObjString.create(self.allocator, field_name, null);
         const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
         const line = self.getLine(node_idx);
         try self.emitOp(.op_get_field, line);
@@ -1271,7 +1271,7 @@ pub const Compiler = struct {
         if (self.resolveBuiltin("panic")) |panic_idx| {
             try self.emitOp(.op_get_builtin, line);
             try self.emitByte(panic_idx, line);
-            const msg = try ObjString.create(self.allocator, "no matching pattern");
+            const msg = try ObjString.create(self.allocator, "no matching pattern", null);
             try self.emitConstant(Value.fromObj(&msg.obj), line);
             try self.emitOp(.op_call, line);
             try self.emitByte(1, line);
@@ -1647,7 +1647,7 @@ pub const Compiler = struct {
                     try self.emitByte(rec_slot, line);
                     // op_get_field pops object, looks up field name constant, pushes field value.
                     // Follow the existing field_access pattern: addConstant for name string, emit op_get_field + u16 idx.
-                    const str_obj = try ObjString.create(self.allocator, field_name);
+                    const str_obj = try ObjString.create(self.allocator, field_name, null);
                     const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
                     try self.emitOp(.op_get_field, line);
                     try self.emitByte(@intCast((const_idx >> 8) & 0xFF), line);
@@ -2359,7 +2359,7 @@ pub const Compiler = struct {
             .string_literal => {
                 if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
                     const content = text[1 .. text.len - 1];
-                    const str_obj = try ObjString.create(self.allocator, content);
+                    const str_obj = try ObjString.create(self.allocator, content, null);
                     return Value.fromObj(&str_obj.obj);
                 }
                 return Value.nil;

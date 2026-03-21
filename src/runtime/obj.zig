@@ -4,6 +4,8 @@ const value_mod = @import("value");
 const Value = value_mod.Value;
 const chunk_mod = @import("chunk");
 const Chunk = chunk_mod.Chunk;
+const intern_mod = @import("intern");
+const InternTable = intern_mod.InternTable;
 
 /// Object type tag for heap-allocated values.
 pub const ObjType = enum(u8) {
@@ -26,8 +28,35 @@ pub const ObjType = enum(u8) {
 /// that we can always recover the type tag from any `*Obj` pointer.
 pub const Obj = struct {
     obj_type: ObjType,
-    /// Linked-list pointer for GC traversal (future phases).
+    /// GC flags: bit 0 = mark, bit 1 = old generation.
+    gc_flags: u8 = 0,
+    /// Linked-list pointer for GC traversal.
     next: ?*Obj = null,
+    /// Forwarding pointer for Cheney's semi-space copying algorithm.
+    forwarded: ?*Obj = null,
+
+    pub const GC_MARK: u8 = 0x01;
+    pub const GC_OLD: u8 = 0x02;
+
+    pub inline fn isMarked(self: *const Obj) bool {
+        return (self.gc_flags & GC_MARK) != 0;
+    }
+
+    pub inline fn setMarked(self: *Obj, marked: bool) void {
+        if (marked) {
+            self.gc_flags |= GC_MARK;
+        } else {
+            self.gc_flags &= ~GC_MARK;
+        }
+    }
+
+    pub inline fn isOldGen(self: *const Obj) bool {
+        return (self.gc_flags & GC_OLD) != 0;
+    }
+
+    pub inline fn promoteToOld(self: *Obj) void {
+        self.gc_flags |= GC_OLD;
+    }
 
     /// Free the memory for this object and its payload.
     pub fn destroy(self: *Obj, allocator: Allocator) void {
@@ -107,7 +136,19 @@ pub const ObjString = struct {
     hash: u32,
 
     /// Create a new ObjString by copying `source` bytes onto the heap.
-    pub fn create(allocator: Allocator, source: []const u8) !*ObjString {
+    /// If `intern_table` is non-null, deduplicates: returns existing interned
+    /// string if one matches, otherwise allocates and inserts into the table.
+    /// If `intern_table` is null, allocates without interning (for bootstrapping/tests).
+    pub fn create(allocator: Allocator, source: []const u8, intern_table: ?*InternTable) !*ObjString {
+        const hash = hashBytes(source);
+
+        // Check intern table for existing string.
+        if (intern_table) |table| {
+            if (table.findByContent(source, hash)) |existing| {
+                return existing;
+            }
+        }
+
         const copy = try allocator.dupe(u8, source);
         errdefer allocator.free(copy);
 
@@ -115,8 +156,14 @@ pub const ObjString = struct {
         str.* = .{
             .obj = .{ .obj_type = .string },
             .bytes = copy,
-            .hash = hashBytes(source),
+            .hash = hash,
         };
+
+        // Insert into intern table if provided.
+        if (intern_table) |table| {
+            try table.insert(str);
+        }
+
         return str;
     }
 
@@ -647,7 +694,7 @@ test "ObjRange destroy frees memory (testing allocator)" {
 
 test "ObjString create and destroy round-trip" {
     const allocator = std.testing.allocator;
-    const str = try ObjString.create(allocator, "hello");
+    const str = try ObjString.create(allocator, "hello", null);
     defer str.obj.destroy(allocator);
 
     try std.testing.expectEqualStrings("hello", str.bytes);
@@ -657,7 +704,7 @@ test "ObjString create and destroy round-trip" {
 
 test "ObjString empty string" {
     const allocator = std.testing.allocator;
-    const str = try ObjString.create(allocator, "");
+    const str = try ObjString.create(allocator, "", null);
     defer str.obj.destroy(allocator);
 
     try std.testing.expectEqualStrings("", str.bytes);
@@ -692,7 +739,7 @@ test "ObjInt negative big value" {
 
 test "ObjString fromObj recovers original" {
     const allocator = std.testing.allocator;
-    const str = try ObjString.create(allocator, "test");
+    const str = try ObjString.create(allocator, "test", null);
     defer str.obj.destroy(allocator);
 
     const obj_ptr: *Obj = &str.obj;

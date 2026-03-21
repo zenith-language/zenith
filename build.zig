@@ -17,11 +17,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const intern_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/intern.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const obj_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/obj.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "intern", .module = intern_mod },
+        },
     });
+
+    // Wire circular import: intern_mod needs obj for ObjString.
+    intern_mod.addImport("obj", obj_mod);
 
     // NOTE: obj_mod needs value and chunk imports for ObjFunction/ObjClosure.
     // These are added below via addImport after value_mod and chunk_mod are created,
@@ -199,6 +211,7 @@ pub fn build(b: *std.Build) void {
     const test_modules = [_]*std.Build.Module{
         token_mod,
         memory_mod,
+        intern_mod,
         obj_mod,
         value_mod,
         chunk_mod,
