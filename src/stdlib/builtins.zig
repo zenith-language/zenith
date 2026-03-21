@@ -9,6 +9,10 @@ const ObjMap = obj_mod.ObjMap;
 const ObjTuple = obj_mod.ObjTuple;
 const ObjAdt = obj_mod.ObjAdt;
 const ObjRecord = obj_mod.ObjRecord;
+const ObjStream = obj_mod.ObjStream;
+const ObjRange = obj_mod.ObjRange;
+const stream_mod = @import("stream");
+const StreamState = stream_mod.StreamState;
 
 /// Error type for native function execution.
 pub const NativeError = error{
@@ -241,6 +245,20 @@ pub const builtins = [_]BuiltinDesc{
     // ── GC (indices 56-57) ──────────────────────────────────────────
     .{ .name = "gc", .func = &builtinGC, .arity_min = 0, .arity_max = 0 },
     .{ .name = "gc_stats", .func = &builtinGCStats, .arity_min = 0, .arity_max = 0 },
+
+    // ── Stream sources (indices 58-59) ────────────────────────────
+    .{ .name = "repeat", .func = &builtinRepeat, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "iterate", .func = &builtinIterate, .arity_min = 2, .arity_max = 2 },
+
+    // ── Stream transforms (indices 60-63) ─────────────────────────
+    .{ .name = "map", .func = &builtinMap, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "filter", .func = &builtinFilter, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "take", .func = &builtinTake, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "drop", .func = &builtinDrop, .arity_min = 2, .arity_max = 2 },
+
+    // ── Stream terminals (indices 64-65) ──────────────────────────
+    .{ .name = "collect", .func = &builtinCollect, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "count", .func = &builtinCount, .arity_min = 1, .arity_max = 1 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -479,6 +497,7 @@ fn builtinTypeOf(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     if (val.isObjType(.tuple)) return Value.fromAtom(11); // :tuple
     if (val.isObjType(.record)) return Value.fromAtom(12); // :record
     if (val.isObjType(.adt)) return Value.fromAtom(13); // :adt
+    if (val.isObjType(.stream)) return Value.fromAtom(14); // :stream
     return Value.fromAtom(3); // fallback: nil
 }
 
@@ -509,7 +528,6 @@ fn builtinPanic(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
 /// range(n) or range(start, end) or range(start, end, step).
 /// Returns a heap-allocated ObjRange that the VM's op_for_iter can iterate.
 fn builtinRange(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
-    const ObjRange = obj_mod.ObjRange;
     switch (args.len) {
         1 => {
             if (!args[0].isInt()) {
@@ -1393,6 +1411,228 @@ fn valueCompare(ctx: void, a: Value, b: Value) bool {
     }
     // Fallback: compare raw bits.
     return a.bits < b.bits;
+}
+
+// ── Stream builtin implementations ────────────────────────────────────
+
+/// Helper: create an ObjStream with the given state, track it with the VM.
+fn createStream(state: *StreamState, allocator: Allocator) NativeError!Value {
+    const s = try ObjStream.create(allocator, state);
+    trackObj(&s.obj);
+    return Value.fromObj(&s.obj);
+}
+
+/// Helper: if value is a range, auto-wrap into a stream with range_iter state.
+fn autoWrapRange(val: Value, allocator: Allocator) NativeError!Value {
+    if (val.isObjType(.range)) {
+        const r = ObjRange.fromObj(val.asObj());
+        const state = try allocator.create(StreamState);
+        state.* = .{ .range_iter = .{
+            .current = r.start,
+            .end = r.end,
+            .step = r.step,
+        } };
+        return createStream(state, allocator);
+    }
+    return val;
+}
+
+/// repeat(value) -> Stream: infinite stream that always yields value.
+fn builtinRepeat(args: []const Value, allocator: Allocator, _: *[]const u8) NativeError!Value {
+    const state = try allocator.create(StreamState);
+    state.* = .{ .repeat_iter = .{ .value = args[0] } };
+    return createStream(state, allocator);
+}
+
+/// iterate(init, fn) -> Stream: stream where each element is fn applied to previous.
+fn builtinIterate(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[1].isObjType(.closure)) {
+        err_msg.* = "iterate() expects a function as second argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .iterate_iter = .{
+        .current = args[0],
+        .fn_val = args[1],
+        .started = false,
+    } };
+    return createStream(state, allocator);
+}
+
+/// map(stream_or_list, fn) -> Stream or List: overloaded dispatch.
+/// For streams: creates a lazy map_op. For lists: delegates to List.map.
+fn builtinMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // Auto-wrap range to stream if needed.
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (first.isObjType(.stream)) {
+        if (!args[1].isObjType(.closure)) {
+            err_msg.* = "map() expects a function as second argument";
+            return error.RuntimeError;
+        }
+        const state = try allocator.create(StreamState);
+        state.* = .{ .map_op = .{
+            .upstream = first,
+            .fn_val = args[1],
+        } };
+        return createStream(state, allocator);
+    }
+    if (first.isObjType(.list)) {
+        // Delegate to existing List.map.
+        return builtinListMap(args, allocator, err_msg);
+    }
+    err_msg.* = "map() expects a stream or list as first argument";
+    return error.RuntimeError;
+}
+
+/// filter(stream_or_list, fn) -> Stream or List: overloaded dispatch.
+fn builtinFilter(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // Auto-wrap range to stream if needed.
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (first.isObjType(.stream)) {
+        if (!args[1].isObjType(.closure)) {
+            err_msg.* = "filter() expects a function as second argument";
+            return error.RuntimeError;
+        }
+        const state = try allocator.create(StreamState);
+        state.* = .{ .filter_op = .{
+            .upstream = first,
+            .fn_val = args[1],
+        } };
+        return createStream(state, allocator);
+    }
+    if (first.isObjType(.list)) {
+        // Delegate to existing List.filter.
+        return builtinListFilter(args, allocator, err_msg);
+    }
+    err_msg.* = "filter() expects a stream or list as first argument";
+    return error.RuntimeError;
+}
+
+/// take(stream, n) -> Stream: take first n elements from stream.
+fn builtinTake(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // Auto-wrap range to stream if needed.
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "take() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isInt()) {
+        err_msg.* = "take() expects an integer as second argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .take_op = .{
+        .upstream = first,
+        .remaining = args[1].asInt(),
+    } };
+    return createStream(state, allocator);
+}
+
+/// drop(stream, n) -> Stream: skip first n elements from stream.
+fn builtinDrop(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // Auto-wrap range to stream if needed.
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "drop() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isInt()) {
+        err_msg.* = "drop() expects an integer as second argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .drop_op = .{
+        .upstream = first,
+        .remaining = args[1].asInt(),
+        .started = false,
+    } };
+    return createStream(state, allocator);
+}
+
+/// collect(stream) -> List: terminal that pulls all elements into a list.
+fn builtinCollect(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // Auto-wrap range to stream if needed.
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "collect() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    // Set stream module callbacks to match our current VM callbacks.
+    if (current_vm) |vm_ptr| {
+        if (call_closure_fn) |fn_ptr| {
+            stream_mod.setVM(vm_ptr, fn_ptr);
+        }
+    }
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    const result_list = try ObjList.create(allocator);
+    trackObj(&result_list.obj);
+
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        // Check if None (Option type_id=0, variant_idx=1).
+        if (isAdtVariant(val, 0, 1)) break;
+        // Extract from Some(x).
+        const inner = adtPayload(val, 0);
+        try result_list.items.append(allocator, inner);
+    }
+
+    return Value.fromObj(&result_list.obj);
+}
+
+/// count(stream) -> Int: terminal that counts elements in the stream.
+fn builtinCount(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // Auto-wrap range to stream if needed.
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "count() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    // Set stream module callbacks.
+    if (current_vm) |vm_ptr| {
+        if (call_closure_fn) |fn_ptr| {
+            stream_mod.setVM(vm_ptr, fn_ptr);
+        }
+    }
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    var n: i32 = 0;
+
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        if (isAdtVariant(val, 0, 1)) break;
+        n += 1;
+    }
+
+    return Value.fromInt(n);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

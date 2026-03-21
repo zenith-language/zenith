@@ -177,12 +177,20 @@ pub const Compiler = struct {
         "List.filter_map",
         // GC (56-57)
         "gc", "gc_stats",
+        // Stream sources (58-59)
+        "repeat", "iterate",
+        // Stream transforms (60-63)
+        "map", "filter", "take", "drop",
+        // Stream terminals (64-65)
+        "collect", "count",
     };
 
-    // Builtin type atom names, pre-registered at IDs 0-6 to match
+    // Builtin type atom names, pre-registered at IDs 0-14 to match
     // the hardcoded return values from type_of().
     const type_atom_names = [_][]const u8{
         "int", "float", "bool", "nil", "string", "bytes", "atom",
+        "range", "function", "list", "map", "tuple", "record", "adt",
+        "stream",
     };
 
     /// Compile an AST into bytecodes wrapped in an ObjClosure.
@@ -2668,7 +2676,7 @@ test "compile: atom literal" {
     defer tc.deinit(allocator);
 
     try std.testing.expect(!tc.result.hasErrors());
-    try std.testing.expectEqual(@as(u32, 8), tc.result.atom_count);
+    try std.testing.expectEqual(@as(u32, 16), tc.result.atom_count);
     try std.testing.expect(tc.result.atom_table.contains("ok"));
 }
 
