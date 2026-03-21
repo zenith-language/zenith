@@ -227,8 +227,9 @@ pub const Parser = struct {
         return switch (self.peekTag()) {
             .minus => self.parseUnaryNegate(),
             .kw_not => self.parseUnaryNot(),
-            .left_paren => self.parseGrouped(),
-            .left_brace => self.parseBlockExpr(),
+            .left_paren => self.parseGroupedOrTuple(),
+            .left_brace => self.parseBraceExpr(),
+            .left_bracket => self.parseListLiteral(),
             .kw_if => self.parseIfExpr(),
             .kw_fn => self.parseFnExpr(),
             .pipe => self.parseLambda(),
@@ -254,6 +255,11 @@ pub const Parser = struct {
         // Check if this is a call expression.
         if (op_tag == .left_paren) {
             return self.parseCall(left);
+        }
+
+        // Dot access (field_access): infix at call precedence.
+        if (op_tag == .dot) {
+            return self.parseDotAccess(left);
         }
 
         // Pipe operator: special handling for left-associative pipe chains.
@@ -388,20 +394,349 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
-    fn parseGrouped(self: *Parser) Error!Node.Index {
+    /// Parse `(expr)` as grouped expression OR `(expr, ...)` / `(expr,)` as tuple literal.
+    fn parseGroupedOrTuple(self: *Parser) Error!Node.Index {
+        const paren_tok = self.pos;
         self.advance(); // consume '('
-        const inner = try self.parseExpression();
+
+        // Empty parens `()` -- parse as zero-element tuple.
+        if (self.peekTag() == .right_paren) {
+            self.advance(); // consume ')'
+            const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+            return self.ast.addNode(.{
+                .tag = .tuple_literal,
+                .main_token = paren_tok,
+                .data = .{ .lhs = extra_start, .rhs = extra_start },
+            }, self.allocator);
+        }
+
+        const first = try self.parseExpression();
+
+        // Single element with closing paren and no comma -> grouped_expr.
+        if (self.peekTag() == .right_paren) {
+            self.advance(); // consume ')'
+            return self.ast.addNode(.{
+                .tag = .grouped_expr,
+                .main_token = paren_tok,
+                .data = .{ .lhs = first, .rhs = 0 },
+            }, self.allocator);
+        }
+
+        // Comma found -> this is a tuple literal.
+        if (self.peekTag() != .comma) {
+            try self.emitError("expected ')' or ',' in tuple/grouped expression");
+            return error.ParseError;
+        }
+
+        var elements: std.ArrayListUnmanaged(u32) = .empty;
+        defer elements.deinit(self.allocator);
+        try elements.append(self.allocator, first);
+
+        // Consume comma and parse remaining elements.
+        while (self.peekTag() == .comma) {
+            self.advance(); // consume ','
+            // Trailing comma: `(expr,)`
+            if (self.peekTag() == .right_paren) break;
+            const elem = try self.parseExpression();
+            try elements.append(self.allocator, elem);
+        }
 
         if (self.peekTag() != .right_paren) {
-            try self.emitError("expected ')' after expression");
+            try self.emitError("expected ')' to close tuple");
             return error.ParseError;
         }
         self.advance(); // consume ')'
 
+        // Store element indices in extra_data.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (elements.items) |e| {
+            _ = try self.ast.addExtra(e, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
         return self.ast.addNode(.{
-            .tag = .grouped_expr,
-            .main_token = self.pos -| 1,
-            .data = .{ .lhs = inner, .rhs = 0 },
+            .tag = .tuple_literal,
+            .main_token = paren_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Parse `[expr, expr, ...]` as list literal.
+    fn parseListLiteral(self: *Parser) Error!Node.Index {
+        const bracket_tok = self.pos;
+        self.advance(); // consume '['
+
+        var elements: std.ArrayListUnmanaged(u32) = .empty;
+        defer elements.deinit(self.allocator);
+
+        if (self.peekTag() != .right_bracket) {
+            const first = try self.parseExpression();
+            try elements.append(self.allocator, first);
+
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                // Allow trailing comma.
+                if (self.peekTag() == .right_bracket) break;
+                const elem = try self.parseExpression();
+                try elements.append(self.allocator, elem);
+            }
+        }
+
+        if (self.peekTag() != .right_bracket) {
+            try self.emitError("expected ']' to close list literal");
+            return error.ParseError;
+        }
+        self.advance(); // consume ']'
+
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (elements.items) |e| {
+            _ = try self.ast.addExtra(e, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .list_literal,
+            .main_token = bracket_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Disambiguation: `{` can start a block_expr, record literal, map literal, or record spread.
+    /// - `{}` -> empty map
+    /// - `{..expr, ...}` -> record_spread
+    /// - `{identifier: expr, ...}` -> record literal
+    /// - `{string_literal: expr, ...}` -> map literal
+    /// - Otherwise -> block expression
+    fn parseBraceExpr(self: *Parser) Error!Node.Index {
+        // Look ahead to disambiguate without consuming the `{`.
+        const after_brace = self.pos + 1;
+
+        // Empty `{}` -> empty map literal.
+        if (after_brace < self.tokens.len and self.tokens[after_brace].tag == .right_brace) {
+            return self.parseMapLiteral();
+        }
+
+        // `{..` -> record spread.
+        if (after_brace < self.tokens.len and self.tokens[after_brace].tag == .dot_dot) {
+            return self.parseRecordSpread();
+        }
+
+        // `{identifier :` -> record literal (but NOT `{identifier =` which is assignment in block).
+        if (after_brace < self.tokens.len and self.tokens[after_brace].tag == .identifier) {
+            const after_ident = after_brace + 1;
+            if (after_ident < self.tokens.len and self.tokens[after_ident].tag == .colon) {
+                return self.parseRecordLiteral();
+            }
+        }
+
+        // `{string_literal :` -> map literal.
+        if (after_brace < self.tokens.len and self.tokens[after_brace].tag == .string_literal) {
+            const after_str = after_brace + 1;
+            if (after_str < self.tokens.len and self.tokens[after_str].tag == .colon) {
+                return self.parseMapLiteral();
+            }
+        }
+
+        // Default: block expression.
+        return self.parseBlockExpr();
+    }
+
+    /// Parse `{name: expr, name: expr, ...}` as record literal.
+    fn parseRecordLiteral(self: *Parser) Error!Node.Index {
+        const brace_tok = self.pos;
+        self.advance(); // consume '{'
+
+        var pairs: std.ArrayListUnmanaged(u32) = .empty;
+        defer pairs.deinit(self.allocator);
+
+        // Parse first field.
+        if (self.peekTag() == .identifier) {
+            const name_tok = self.pos;
+            self.advance(); // consume identifier
+            if (self.peekTag() != .colon) {
+                try self.emitError("expected ':' after record field name");
+                return error.ParseError;
+            }
+            self.advance(); // consume ':'
+            const value = try self.parseExpression();
+            try pairs.append(self.allocator, name_tok);
+            try pairs.append(self.allocator, value);
+        }
+
+        // Parse remaining fields.
+        while (self.peekTag() == .comma) {
+            self.advance(); // consume ','
+            if (self.peekTag() == .right_brace) break; // trailing comma
+            if (self.peekTag() != .identifier) {
+                try self.emitError("expected field name in record literal");
+                return error.ParseError;
+            }
+            const name_tok = self.pos;
+            self.advance(); // consume identifier
+            if (self.peekTag() != .colon) {
+                try self.emitError("expected ':' after record field name");
+                return error.ParseError;
+            }
+            self.advance(); // consume ':'
+            const value = try self.parseExpression();
+            try pairs.append(self.allocator, name_tok);
+            try pairs.append(self.allocator, value);
+        }
+
+        if (self.peekTag() != .right_brace) {
+            try self.emitError("expected '}' to close record literal");
+            return error.ParseError;
+        }
+        self.advance(); // consume '}'
+
+        // Store alternating name_token/value_node in extra_data.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (pairs.items) |p| {
+            _ = try self.ast.addExtra(p, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .record_literal,
+            .main_token = brace_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Parse `{"key": expr, ...}` or `{}` as map literal.
+    fn parseMapLiteral(self: *Parser) Error!Node.Index {
+        const brace_tok = self.pos;
+        self.advance(); // consume '{'
+
+        var pairs: std.ArrayListUnmanaged(u32) = .empty;
+        defer pairs.deinit(self.allocator);
+
+        if (self.peekTag() != .right_brace) {
+            // Parse first key-value pair.
+            const key = try self.parseExpression();
+            if (self.peekTag() != .colon) {
+                try self.emitError("expected ':' after map key");
+                return error.ParseError;
+            }
+            self.advance(); // consume ':'
+            const value = try self.parseExpression();
+            try pairs.append(self.allocator, key);
+            try pairs.append(self.allocator, value);
+
+            // Parse remaining pairs.
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                if (self.peekTag() == .right_brace) break; // trailing comma
+                const k = try self.parseExpression();
+                if (self.peekTag() != .colon) {
+                    try self.emitError("expected ':' after map key");
+                    return error.ParseError;
+                }
+                self.advance(); // consume ':'
+                const v = try self.parseExpression();
+                try pairs.append(self.allocator, k);
+                try pairs.append(self.allocator, v);
+            }
+        }
+
+        if (self.peekTag() != .right_brace) {
+            try self.emitError("expected '}' to close map literal");
+            return error.ParseError;
+        }
+        self.advance(); // consume '}'
+
+        // Store alternating key_node/value_node in extra_data.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (pairs.items) |p| {
+            _ = try self.ast.addExtra(p, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .map_literal,
+            .main_token = brace_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Parse `{..expr, field: val, ...}` as record spread.
+    fn parseRecordSpread(self: *Parser) Error!Node.Index {
+        const brace_tok = self.pos;
+        self.advance(); // consume '{'
+
+        // Expect `..`
+        if (self.peekTag() != .dot_dot) {
+            try self.emitError("expected '..' for record spread");
+            return error.ParseError;
+        }
+        self.advance(); // consume '..'
+
+        // Parse base record expression.
+        const base = try self.parseExpression();
+
+        // Parse override fields.
+        var overrides: std.ArrayListUnmanaged(u32) = .empty;
+        defer overrides.deinit(self.allocator);
+
+        while (self.peekTag() == .comma) {
+            self.advance(); // consume ','
+            if (self.peekTag() == .right_brace) break; // trailing comma
+            if (self.peekTag() != .identifier) {
+                try self.emitError("expected field name in record spread override");
+                return error.ParseError;
+            }
+            const name_tok = self.pos;
+            self.advance(); // consume identifier
+            if (self.peekTag() != .colon) {
+                try self.emitError("expected ':' after override field name");
+                return error.ParseError;
+            }
+            self.advance(); // consume ':'
+            const value = try self.parseExpression();
+            try overrides.append(self.allocator, name_tok);
+            try overrides.append(self.allocator, value);
+        }
+
+        if (self.peekTag() != .right_brace) {
+            try self.emitError("expected '}' to close record spread");
+            return error.ParseError;
+        }
+        self.advance(); // consume '}'
+
+        // Store override pairs in extra_data: alternating name_token/value_node.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (overrides.items) |o| {
+            _ = try self.ast.addExtra(o, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        // extra_idx stores start..end range of override pairs.
+        const extra_idx = try self.ast.addExtra(extra_start, self.allocator);
+        _ = try self.ast.addExtra(extra_end, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .record_spread,
+            .main_token = brace_tok,
+            .data = .{ .lhs = base, .rhs = extra_idx },
+        }, self.allocator);
+    }
+
+    /// Parse dot access: `expr.identifier` -> field_access node.
+    fn parseDotAccess(self: *Parser, left: Node.Index) Error!Node.Index {
+        const dot_tok = self.pos;
+        self.advance(); // consume '.'
+
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected identifier after '.'");
+            return error.ParseError;
+        }
+        const field_tok = self.pos;
+        self.advance(); // consume identifier
+
+        return self.ast.addNode(.{
+            .tag = .field_access,
+            .main_token = dot_tok,
+            .data = .{ .lhs = left, .rhs = field_tok },
         }, self.allocator);
     }
 
@@ -787,7 +1122,7 @@ pub const Parser = struct {
             .less, .greater, .less_equal, .greater_equal => .comparison,
             .plus, .minus, .plus_plus => .additive,
             .star, .slash, .percent => .multiplicative,
-            .left_paren => .call,
+            .left_paren, .dot => .call,
             else => .none,
         };
     }
@@ -1659,4 +1994,192 @@ test "parser: fn with zero params" {
     const param_start = r.ast.extra_data.items[extra_idx + 1];
     const param_end = r.ast.extra_data.items[extra_idx + 2];
     try std.testing.expectEqual(@as(u32, 0), param_end - param_start);
+}
+
+// ── Phase 3 Collection Literal Parsing Tests ─────────────────────────
+
+test "parser: empty list literal []" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("[]", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.list_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(data.lhs, data.rhs); // zero elements
+}
+
+test "parser: list literal [1, 2, 3]" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("[1, 2, 3]", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.list_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    const elements = r.ast.extra_data.items[data.lhs..data.rhs];
+    try std.testing.expectEqual(@as(usize, 3), elements.len);
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, elements[0]));
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, elements[1]));
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, elements[2]));
+}
+
+test "parser: list literal with trailing comma" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("[1, 2,]", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.list_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    const elements = r.ast.extra_data.items[data.lhs..data.rhs];
+    try std.testing.expectEqual(@as(usize, 2), elements.len);
+}
+
+test "parser: empty map literal {}" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("{}", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.map_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(data.lhs, data.rhs); // zero pairs
+}
+
+test "parser: map literal with string keys" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned(
+        \\{"a": 1, "b": 2}
+    , allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.map_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    const pairs = r.ast.extra_data.items[data.lhs..data.rhs];
+    // 2 pairs * 2 (key + value) = 4
+    try std.testing.expectEqual(@as(usize, 4), pairs.len);
+    try std.testing.expectEqual(Node.Tag.string_literal, nodeTag(&r.ast, pairs[0])); // key "a"
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, pairs[1])); // value 1
+}
+
+test "parser: record literal {name: expr}" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned(
+        \\{name: "alice", age: 30}
+    , allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.record_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    const pairs = r.ast.extra_data.items[data.lhs..data.rhs];
+    // 2 fields * 2 (name_token + value_node) = 4
+    try std.testing.expectEqual(@as(usize, 4), pairs.len);
+}
+
+test "parser: record spread {..base, field: val}" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("{..r, name: 42}", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.record_spread, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    // lhs = base record node
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, data.lhs));
+    // rhs = extra_idx pointing to override start/end
+    const extra_idx = data.rhs;
+    const override_start = r.ast.extra_data.items[extra_idx];
+    const override_end = r.ast.extra_data.items[extra_idx + 1];
+    // 1 override * 2 (name_token + value_node) = 2
+    try std.testing.expectEqual(@as(u32, 2), override_end - override_start);
+}
+
+test "parser: grouped expression (expr) still works" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("(42)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.grouped_expr, nodeTag(&r.ast, expr));
+    const inner = nodeData(&r.ast, expr).lhs;
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, inner));
+}
+
+test "parser: tuple literal (1, 2)" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("(1, 2)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.tuple_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    const elements = r.ast.extra_data.items[data.lhs..data.rhs];
+    try std.testing.expectEqual(@as(usize, 2), elements.len);
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, elements[0]));
+    try std.testing.expectEqual(Node.Tag.int_literal, nodeTag(&r.ast, elements[1]));
+}
+
+test "parser: single-element tuple with trailing comma (expr,)" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("(42,)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.tuple_literal, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    const elements = r.ast.extra_data.items[data.lhs..data.rhs];
+    try std.testing.expectEqual(@as(usize, 1), elements.len);
+}
+
+test "parser: dot access expr.field" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("x.y", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.field_access, nodeTag(&r.ast, expr));
+    const data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, data.lhs)); // x
+    // data.rhs is the token index for "y"
+    const field_name = r.ast.tokenSlice(data.rhs);
+    try std.testing.expectEqualStrings("y", field_name);
+}
+
+test "parser: chained dot access a.b.c" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("a.b.c", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    // Top level: field_access(field_access(a, b), c)
+    try std.testing.expectEqual(Node.Tag.field_access, nodeTag(&r.ast, expr));
+    const outer = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.field_access, nodeTag(&r.ast, outer.lhs));
+    const field_name = r.ast.tokenSlice(outer.rhs);
+    try std.testing.expectEqualStrings("c", field_name);
+}
+
+test "parser: block expression still works with { statements }" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("{ let x = 1 }", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, expr));
 }
