@@ -168,6 +168,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const stream_mod_build = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/stream.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+        },
+    });
+
+    // Wire obj_mod to import stream for ObjStream/StreamState.
+    obj_mod.addImport("stream", stream_mod_build);
+
+    // Wire gc_nursery and gc_oldgen to import stream for GC traversal.
+    gc_nursery_mod.addImport("stream", stream_mod_build);
+    gc_oldgen_mod.addImport("stream", stream_mod_build);
+
     const builtins_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib/builtins.zig"),
         .target = target,
@@ -175,6 +192,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "value", .module = value_mod },
             .{ .name = "obj", .module = obj_mod },
+            .{ .name = "stream", .module = stream_mod_build },
         },
     });
 
@@ -310,6 +328,7 @@ pub fn build(b: *std.Build) void {
         parser_mod,
         compiler_mod,
         builtins_mod,
+        stream_mod_build,
         vm_mod,
     };
 

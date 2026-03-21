@@ -397,6 +397,9 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
                     try writer.writeByte(')');
                 }
             },
+            .stream => {
+                try writer.writeAll("<stream>");
+            },
         }
     } else {
         try writer.writeAll("<unknown>");

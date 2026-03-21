@@ -369,6 +369,9 @@ pub const Value = struct {
                         try writer.writeByte(')');
                     }
                 },
+                .stream => {
+                    try writer.writeAll("<stream>");
+                },
             }
         } else {
             try writer.writeAll("<unknown>");

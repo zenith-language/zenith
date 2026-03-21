@@ -6,6 +6,7 @@ const chunk_mod = @import("chunk");
 const Chunk = chunk_mod.Chunk;
 const intern_mod = @import("intern");
 const InternTable = intern_mod.InternTable;
+const stream_mod = @import("stream");
 
 /// Object type tag for heap-allocated values.
 pub const ObjType = enum(u8) {
@@ -21,6 +22,7 @@ pub const ObjType = enum(u8) {
     tuple,
     record,
     adt,
+    stream,
 };
 
 /// Common header for all heap-allocated objects.
@@ -124,6 +126,12 @@ pub const Obj = struct {
                 const a = ObjAdt.fromObj(self);
                 allocator.free(a.payload);
                 allocator.destroy(a);
+            },
+            .stream => {
+                const s = ObjStream.fromObj(self);
+                s.state.deinit(allocator);
+                allocator.destroy(s.state);
+                allocator.destroy(s);
             },
         }
     }
@@ -481,6 +489,25 @@ pub const ObjAdt = struct {
     }
 
     pub fn fromObj(o: *Obj) *ObjAdt {
+        return @fieldParentPtr("obj", o);
+    }
+};
+
+/// Heap-allocated stream object (pull-based lazy iterator).
+pub const ObjStream = struct {
+    obj: Obj,
+    state: *stream_mod.StreamState,
+
+    pub fn create(allocator: Allocator, state: *stream_mod.StreamState) !*ObjStream {
+        const s = try allocator.create(ObjStream);
+        s.* = .{
+            .obj = .{ .obj_type = .stream },
+            .state = state,
+        };
+        return s;
+    }
+
+    pub fn fromObj(o: *Obj) *ObjStream {
         return @fieldParentPtr("obj", o);
     }
 };

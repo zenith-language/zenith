@@ -11,6 +11,7 @@ const ObjMap = obj_mod.ObjMap;
 const ObjTuple = obj_mod.ObjTuple;
 const ObjRecord = obj_mod.ObjRecord;
 const ObjAdt = obj_mod.ObjAdt;
+const ObjStream = obj_mod.ObjStream;
 const value_mod = @import("value");
 const Value = value_mod.Value;
 const gc_mod = @import("gc");
@@ -191,6 +192,10 @@ pub const NurseryCollector = struct {
                 for (a.payload) |*val| {
                     try self.processValue(val, gc);
                 }
+            },
+            .stream => {
+                const s = ObjStream.fromObj(obj);
+                try s.state.traceGCRefs(self, gc);
             },
         }
     }
