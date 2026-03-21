@@ -190,6 +190,8 @@ pub const Compiler = struct {
         "sum", "reduce", "first", "last", "each", "min", "max",
         // Stream error handling (81)
         "partition_result",
+        // Json module (82-83)
+        "Json.decode", "Json.encode",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-14 to match
@@ -866,7 +868,7 @@ pub const Compiler = struct {
 
     /// Known module names for compile-time dot access resolution.
     const module_names = [_][]const u8{
-        "List", "Map", "String", "Result", "Option", "Tuple",
+        "List", "Map", "String", "Result", "Option", "Tuple", "Json",
     };
 
     fn isKnownModule(name: []const u8) bool {

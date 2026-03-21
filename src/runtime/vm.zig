@@ -1043,6 +1043,9 @@ pub const VM = struct {
         if (self.gc != null) {
             builtins_mod.setGCCallbacks(&triggerGCFromBuiltin, &getGCStatsFromBuiltin);
         }
+        if (self.atom_names.items.len > 0) {
+            builtins_mod.setAtomNames(self.atom_names.items);
+        }
         defer builtins_mod.clearVM();
 
         var err_msg: []const u8 = "";

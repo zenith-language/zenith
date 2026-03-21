@@ -60,6 +60,7 @@ const normal_tests = [_]TestCase{
     .{ .name = "streams_basic", .zen_path = "tests/zen/streams_basic.zen", .expected_path = "tests/zen/streams_basic.expected", .is_error_test = false },
     .{ .name = "streams_ops", .zen_path = "tests/zen/streams_ops.zen", .expected_path = "tests/zen/streams_ops.expected", .is_error_test = false },
     .{ .name = "streams_partition", .zen_path = "tests/zen/streams_partition.zen", .expected_path = "tests/zen/streams_partition.expected", .is_error_test = false },
+    .{ .name = "json", .zen_path = "tests/zen/json.zen", .expected_path = "tests/zen/json.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
@@ -449,6 +450,10 @@ test "e2e: streams_ops" {
 
 test "e2e: streams_partition" {
     try runNormalTest(normal_tests[26]);
+}
+
+test "e2e: json" {
+    try runNormalTest(normal_tests[27]);
 }
 
 // ── Phase 3 error tests ──────────────────────────────────────────────────

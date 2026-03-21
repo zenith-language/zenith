@@ -1,0 +1,50 @@
+-- STD-05: Json.decode parses JSON into Zenith types
+
+-- Decode integer
+print(Result.unwrap_or(Json.decode("42"), nil))
+
+-- Decode float
+print(Result.unwrap_or(Json.decode("3.14"), nil))
+
+-- Decode booleans
+print(Result.unwrap_or(Json.decode("true"), nil))
+print(Result.unwrap_or(Json.decode("false"), nil))
+
+-- Decode null -> nil
+print(Result.unwrap_or(Json.decode("null"), 999))
+
+-- Decode array -> List
+print(Result.unwrap_or(Json.decode("[1, 2, 3]"), nil))
+
+-- Decode object -> Map (check it succeeds)
+print(Result.is_ok(Json.decode("{}")))
+
+-- Decode error returns Err
+print(Result.is_err(Json.decode("not json")))
+
+-- STD-05: Json.encode converts Zenith types to JSON
+
+-- Encode integer
+print(Result.unwrap_or(Json.encode(42), nil))
+
+-- Encode list
+print(Result.unwrap_or(Json.encode([1, 2, 3]), nil))
+
+-- Encode booleans and nil
+print(Result.unwrap_or(Json.encode(true), nil))
+print(Result.unwrap_or(Json.encode(nil), nil))
+
+-- Encode string
+print(Result.unwrap_or(Json.encode("hello"), nil))
+
+-- Round-trip: decode(encode(42)) = 42
+print(Result.unwrap_or(Json.decode(Result.unwrap_or(Json.encode(42), "")), nil))
+
+-- Round-trip: decode(encode([1, 2, 3])) = [1, 2, 3]
+print(Result.unwrap_or(Json.decode(Result.unwrap_or(Json.encode([1, 2, 3]), "")), nil))
+
+-- Number auto-detection: "1e10" -> Float
+print(Result.unwrap_or(Json.decode("1e10"), nil))
+
+-- Round-trip: decode(encode(true)) = true
+print(Result.unwrap_or(Json.decode(Result.unwrap_or(Json.encode(true), "")), nil))

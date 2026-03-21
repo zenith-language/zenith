@@ -13,6 +13,7 @@ const ObjStream = obj_mod.ObjStream;
 const ObjRange = obj_mod.ObjRange;
 const stream_mod = @import("stream");
 const StreamState = stream_mod.StreamState;
+const json_mod = @import("json");
 
 /// Error type for native function execution.
 pub const NativeError = error{
@@ -67,6 +68,8 @@ var call_closure_fn: ?CallClosureFn = null;
 var track_obj_fn: ?TrackObjFn = null;
 var trigger_gc_fn: ?TriggerGCFn = null;
 var get_gc_stats_fn: ?GetGCStatsFn = null;
+/// Atom name table, set by the VM for builtins that need atom resolution (e.g. Json.encode).
+var current_atom_names: ?[]const []const u8 = null;
 
 /// Called by the VM before dispatching a builtin function.
 pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {
@@ -81,6 +84,11 @@ pub fn setGCCallbacks(gc_fn: TriggerGCFn, stats_fn: GetGCStatsFn) void {
     get_gc_stats_fn = stats_fn;
 }
 
+/// Set atom names for builtins that need atom resolution (Json.encode).
+pub fn setAtomNames(names: []const []const u8) void {
+    current_atom_names = names;
+}
+
 /// Called by the VM after a builtin returns.
 pub fn clearVM() void {
     current_vm = null;
@@ -88,6 +96,7 @@ pub fn clearVM() void {
     track_obj_fn = null;
     trigger_gc_fn = null;
     get_gc_stats_fn = null;
+    current_atom_names = null;
 }
 
 /// Track an intermediate heap object with the VM (called by builtins that
@@ -281,6 +290,10 @@ pub const builtins = [_]BuiltinDesc{
 
     // ── Stream error handling (index 81) ────────────────────────
     .{ .name = "partition_result", .func = &builtinPartitionResult, .arity_min = 1, .arity_max = 1 },
+
+    // ── Json module (indices 82-83) ──────────────────────────────
+    .{ .name = "Json.decode", .func = &builtinJsonDecode, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "Json.encode", .func = &builtinJsonEncode, .arity_min = 1, .arity_max = 1 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -2151,6 +2164,74 @@ fn builtinPartitionResult(args: []const Value, allocator: Allocator, err_msg: *[
     trackObj(&record.obj);
 
     return Value.fromObj(&record.obj);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Json module ────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+fn builtinJsonDecode(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isString()) {
+        err_msg.* = "Json.decode expects a string argument";
+        return error.RuntimeError;
+    }
+    const str = ObjString.fromObj(args[0].asObj());
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |tfn| {
+            json_mod.setVM(vm_ptr, tfn);
+        }
+    }
+    defer json_mod.clearVM();
+    const result = json_mod.parse(str.bytes, allocator);
+    switch (result) {
+        .ok => |val| {
+            return makeOk(val, allocator);
+        },
+        .err => |e| {
+            const msg_str = try ObjString.create(allocator, e.message, null);
+            trackObj(&msg_str.obj);
+            const names = [_][]const u8{ "message", "position" };
+            const values = [_]Value{
+                Value.fromObj(&msg_str.obj),
+                Value.fromInt(@intCast(@min(e.position, @as(usize, @intCast(std.math.maxInt(i32)))))),
+            };
+            const record = try ObjRecord.create(allocator, &names, &values);
+            trackObj(&record.obj);
+            return makeErr(Value.fromObj(&record.obj), allocator);
+        },
+    }
+}
+
+fn builtinJsonEncode(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = err_msg;
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |tfn| {
+            json_mod.setVM(vm_ptr, tfn);
+        }
+    }
+    defer json_mod.clearVM();
+    if (current_atom_names) |names| {
+        json_mod.setAtomNames(names);
+    }
+    const result = json_mod.emit(args[0], allocator);
+    switch (result) {
+        .ok => |json_bytes| {
+            const json_str = ObjString.create(allocator, json_bytes, null) catch {
+                allocator.free(json_bytes);
+                return error.OutOfMemory;
+            };
+            if (json_str.bytes.ptr != json_bytes.ptr) {
+                allocator.free(json_bytes);
+            }
+            trackObj(&json_str.obj);
+            return makeOk(Value.fromObj(&json_str.obj), allocator);
+        },
+        .err => |msg| {
+            const err_str = try ObjString.create(allocator, msg, null);
+            trackObj(&err_str.obj);
+            return makeErr(Value.fromObj(&err_str.obj), allocator);
+        },
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
