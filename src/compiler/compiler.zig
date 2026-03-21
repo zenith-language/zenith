@@ -1477,30 +1477,199 @@ pub const Compiler = struct {
             },
 
             .pattern_list => {
-                // List pattern: check length and elements.
-                // For now, emit a simplified check.
+                // List pattern [a, b, ..rest]: check length and bind elements.
+                // CONTRACT: dup'd scrutinee on top of stack.
+                // On exit: scrutinee consumed (kept as hidden local), bindings pushed,
+                //          bool result on top.
                 const elements = self.ast.extra_data.items[pat_data.lhs..pat_data.rhs];
-                _ = elements;
-                // Full list pattern matching needs op_list_len, op_get_index, etc.
-                // For Phase 3 core, we support this but with a simpler approach.
-                try self.emitOp(.op_pop, line); // pop dup'd value
-                try self.emitOp(.op_false, line); // placeholder: list patterns need more runtime support
+
+                // Determine if last element is a rest pattern.
+                var has_rest = false;
+                var fixed_count: u32 = @intCast(elements.len);
+                if (elements.len > 0) {
+                    const last_tag = self.ast.nodes.items(.tag)[elements[elements.len - 1]];
+                    if (last_tag == .pattern_rest) {
+                        has_rest = true;
+                        fixed_count = @intCast(elements.len - 1);
+                    }
+                }
+
+                // Step 1: Register scrutinee_dup as hidden local for indexed access.
+                // The dup'd value on the stack becomes this local.
+                const list_slot: u8 = self.local_count;
+                self.locals[self.local_count] = .{ .name = " list", .depth = self.scope_depth, .is_captured = false };
+                self.local_count += 1;
+
+                // Step 2: Check length. Get list len (pops copy, pushes int).
+                try self.emitOp(.op_get_local, line);
+                try self.emitByte(list_slot, line);
+                try self.emitOp(.op_list_len, line);
+                // Stack: [..., len_int]
+
+                // Push the expected fixed count as a constant.
+                try self.emitConstant(Value.fromInt(@intCast(fixed_count)), line);
+                // Stack: [..., len_int, fixed_count]
+
+                var len_fail: u32 = undefined;
+                if (has_rest) {
+                    // Need len >= fixed_count.
+                    // binaryCompare(.lt) pops b=fixed_count, a=len, pushes (len < fixed_count).
+                    // If len < fixed_count, pattern fails.
+                    // We want to jump to fail if len < fixed_count (i.e., result is true).
+                    // op_not inverts: pushes (len >= fixed_count).
+                    // op_jump_if_false jumps when (len >= fixed_count) is false, i.e., len < fixed_count.
+                    try self.emitOp(.op_greater_equal, line); // pushes (len >= fixed_count)
+                    len_fail = try self.emitJump(.op_jump_if_false, line);
+                    try self.emitOp(.op_pop, line); // pop true (len >= fixed_count)
+                } else {
+                    // Exact match: len == fixed_count.
+                    try self.emitOp(.op_equal, line); // pushes (len == fixed_count)
+                    len_fail = try self.emitJump(.op_jump_if_false, line);
+                    try self.emitOp(.op_pop, line); // pop true
+                }
+
+                // Step 3: Bind each fixed element.
+                for (elements[0..fixed_count], 0..) |elem_pat, i| {
+                    const elem_tag = self.ast.nodes.items(.tag)[elem_pat];
+                    // Get element from list by index.
+                    try self.emitOp(.op_get_local, line);
+                    try self.emitByte(list_slot, line);
+                    try self.emitOp(.op_get_index, line);
+                    try self.emitByte(@intCast((i >> 8) & 0xFF), line);
+                    try self.emitByte(@intCast(i & 0xFF), line);
+                    // Stack: [..., element_value]
+
+                    if (elem_tag == .pattern_binding) {
+                        // Bind as local: element_value stays on stack as the local.
+                        const sub_data = self.ast.nodes.items(.data)[elem_pat];
+                        const bind_name = self.ast.tokenSlice(sub_data.lhs);
+                        self.locals[self.local_count] = .{ .name = bind_name, .depth = self.scope_depth, .is_captured = false };
+                        self.local_count += 1;
+                    } else if (elem_tag == .pattern_wildcard) {
+                        try self.emitOp(.op_pop, line); // discard
+                    } else {
+                        // Sub-pattern check (literal, nested, etc.)
+                        try self.compilePatternCheck(elem_pat, line);
+                        const sub_fail = try self.emitJump(.op_jump_if_false, line);
+                        try self.emitOp(.op_pop, line); // pop true
+                        _ = sub_fail; // sub-pattern failure: scope cleanup handles bindings
+                    }
+                }
+
+                // Step 4: Handle rest pattern if present.
+                if (has_rest) {
+                    const rest_pat = elements[elements.len - 1];
+                    const rest_data = self.ast.nodes.items(.data)[rest_pat];
+                    const rest_name = self.ast.tokenSlice(rest_data.lhs);
+                    // Slice from fixed_count to end.
+                    try self.emitOp(.op_get_local, line);
+                    try self.emitByte(list_slot, line);
+                    try self.emitOp(.op_list_slice, line);
+                    try self.emitByte(@intCast((fixed_count >> 8) & 0xFF), line);
+                    try self.emitByte(@intCast(fixed_count & 0xFF), line);
+                    // Bind rest slice as local.
+                    self.locals[self.local_count] = .{ .name = rest_name, .depth = self.scope_depth, .is_captured = false };
+                    self.local_count += 1;
+                }
+
+                // All matched -> push true.
+                try self.emitOp(.op_true, line);
+                const skip_fail = try self.emitJump(.op_jump, line);
+
+                // Fail path: length check failed.
+                try self.patchJump(len_fail);
+                try self.emitOp(.op_pop, line); // pop the false from length check
+                try self.emitOp(.op_false, line);
+
+                try self.patchJump(skip_fail);
             },
 
             .pattern_tuple => {
-                // Tuple pattern check.
-                try self.emitOp(.op_pop, line);
-                try self.emitOp(.op_false, line); // placeholder
+                // Tuple pattern (a, b): extract elements by index and bind.
+                // CONTRACT: dup'd scrutinee on top of stack.
+                const elements = self.ast.extra_data.items[pat_data.lhs..pat_data.rhs];
+
+                // Register scrutinee_dup as hidden local.
+                const tuple_slot: u8 = self.local_count;
+                self.locals[self.local_count] = .{ .name = " tuple", .depth = self.scope_depth, .is_captured = false };
+                self.local_count += 1;
+
+                // Extract and bind each element.
+                for (elements, 0..) |elem_pat, i| {
+                    const elem_tag = self.ast.nodes.items(.tag)[elem_pat];
+                    try self.emitOp(.op_get_local, line);
+                    try self.emitByte(tuple_slot, line);
+                    try self.emitOp(.op_get_index, line);
+                    try self.emitByte(@intCast((i >> 8) & 0xFF), line);
+                    try self.emitByte(@intCast(i & 0xFF), line);
+
+                    if (elem_tag == .pattern_binding) {
+                        const sub_data = self.ast.nodes.items(.data)[elem_pat];
+                        const bind_name = self.ast.tokenSlice(sub_data.lhs);
+                        self.locals[self.local_count] = .{ .name = bind_name, .depth = self.scope_depth, .is_captured = false };
+                        self.local_count += 1;
+                    } else if (elem_tag == .pattern_wildcard) {
+                        try self.emitOp(.op_pop, line);
+                    } else {
+                        try self.compilePatternCheck(elem_pat, line);
+                        const sub_fail = try self.emitJump(.op_jump_if_false, line);
+                        try self.emitOp(.op_pop, line);
+                        _ = sub_fail;
+                    }
+                }
+                try self.emitOp(.op_true, line);
             },
 
             .pattern_record => {
-                // Record pattern check.
-                try self.emitOp(.op_pop, line);
-                try self.emitOp(.op_false, line); // placeholder
+                // Record pattern {name: n, age: a}: extract fields by name and bind.
+                // CONTRACT: dup'd scrutinee on top of stack.
+                // extra_data stores pairs: (name_token_idx, pattern_node_idx).
+                const pairs = self.ast.extra_data.items[pat_data.lhs..pat_data.rhs];
+
+                // Register scrutinee_dup as hidden local.
+                const rec_slot: u8 = self.local_count;
+                self.locals[self.local_count] = .{ .name = " record", .depth = self.scope_depth, .is_captured = false };
+                self.local_count += 1;
+
+                var pi: usize = 0;
+                while (pi < pairs.len) : (pi += 2) {
+                    const field_name_tok = pairs[pi];
+                    const field_pat = pairs[pi + 1];
+                    const field_name = self.ast.tokenSlice(field_name_tok);
+                    const elem_tag = self.ast.nodes.items(.tag)[field_pat];
+
+                    // Push the record onto stack via hidden local, then emit op_get_field.
+                    try self.emitOp(.op_get_local, line);
+                    try self.emitByte(rec_slot, line);
+                    // op_get_field pops object, looks up field name constant, pushes field value.
+                    // Follow the existing field_access pattern: addConstant for name string, emit op_get_field + u16 idx.
+                    const str_obj = try ObjString.create(self.allocator, field_name);
+                    const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+                    try self.emitOp(.op_get_field, line);
+                    try self.emitByte(@intCast((const_idx >> 8) & 0xFF), line);
+                    try self.emitByte(@intCast(const_idx & 0xFF), line);
+                    // Stack: [..., field_value]
+
+                    if (elem_tag == .pattern_binding) {
+                        const sub_data = self.ast.nodes.items(.data)[field_pat];
+                        const bind_name = self.ast.tokenSlice(sub_data.lhs);
+                        self.locals[self.local_count] = .{ .name = bind_name, .depth = self.scope_depth, .is_captured = false };
+                        self.local_count += 1;
+                    } else if (elem_tag == .pattern_wildcard) {
+                        try self.emitOp(.op_pop, line);
+                    } else {
+                        try self.compilePatternCheck(field_pat, line);
+                        const sub_fail = try self.emitJump(.op_jump_if_false, line);
+                        try self.emitOp(.op_pop, line);
+                        _ = sub_fail;
+                    }
+                }
+                try self.emitOp(.op_true, line);
             },
 
             .pattern_rest => {
-                // Rest patterns should be handled as part of list/tuple pattern.
+                // Rest patterns are handled inside pattern_list (step 4).
+                // Standalone pattern_rest should not be reached directly.
                 try self.emitOp(.op_pop, line);
                 try self.emitOp(.op_false, line);
             },
