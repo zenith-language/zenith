@@ -1,0 +1,46 @@
+-- flat_map
+print(range(1, 4) |> flat_map(|x| repeat(x) |> take(2)) |> collect())
+
+-- filter_map
+print(range(1, 6) |> filter_map(|x| {
+  if x > 3 { Option.Some(x * 10) } else { Option.None }
+}) |> collect())
+
+-- scan
+print(range(1, 6) |> scan(0, |acc, x| acc + x) |> collect())
+
+-- distinct
+print(range(1, 4) |> flat_map(|x| repeat(x) |> take(2)) |> distinct() |> collect())
+
+-- zip
+print(range(1, 6) |> zip(range(10, 15)) |> collect())
+
+-- flatten
+print(range(1, 4) |> map(|x| [x, x * 10]) |> flatten() |> collect())
+
+-- tap
+print(range(1, 4) |> tap(|x| x) |> collect())
+
+-- batch
+print(range(1, 6) |> batch(2) |> collect())
+
+-- sum
+print(range(1, 11) |> sum())
+
+-- reduce
+print(range(1, 6) |> reduce(0, |acc, x| acc + x))
+
+-- first
+print(range(1, 6) |> first())
+
+-- last
+print(range(1, 6) |> last())
+
+-- min
+print(range(1, 6) |> min())
+
+-- max
+print(range(1, 6) |> max())
+
+-- each
+range(1, 4) |> each(|x| print(x))

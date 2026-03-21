@@ -2129,6 +2129,7 @@ fn builtinPartitionResult(args: []const Value, allocator: Allocator, err_msg: *[
         .upstream = first,
         .ok_queue = .{},
         .err_queue = .{},
+        .ref_count = 2,
     };
 
     // Create ok stream.

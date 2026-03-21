@@ -1,0 +1,8 @@
+-- ERR-04: partition_result splits Stream(Result) into {ok, err} record
+-- Create a stream of Result values using range + map
+let results = range(1, 6) |> map(|x| {
+  if x % 2 == 0 { Result.Err(x) } else { Result.Ok(x) }
+})
+let parts = results |> partition_result()
+print(parts.ok |> collect())
+print(parts.err |> collect())

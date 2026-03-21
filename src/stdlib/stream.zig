@@ -125,10 +125,12 @@ pub const StreamState = union(enum) {
     };
 
     /// Shared state for partition_result: both ok and err streams reference this.
+    /// ref_count tracks how many streams still hold a reference (starts at 2).
     pub const PartitionState = struct {
         upstream: Value, // NaN-boxed ObjStream pointer
         ok_queue: std.ArrayListUnmanaged(Value),
         err_queue: std.ArrayListUnmanaged(Value),
+        ref_count: u8,
     };
 
     /// Pull the next element from this stream.
@@ -395,11 +397,13 @@ pub const StreamState = union(enum) {
             .distinct_op => |*s| {
                 s.seen.deinit(allocator);
             },
-            .partition_ok, .partition_err => |s| {
-                // Only free shared state once. We use a simple convention:
-                // partition_ok owns the shared state.
-                // But since both may be collected independently, we let GC handle it.
-                _ = s;
+            .partition_ok, .partition_err => |*s| {
+                s.shared.ref_count -= 1;
+                if (s.shared.ref_count == 0) {
+                    s.shared.ok_queue.deinit(allocator);
+                    s.shared.err_queue.deinit(allocator);
+                    allocator.destroy(s.shared);
+                }
             },
             else => {},
         }
