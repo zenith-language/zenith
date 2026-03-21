@@ -13,6 +13,8 @@ const gc_oldgen_mod = @import("gc_oldgen");
 const OldGenCollector = gc_oldgen_mod.OldGenCollector;
 const WriteBarrier = gc_oldgen_mod.WriteBarrier;
 const gc_roots_mod = @import("gc_roots");
+const arena_mod = @import("arena");
+const StageArena = arena_mod.StageArena;
 const vm_mod = @import("vm");
 const VM = vm_mod.VM;
 
@@ -56,6 +58,9 @@ pub const GC = struct {
     old_gen_threshold: usize = 2048, // trigger threshold (initial: 2048 objects)
     old_gen_last_size: usize = 0, // size after last old-gen collection
 
+    // ── Registered arenas ────────────────────────────────────────────
+    arenas: std.ArrayListUnmanaged(*StageArena) = .empty,
+
     // ── VM reference (set when VM starts execution) ──────────────────
     vm: ?*VM = null,
 
@@ -97,6 +102,7 @@ pub const GC = struct {
         self.nursery_collector.deinit(self.backing_allocator);
         self.oldgen_collector.deinit(self.backing_allocator);
         self.write_barrier.deinit(self.backing_allocator);
+        self.arenas.deinit(self.backing_allocator);
 
         // Free all nursery objects.
         var obj = self.nursery_objects;
@@ -131,6 +137,21 @@ pub const GC = struct {
         obj.next = self.old_objects;
         self.old_objects = obj;
         self.old_gen_size += 1;
+    }
+
+    /// Register a stage arena with the GC for root scanning.
+    pub fn registerArena(self: *GC, arena: *StageArena) !void {
+        try self.arenas.append(self.backing_allocator, arena);
+    }
+
+    /// Unregister a stage arena from the GC.
+    pub fn unregisterArena(self: *GC, arena: *StageArena) void {
+        for (self.arenas.items, 0..) |a, i| {
+            if (a == arena) {
+                _ = self.arenas.swapRemove(i);
+                return;
+            }
+        }
     }
 
     /// Get total heap size (bytes currently allocated).

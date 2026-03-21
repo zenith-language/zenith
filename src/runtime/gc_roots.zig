@@ -9,6 +9,8 @@ const gc_nursery_mod = @import("gc_nursery");
 const NurseryCollector = gc_nursery_mod.NurseryCollector;
 const gc_oldgen_mod = @import("gc_oldgen");
 const OldGenCollector = gc_oldgen_mod.OldGenCollector;
+const arena_mod = @import("arena");
+const StageArena = arena_mod.StageArena;
 const vm_mod = @import("vm");
 const VM = vm_mod.VM;
 
@@ -49,6 +51,13 @@ pub fn scanRoots(nursery: *NurseryCollector, gc: *GC, vm: *VM) !void {
         }
         uv = u.next;
     }
+
+    // 4. Arena GC references: arena objects may hold references to GC objects.
+    for (gc.arenas.items) |arena| {
+        for (arena.gc_refs.items) |*ref| {
+            try nursery.processValue(ref, gc);
+        }
+    }
 }
 
 /// Scan all GC roots for old-gen collection.
@@ -76,6 +85,13 @@ pub fn scanRootsForOldGen(oldgen: *OldGenCollector, gc: *GC, vm: *VM) !void {
             try oldgen.processValue(&u.closed, gc);
         }
         uv = u.next;
+    }
+
+    // 4. Arena GC references: arena objects may hold references to GC objects.
+    for (gc.arenas.items) |arena| {
+        for (arena.gc_refs.items) |*ref| {
+            try oldgen.processValue(ref, gc);
+        }
     }
 }
 

@@ -62,6 +62,16 @@ pub fn build(b: *std.Build) void {
     obj_mod.addImport("value", value_mod);
     obj_mod.addImport("chunk", chunk_mod);
 
+    const arena_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/arena.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+        },
+    });
+
     const gc_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/gc.zig"),
         .target = target,
@@ -69,6 +79,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "obj", .module = obj_mod },
             .{ .name = "intern", .module = intern_mod },
+            .{ .name = "arena", .module = arena_mod },
         },
     });
 
@@ -191,6 +202,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "gc", .module = gc_mod },
             .{ .name = "gc_nursery", .module = gc_nursery_mod },
             .{ .name = "gc_oldgen", .module = gc_oldgen_mod },
+            .{ .name = "arena", .module = arena_mod },
             .{ .name = "vm", .module = vm_mod },
         },
     });
@@ -283,6 +295,7 @@ pub fn build(b: *std.Build) void {
         token_mod,
         memory_mod,
         intern_mod,
+        arena_mod,
         gc_mod,
         gc_nursery_mod,
         gc_oldgen_mod,
