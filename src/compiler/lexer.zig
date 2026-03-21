@@ -69,7 +69,13 @@ pub const Lexer = struct {
             '[' => try self.addToken(.left_bracket, allocator),
             ']' => try self.addToken(.right_bracket, allocator),
             ',' => try self.addToken(.comma, allocator),
-            '.' => try self.addToken(.dot, allocator),
+            '.' => {
+                if (self.match('.')) {
+                    try self.addToken(.dot_dot, allocator);
+                } else {
+                    try self.addToken(.dot, allocator);
+                }
+            },
             ';' => try self.addToken(.semicolon, allocator),
             '*' => try self.addToken(.star, allocator),
             '%' => try self.addToken(.percent, allocator),
@@ -86,6 +92,8 @@ pub const Lexer = struct {
                 if (self.match('-')) {
                     // Line comment: skip to end of line.
                     self.skipLineComment();
+                } else if (self.match('>')) {
+                    try self.addToken(.arrow, allocator);
                 } else {
                     try self.addToken(.minus, allocator);
                 }
@@ -567,12 +575,12 @@ test "lexer: keyword vs identifier" {
 }
 
 test "lexer: all keywords" {
-    const src = "let if else while for in and or not fn true false nil match type with return break continue import";
+    const src = "let if else while for in and or not fn true false nil match type with return break continue import when";
     try expectTags(src, &.{
         .kw_let, .kw_if, .kw_else, .kw_while, .kw_for, .kw_in,
         .kw_and, .kw_or, .kw_not, .kw_fn, .kw_true, .kw_false,
         .kw_nil, .kw_match, .kw_type, .kw_with, .kw_return,
-        .kw_break, .kw_continue, .kw_import, .eof,
+        .kw_break, .kw_continue, .kw_import, .kw_when, .eof,
     });
 }
 

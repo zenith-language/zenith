@@ -146,6 +146,31 @@ pub const Value = struct {
         return self.isObjType(.function);
     }
 
+    /// Returns true if this value is a list object.
+    pub fn isList(self: Value) bool {
+        return self.isObjType(.list);
+    }
+
+    /// Returns true if this value is a map object.
+    pub fn isMap(self: Value) bool {
+        return self.isObjType(.map);
+    }
+
+    /// Returns true if this value is a tuple object.
+    pub fn isTuple(self: Value) bool {
+        return self.isObjType(.tuple);
+    }
+
+    /// Returns true if this value is a record object.
+    pub fn isRecord(self: Value) bool {
+        return self.isObjType(.record);
+    }
+
+    /// Returns true if this value is an ADT object.
+    pub fn isAdt(self: Value) bool {
+        return self.isObjType(.adt);
+    }
+
     // ── Decoders ───────────────────────────────────────────────────────
 
     pub fn asFloat(self: Value) f64 {
@@ -277,6 +302,60 @@ pub const Value = struct {
                 },
                 .upvalue => {
                     try writer.writeAll("<upvalue>");
+                },
+                .list => {
+                    const lst = obj_mod.ObjList.fromObj(obj_ptr);
+                    try writer.writeByte('[');
+                    for (lst.items.items, 0..) |item, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try item.format("", .{}, writer);
+                    }
+                    try writer.writeByte(']');
+                },
+                .map => {
+                    const m = obj_mod.ObjMap.fromObj(obj_ptr);
+                    try writer.writeByte('{');
+                    var it = m.entries.iterator();
+                    var first = true;
+                    while (it.next()) |entry| {
+                        if (!first) try writer.writeAll(", ");
+                        first = false;
+                        try entry.key_ptr.*.format("", .{}, writer);
+                        try writer.writeAll(": ");
+                        try entry.value_ptr.*.format("", .{}, writer);
+                    }
+                    try writer.writeByte('}');
+                },
+                .tuple => {
+                    const t = obj_mod.ObjTuple.fromObj(obj_ptr);
+                    try writer.writeByte('(');
+                    for (t.fields, 0..) |field, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try field.format("", .{}, writer);
+                    }
+                    try writer.writeByte(')');
+                },
+                .record => {
+                    const rec = obj_mod.ObjRecord.fromObj(obj_ptr);
+                    try writer.writeAll("{");
+                    for (0..rec.field_count) |i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try writer.print("{s}: ", .{rec.field_names[i]});
+                        try rec.field_values[i].format("", .{}, writer);
+                    }
+                    try writer.writeAll("}");
+                },
+                .adt => {
+                    const a = obj_mod.ObjAdt.fromObj(obj_ptr);
+                    try writer.print("ADT({d}.{d})", .{ a.type_id, a.variant_idx });
+                    if (a.payload.len > 0) {
+                        try writer.writeByte('(');
+                        for (a.payload, 0..) |p, i| {
+                            if (i > 0) try writer.writeAll(", ");
+                            try p.format("", .{}, writer);
+                        }
+                        try writer.writeByte(')');
+                    }
                 },
             }
         } else {

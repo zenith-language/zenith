@@ -14,6 +14,11 @@ pub const ObjType = enum(u8) {
     function,
     closure,
     upvalue,
+    list,
+    map,
+    tuple,
+    record,
+    adt,
 };
 
 /// Common header for all heap-allocated objects.
@@ -65,6 +70,32 @@ pub const Obj = struct {
                 const uv = ObjUpvalue.fromObj(self);
                 allocator.destroy(uv);
             },
+            .list => {
+                const lst = ObjList.fromObj(self);
+                lst.items.deinit(allocator);
+                allocator.destroy(lst);
+            },
+            .map => {
+                const m = ObjMap.fromObj(self);
+                m.entries.deinit(allocator);
+                allocator.destroy(m);
+            },
+            .tuple => {
+                const t = ObjTuple.fromObj(self);
+                allocator.free(t.fields);
+                allocator.destroy(t);
+            },
+            .record => {
+                const rec = ObjRecord.fromObj(self);
+                allocator.free(rec.field_names);
+                allocator.free(rec.field_values);
+                allocator.destroy(rec);
+            },
+            .adt => {
+                const a = ObjAdt.fromObj(self);
+                allocator.free(a.payload);
+                allocator.destroy(a);
+            },
         }
     }
 };
@@ -94,7 +125,7 @@ pub const ObjString = struct {
         return @fieldParentPtr("obj", obj);
     }
 
-    fn hashBytes(data: []const u8) u32 {
+    pub fn hashBytes(data: []const u8) u32 {
         // FNV-1a hash.
         var h: u32 = 2166136261;
         for (data) |byte| {
@@ -268,7 +299,228 @@ pub const ObjUpvalue = struct {
     }
 };
 
+/// Heap-allocated dynamic list (ordered, mutable-length).
+pub const ObjList = struct {
+    obj: Obj,
+    items: std.ArrayListUnmanaged(Value),
+
+    pub fn create(allocator: Allocator) !*ObjList {
+        const lst = try allocator.create(ObjList);
+        lst.* = .{
+            .obj = .{ .obj_type = .list },
+            .items = .empty,
+        };
+        return lst;
+    }
+
+    pub fn fromObj(o: *Obj) *ObjList {
+        return @fieldParentPtr("obj", o);
+    }
+};
+
+/// Context for hashing and comparing Values as map keys.
+pub const ValueContext = struct {
+    pub fn hash(_: ValueContext, v: Value) u32 {
+        // Hash the raw u64 bits using FNV-1a for non-string types.
+        // For strings, hash the string bytes for content equality.
+        if (v.isObj() and v.asObj().obj_type == .string) {
+            const str = ObjString.fromObj(v.asObj());
+            return ObjString.hashBytes(str.bytes);
+        }
+        // FNV-1a on the raw u64 bits.
+        const bits = v.bits;
+        var h: u32 = 2166136261;
+        inline for (0..8) |i| {
+            h ^= @as(u32, @truncate(bits >> @intCast(i * 8)));
+            h *%= 16777619;
+        }
+        return h;
+    }
+
+    pub fn eql(_: ValueContext, a: Value, b: Value, _: usize) bool {
+        return Value.eql(a, b);
+    }
+};
+
+/// Heap-allocated ordered hash map (preserves insertion order).
+pub const ObjMap = struct {
+    obj: Obj,
+    entries: std.ArrayHashMapUnmanaged(Value, Value, ValueContext, true),
+
+    pub fn create(allocator: Allocator) !*ObjMap {
+        const m = try allocator.create(ObjMap);
+        m.* = .{
+            .obj = .{ .obj_type = .map },
+            .entries = .{},
+        };
+        return m;
+    }
+
+    pub fn fromObj(o: *Obj) *ObjMap {
+        return @fieldParentPtr("obj", o);
+    }
+};
+
+/// Heap-allocated fixed-size tuple.
+pub const ObjTuple = struct {
+    obj: Obj,
+    fields: []Value,
+
+    pub fn create(allocator: Allocator, values: []const Value) !*ObjTuple {
+        const fields = try allocator.alloc(Value, values.len);
+        @memcpy(fields, values);
+
+        const t = try allocator.create(ObjTuple);
+        t.* = .{
+            .obj = .{ .obj_type = .tuple },
+            .fields = fields,
+        };
+        return t;
+    }
+
+    pub fn fromObj(o: *Obj) *ObjTuple {
+        return @fieldParentPtr("obj", o);
+    }
+};
+
+/// Heap-allocated record (named fields).
+pub const ObjRecord = struct {
+    obj: Obj,
+    field_count: u16,
+    field_names: []const []const u8,
+    field_values: []Value,
+
+    pub fn create(allocator: Allocator, names: []const []const u8, values: []const Value) !*ObjRecord {
+        std.debug.assert(names.len == values.len);
+        const n = try allocator.alloc([]const u8, names.len);
+        @memcpy(n, names);
+        const v = try allocator.alloc(Value, values.len);
+        @memcpy(v, values);
+
+        const rec = try allocator.create(ObjRecord);
+        rec.* = .{
+            .obj = .{ .obj_type = .record },
+            .field_count = @intCast(names.len),
+            .field_names = n,
+            .field_values = v,
+        };
+        return rec;
+    }
+
+    pub fn fromObj(o: *Obj) *ObjRecord {
+        return @fieldParentPtr("obj", o);
+    }
+};
+
+/// Heap-allocated algebraic data type variant.
+pub const ObjAdt = struct {
+    obj: Obj,
+    type_id: u16,
+    variant_idx: u16,
+    payload: []Value,
+
+    pub fn create(allocator: Allocator, type_id: u16, variant_idx: u16, values: []const Value) !*ObjAdt {
+        const payload = try allocator.alloc(Value, values.len);
+        @memcpy(payload, values);
+
+        const a = try allocator.create(ObjAdt);
+        a.* = .{
+            .obj = .{ .obj_type = .adt },
+            .type_id = type_id,
+            .variant_idx = variant_idx,
+            .payload = payload,
+        };
+        return a;
+    }
+
+    pub fn fromObj(o: *Obj) *ObjAdt {
+        return @fieldParentPtr("obj", o);
+    }
+};
+
 // ── Tests ──────────────────────────────────────────────────────────────
+
+test "ObjList create, append, and destroy lifecycle" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+
+    try lst.items.append(allocator, Value.fromInt(1));
+    try lst.items.append(allocator, Value.fromInt(2));
+    try lst.items.append(allocator, Value.fromInt(3));
+
+    try std.testing.expectEqual(ObjType.list, lst.obj.obj_type);
+    try std.testing.expectEqual(@as(usize, 3), lst.items.items.len);
+    try std.testing.expectEqual(@as(i32, 2), lst.items.items[1].asInt());
+}
+
+test "ObjList fromObj recovers original" {
+    const allocator = std.testing.allocator;
+    const lst = try ObjList.create(allocator);
+    defer lst.obj.destroy(allocator);
+
+    try lst.items.append(allocator, Value.fromInt(42));
+    const obj_ptr: *Obj = &lst.obj;
+    const recovered = ObjList.fromObj(obj_ptr);
+    try std.testing.expectEqual(@as(usize, 1), recovered.items.items.len);
+}
+
+test "ObjMap create and destroy lifecycle" {
+    const allocator = std.testing.allocator;
+    const m = try ObjMap.create(allocator);
+    defer m.obj.destroy(allocator);
+
+    try m.entries.put(allocator, Value.fromInt(1), Value.fromInt(10));
+    try m.entries.put(allocator, Value.fromInt(2), Value.fromInt(20));
+
+    try std.testing.expectEqual(ObjType.map, m.obj.obj_type);
+    try std.testing.expectEqual(@as(u32, 2), m.entries.count());
+}
+
+test "ObjTuple create and destroy lifecycle" {
+    const allocator = std.testing.allocator;
+    const values = [_]Value{ Value.fromInt(1), Value.fromInt(2), Value.fromInt(3) };
+    const t = try ObjTuple.create(allocator, &values);
+    defer t.obj.destroy(allocator);
+
+    try std.testing.expectEqual(ObjType.tuple, t.obj.obj_type);
+    try std.testing.expectEqual(@as(usize, 3), t.fields.len);
+    try std.testing.expectEqual(@as(i32, 2), t.fields[1].asInt());
+}
+
+test "ObjRecord create and destroy lifecycle" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "x", "y" };
+    const values = [_]Value{ Value.fromInt(10), Value.fromInt(20) };
+    const rec = try ObjRecord.create(allocator, &names, &values);
+    defer rec.obj.destroy(allocator);
+
+    try std.testing.expectEqual(ObjType.record, rec.obj.obj_type);
+    try std.testing.expectEqual(@as(u16, 2), rec.field_count);
+    try std.testing.expectEqualStrings("x", rec.field_names[0]);
+    try std.testing.expectEqual(@as(i32, 20), rec.field_values[1].asInt());
+}
+
+test "ObjAdt create and destroy lifecycle" {
+    const allocator = std.testing.allocator;
+    const payload = [_]Value{Value.fromInt(42)};
+    const a = try ObjAdt.create(allocator, 0, 1, &payload);
+    defer a.obj.destroy(allocator);
+
+    try std.testing.expectEqual(ObjType.adt, a.obj.obj_type);
+    try std.testing.expectEqual(@as(u16, 0), a.type_id);
+    try std.testing.expectEqual(@as(u16, 1), a.variant_idx);
+    try std.testing.expectEqual(@as(usize, 1), a.payload.len);
+    try std.testing.expectEqual(@as(i32, 42), a.payload[0].asInt());
+}
+
+test "ObjAdt nullary variant (empty payload)" {
+    const allocator = std.testing.allocator;
+    const a = try ObjAdt.create(allocator, 0, 0, &[_]Value{});
+    defer a.obj.destroy(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), a.payload.len);
+}
 
 test "ObjFunction create and destroy lifecycle" {
     const allocator = std.testing.allocator;

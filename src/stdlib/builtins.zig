@@ -106,6 +106,73 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
             .upvalue => {
                 try writer.writeAll("<upvalue>");
             },
+            .list => {
+                const lst = obj_mod.ObjList.fromObj(obj_ptr);
+                try writer.writeByte('[');
+                for (lst.items.items, 0..) |item, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    const item_str = try formatValue(item, allocator, atom_names);
+                    defer allocator.free(item_str);
+                    try writer.writeAll(item_str);
+                }
+                try writer.writeByte(']');
+            },
+            .map => {
+                const m = obj_mod.ObjMap.fromObj(obj_ptr);
+                try writer.writeByte('{');
+                var it = m.entries.iterator();
+                var first = true;
+                while (it.next()) |entry| {
+                    if (!first) try writer.writeAll(", ");
+                    first = false;
+                    const k_str = try formatValue(entry.key_ptr.*, allocator, atom_names);
+                    defer allocator.free(k_str);
+                    try writer.writeAll(k_str);
+                    try writer.writeAll(": ");
+                    const v_str = try formatValue(entry.value_ptr.*, allocator, atom_names);
+                    defer allocator.free(v_str);
+                    try writer.writeAll(v_str);
+                }
+                try writer.writeByte('}');
+            },
+            .tuple => {
+                const t = obj_mod.ObjTuple.fromObj(obj_ptr);
+                try writer.writeByte('(');
+                for (t.fields, 0..) |field, i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    const f_str = try formatValue(field, allocator, atom_names);
+                    defer allocator.free(f_str);
+                    try writer.writeAll(f_str);
+                }
+                try writer.writeByte(')');
+            },
+            .record => {
+                const rec = obj_mod.ObjRecord.fromObj(obj_ptr);
+                try writer.writeAll("{");
+                for (0..rec.field_count) |i| {
+                    if (i > 0) try writer.writeAll(", ");
+                    try writer.writeAll(rec.field_names[i]);
+                    try writer.writeAll(": ");
+                    const v_str = try formatValue(rec.field_values[i], allocator, atom_names);
+                    defer allocator.free(v_str);
+                    try writer.writeAll(v_str);
+                }
+                try writer.writeAll("}");
+            },
+            .adt => {
+                const a = obj_mod.ObjAdt.fromObj(obj_ptr);
+                try writer.print("ADT({d}.{d})", .{ a.type_id, a.variant_idx });
+                if (a.payload.len > 0) {
+                    try writer.writeByte('(');
+                    for (a.payload, 0..) |p, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        const p_str = try formatValue(p, allocator, atom_names);
+                        defer allocator.free(p_str);
+                        try writer.writeAll(p_str);
+                    }
+                    try writer.writeByte(')');
+                }
+            },
         }
     } else {
         try writer.writeAll("<unknown>");

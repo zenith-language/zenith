@@ -27,6 +27,8 @@ pub const Tag = enum(u8) {
     greater_equal, // >=
     pipe, // | (lambda param delimiter)
     pipe_greater, // |>
+    arrow, // ->
+    dot_dot, // ..
 
     // ── Punctuation ────────────────────────────────────────────────────
     left_paren, // (
@@ -61,6 +63,7 @@ pub const Tag = enum(u8) {
     kw_break,
     kw_continue,
     kw_import,
+    kw_when,
 
     // ── Comments ───────────────────────────────────────────────────────
     line_comment, // -- ...
@@ -112,6 +115,7 @@ pub fn keyword(text: []const u8) ?Tag {
         .{ "break", .kw_break },
         .{ "continue", .kw_continue },
         .{ "import", .kw_import },
+        .{ "when", .kw_when },
     });
     return map.get(text);
 }
@@ -140,6 +144,7 @@ test "keyword lookup resolves all keywords" {
         .{ "break", Tag.kw_break },
         .{ "continue", Tag.kw_continue },
         .{ "import", Tag.kw_import },
+        .{ "when", Tag.kw_when },
     };
 
     inline for (cases) |case| {
@@ -207,6 +212,8 @@ test "Tag enum has all required token types" {
         .greater_equal,
         .pipe,
         .pipe_greater,
+        .arrow,
+        .dot_dot,
         .left_paren,
         .right_paren,
         .left_brace,
@@ -237,6 +244,7 @@ test "Tag enum has all required token types" {
         .kw_break,
         .kw_continue,
         .kw_import,
+        .kw_when,
         .line_comment,
         .block_comment,
         .eof,
