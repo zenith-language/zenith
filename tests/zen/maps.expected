@@ -1,0 +1,13 @@
+{name: alice, age: 30}
+Option.Some(alice)
+Option.None
+Option.Some(31)
+Option.Some(30)
+Option.None
+[name, age]
+[alice, 30]
+Option.Some(99)
+Option.Some(2)
+true
+{}
+0

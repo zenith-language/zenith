@@ -1,0 +1,7 @@
+(10, 20)
+(42)
+42
+Option.Some(10)
+Option.Some(20)
+Option.None
+(hello, 42, true)

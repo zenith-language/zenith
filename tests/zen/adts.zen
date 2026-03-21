@@ -1,0 +1,25 @@
+-- ADT declaration
+type Color = | Red | Green | Blue | Hex(String)
+
+-- Nullary constructor
+let c1 = Color.Red
+print(c1)
+
+-- Constructor with payload
+let c2 = Color.Hex("#ff0000")
+print(c2)
+
+-- Different ADT types are distinct
+type Shape = | Circle(Float) | Rect(Float, Float)
+let s = Shape.Circle(5.0)
+print(s)
+print(Shape.Rect(3.0, 4.0))
+
+-- Recursive ADT
+type IntList = | Empty | Cons(Int, IntList)
+let xs = IntList.Cons(1, IntList.Cons(2, IntList.Empty))
+print(xs)
+
+-- Equality: same type same variant
+print(Color.Red == Color.Red)
+print(Color.Red == Color.Green)

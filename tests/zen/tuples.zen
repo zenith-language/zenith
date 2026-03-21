@@ -1,0 +1,20 @@
+-- Tuple literal
+let point = (10, 20)
+print(point)
+
+-- Single-element tuple (trailing comma)
+let single = (42,)
+print(single)
+
+-- Grouped expr is NOT a tuple
+let grouped = (42)
+print(grouped)
+
+-- Tuple.get returns Option
+print(Tuple.get(point, 0))
+print(Tuple.get(point, 1))
+print(Tuple.get(point, 5))
+
+-- Heterogeneous tuple
+let mixed = ("hello", 42, true)
+print(mixed)

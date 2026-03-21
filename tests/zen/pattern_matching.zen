@@ -1,0 +1,49 @@
+-- Literal pattern matching with guards
+let grade = match 95
+  | 100 -> "perfect"
+  | n when n >= 90 -> "A"
+  | n when n >= 80 -> "B"
+  | _ -> "below B"
+print(grade)
+
+-- ADT pattern matching
+type Shape = | Circle(Float) | Rect(Float, Float)
+
+let area = fn(s) {
+  match s
+    | Shape.Circle(r) -> 3.14159 * r * r
+    | Shape.Rect(w, h) -> w * h
+}
+print(area(Shape.Circle(5.0)))
+print(area(Shape.Rect(3.0, 4.0)))
+
+-- Wildcard
+let describe = fn(x) {
+  match x
+    | 0 -> "zero"
+    | _ -> "nonzero"
+}
+print(describe(0))
+print(describe(42))
+
+-- Variable binding with Option
+let extract = fn(opt) {
+  match opt
+    | Option.Some(v) -> v
+    | Option.None -> "nothing"
+}
+print(extract(Option.Some("hello")))
+print(extract(Option.None))
+
+-- Match is an expression
+let x = match true | true -> 1 | false -> 0
+print(x)
+
+-- Guard with complex condition
+let classify = fn(n) {
+  match n
+    | x when x > 0 -> "positive"
+    | _ -> "non-positive"
+}
+print(classify(5))
+print(classify(-1))

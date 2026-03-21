@@ -1104,8 +1104,17 @@ pub const Compiler = struct {
     fn compileMatchExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         const line = self.getLine(node_idx);
 
-        // Compile scrutinee -- leave on stack.
+        // Open a match scope for the scrutinee.
+        self.beginScope();
+
+        // Compile scrutinee -- leave on stack as a hidden local.
         try self.compileNode(node_data.lhs);
+        // Register scrutinee as a hidden local so that pattern bindings
+        // get correct stack slot indices, and we can overwrite it with
+        // the match result via op_set_local.
+        const scrutinee_slot: u8 = self.local_count;
+        self.locals[self.local_count] = .{ .name = " match", .depth = self.scope_depth, .is_captured = false };
+        self.local_count += 1;
 
         // Get arm node indices from extra_data.
         const arms_extra = node_data.rhs;
@@ -1165,67 +1174,91 @@ pub const Compiler = struct {
 
             // -- Emit pattern check for this arm --
 
-            // Duplicate scrutinee for pattern test.
-            try self.emitOp(.op_dup, line);
+            // Push a copy of scrutinee for pattern test.
+            try self.emitOp(.op_get_local, line);
+            try self.emitByte(scrutinee_slot, line);
 
             // Open a new scope for pattern bindings.
             self.beginScope();
+            const locals_before_pat = self.local_count;
 
-            // Compile pattern check -- pushes true/false.
+            // Compile pattern check -- consumes dup'd scrutinee, pushes
+            // optional bindings + true/false.
+            // CONTRACT: On the FALSE path from compilePatternCheck, the pattern
+            // check has already cleaned up all intermediate values. Only [false]
+            // is on the stack (no arm-scope locals pushed).
+            // On the TRUE path, arm-scope locals (bindings) may exist under [true].
             try self.compilePatternCheck(pattern_idx, line);
+
+            const locals_after_pat = self.local_count;
+            const pat_binding_count = locals_after_pat - locals_before_pat;
 
             // If guard exists, AND the guard with the pattern check result.
             if (guard_idx) |gidx| {
-                // Pattern check result is on stack (true/false).
-                // If false, skip the guard.
                 const skip_guard = try self.emitJump(.op_jump_if_false, line);
-                try self.emitOp(.op_pop, line); // pop pattern check result (true)
-                try self.compileNode(gidx); // compile guard expression
-                try self.patchJump(skip_guard); // false path skips guard, leaves false on stack
+                try self.emitOp(.op_pop, line); // pop true
+                try self.compileNode(gidx); // compile guard
+                // If guard is false, we need to clean up pattern bindings
+                // before falling through to the failure path.
+                const guard_ok = try self.emitJump(.op_jump_if_false, line);
+                // Guard succeeded -- continue with true on stack.
+                try self.emitOp(.op_pop, line); // pop guard true
+                try self.emitOp(.op_true, line); // push combined true
+                const guard_done = try self.emitJump(.op_jump, line);
+
+                // Guard failed: pop guard false, pop bindings, push false.
+                try self.patchJump(guard_ok);
+                try self.emitOp(.op_pop, line); // pop guard false
+                for (0..pat_binding_count) |_| {
+                    try self.emitOp(.op_pop, line); // pop binding
+                }
+                try self.emitOp(.op_false, line); // push false
+
+                const guard_fail_done = try self.emitJump(.op_jump, line);
+
+                // Pattern failed: skip guard jumps here. false is on stack.
+                try self.patchJump(skip_guard);
+
+                try self.patchJump(guard_done);
+                try self.patchJump(guard_fail_done);
             }
 
             // Jump to next arm if pattern (and guard) failed.
+            // At this point: SUCCESS path has [bindings..., true]
+            //                FAILURE path has [false] (bindings already cleaned up)
             const next_arm = try self.emitJump(.op_jump_if_false, line);
             try self.emitOp(.op_pop, line); // pop true result
 
-            // Pop the duplicated scrutinee (pattern matched).
-            try self.emitOp(.op_pop, line);
-
+            // === SUCCESS PATH ===
             // Compile arm body.
             try self.compileNode(body_idx);
 
-            // Jump to end of match.
+            // Save result into scrutinee slot (overwriting the scrutinee).
+            try self.emitOp(.op_set_local, line);
+            try self.emitByte(scrutinee_slot, line);
+            try self.emitOp(.op_pop, line); // pop result copy
+
+            // Pop arm-scope bindings (success path).
+            for (0..pat_binding_count) |_| {
+                try self.emitOp(.op_pop, line);
+            }
+
+            // Jump to end of match. Stack: [result-in-S-slot]
             const end_jump = try self.emitJump(.op_jump, line);
             try end_jumps.append(self.allocator, end_jump);
 
-            // -- next_arm: --
+            // === FAILURE PATH ===
             try self.patchJump(next_arm);
             try self.emitOp(.op_pop, line); // pop false result
+            // No binding pops needed -- pattern check or guard cleanup already handled it.
 
-            // End arm scope (pop any pattern bindings).
-            var arm_pop_count: u32 = 0;
-            var li = self.local_count;
-            while (li > 0 and self.locals[li - 1].depth >= self.scope_depth) {
-                arm_pop_count += 1;
-                li -= 1;
-            }
-            if (arm_pop_count > 0) {
-                self.endScopeWithPops(arm_pop_count, line);
-            } else {
-                self.scope_depth -= 1;
-            }
+            // Adjust compiler state: remove arm-scope locals.
+            self.local_count = locals_before_pat;
+            self.scope_depth -= 1;
         }
 
         // -- match_fail: runtime panic if no arm matched --
-        // Pop the scrutinee (still on stack from last failed arm dup).
-        try self.emitOp(.op_pop, line);
-
-        // Emit a runtime error: push an error message and call panic.
-        // Simple approach: emit an error constant and call panic builtin.
-        // Even simpler: just emit a special error.
-        // For now, push nil to maintain stack balance and emit a runtime error marker.
-        // The plan says "runtime panics when no match arm succeeds".
-        // We'll use op_get_builtin(panic) + call with a message.
+        // Scrutinee is still in its hidden local slot. Overwrite with panic result.
         if (self.resolveBuiltin("panic")) |panic_idx| {
             try self.emitOp(.op_get_builtin, line);
             try self.emitByte(panic_idx, line);
@@ -1233,14 +1266,29 @@ pub const Compiler = struct {
             try self.emitConstant(Value.fromObj(&msg.obj), line);
             try self.emitOp(.op_call, line);
             try self.emitByte(1, line);
+            // panic result overwrites scrutinee slot.
+            try self.emitOp(.op_set_local, line);
+            try self.emitByte(scrutinee_slot, line);
+            try self.emitOp(.op_pop, line);
         } else {
-            try self.emitOp(.op_nil, line); // fallback: push nil as match result
+            // Fallback: overwrite scrutinee with nil.
+            try self.emitOp(.op_nil, line);
+            try self.emitOp(.op_set_local, line);
+            try self.emitByte(scrutinee_slot, line);
+            try self.emitOp(.op_pop, line);
         }
 
         // -- end_match: patch all arm end jumps --
         for (end_jumps.items) |ej| {
             try self.patchJump(ej);
         }
+
+        // End the match scope. The scrutinee slot now holds the match result.
+        // We DON'T want to pop it -- the match expression's result should
+        // stay on the stack. So just adjust local_count and scope_depth
+        // without emitting pops.
+        self.local_count -= 1; // remove hidden scrutinee local
+        self.scope_depth -= 1;
 
         // -- Exhaustiveness warning --
         if (!has_catch_all) {
@@ -1301,6 +1349,9 @@ pub const Compiler = struct {
 
             .pattern_adt => {
                 // Check tag match and optionally destructure payload.
+                // CONTRACT: dup'd scrutinee is on top of stack on entry.
+                // On exit: dup'd scrutinee is CONSUMED, bindings (if any) are pushed,
+                // bool result is on top. This is consistent with wildcard/literal.
                 const type_tok = self.ast.extra_data.items[pat_data.lhs];
                 const variant_tok = self.ast.extra_data.items[pat_data.lhs + 1];
                 const type_name = self.ast.tokenSlice(type_tok);
@@ -1325,6 +1376,7 @@ pub const Compiler = struct {
 
                     if (found_variant) |vidx| {
                         // Emit op_check_tag: peeks top, pushes bool.
+                        // Stack: [S_dup] -> [S_dup, bool]
                         try self.emitOp(.op_check_tag, line);
                         try self.emitByte(@intCast((tid >> 8) & 0xFF), line);
                         try self.emitByte(@intCast(tid & 0xFF), line);
@@ -1332,25 +1384,31 @@ pub const Compiler = struct {
                         try self.emitByte(@intCast(vidx & 0xFF), line);
 
                         if (sub_pats.len > 0) {
-                            // If tag check fails, skip sub-pattern checks.
+                            // Stack: [S_dup, bool]
+                            // If tag check fails, skip to cleanup.
                             const skip_sub = try self.emitJump(.op_jump_if_false, line);
-                            try self.emitOp(.op_pop, line); // pop true
+                            try self.emitOp(.op_pop, line); // pop true -> [S_dup]
 
-                            // For each sub-pattern, extract the field and check.
+                            // Register S_dup as a hidden local so we can access it
+                            // by slot index after bindings are pushed on top.
+                            const adt_slot: u8 = self.local_count;
+                            self.locals[self.local_count] = .{ .name = " adt", .depth = self.scope_depth, .is_captured = false };
+                            self.local_count += 1;
+
+                            // Extract fields into bindings from S_dup.
                             for (sub_pats, 0..) |sub_pat, fi| {
                                 const sub_tag = self.ast.nodes.items(.tag)[sub_pat];
                                 if (sub_tag == .pattern_wildcard) {
-                                    // Skip: don't need to extract.
                                     continue;
                                 }
-                                // Duplicate the ADT value (still dup'd scrutinee on stack).
-                                try self.emitOp(.op_dup, line);
-                                // Extract field.
+                                // Get S_dup by slot (works even with bindings above it).
+                                try self.emitOp(.op_get_local, line);
+                                try self.emitByte(adt_slot, line);
+                                // Extract field (pops ADT copy, pushes field).
                                 try self.emitOp(.op_adt_get_field, line);
                                 try self.emitByte(@intCast(fi), line);
-                                // Check sub-pattern recursively.
                                 if (sub_tag == .pattern_binding) {
-                                    // Bind: the extracted field value is on stack.
+                                    // field_val becomes a local binding.
                                     const sub_data = self.ast.nodes.items(.data)[sub_pat];
                                     const bind_name = self.ast.tokenSlice(sub_data.lhs);
                                     if (self.local_count >= 255) {
@@ -1360,43 +1418,53 @@ pub const Compiler = struct {
                                     self.locals[self.local_count] = .{ .name = bind_name, .depth = self.scope_depth, .is_captured = false };
                                     self.local_count += 1;
                                 } else {
-                                    // Literal/nested pattern check.
+                                    // Literal/nested sub-pattern check on field_val.
                                     try self.compilePatternCheck(sub_pat, line);
-                                    // If sub-check fails, the whole match fails.
                                     const sub_fail = try self.emitJump(.op_jump_if_false, line);
                                     try self.emitOp(.op_pop, line); // pop true
-                                    // Continue to next sub-pattern.
-                                    // At the end, push true.
-                                    // Actually we need to handle the fail jump...
-                                    // For simplicity: if sub fails, jump to a "push false" at end.
-                                    // We'll patch sub_fail to the "push false" section.
-                                    _ = sub_fail;
-                                    // TODO: This is simplified; for now literal sub-patterns work.
+                                    _ = sub_fail; // TODO: patch to false path
                                 }
                             }
 
-                            // All sub-patterns matched: push true.
+                            // All sub-patterns matched. Push true.
+                            // S_dup is still on stack as the hidden local.
+                            // It will be cleaned up with the arm scope bindings.
                             try self.emitOp(.op_true, line);
                             const skip_false = try self.emitJump(.op_jump, line);
 
                             // Tag check failed: patch skip_sub here.
+                            // Stack: [S_dup, false]
                             try self.patchJump(skip_sub);
-                            // Keep the false on stack from op_check_tag.
+                            // Pop false, pop S_dup, push false.
+                            try self.emitOp(.op_pop, line); // pop false -> [S_dup]
+                            try self.emitOp(.op_pop, line); // pop S_dup -> []
+                            try self.emitOp(.op_false, line); // [false]
 
                             try self.patchJump(skip_false);
                         } else {
-                            // No sub-patterns: op_check_tag result is sufficient.
-                            // Pop the dup'd scrutinee if check succeeded -- but we need it for bindings.
-                            // Actually, op_check_tag peeks (doesn't pop), and pushes bool.
-                            // The dup'd scrutinee is still below the bool. That's fine --
-                            // the calling code (compileMatchExpr) handles popping.
+                            // No sub-patterns. Stack: [S_dup, bool]
+                            // Pop S_dup underneath bool. Use conditional pop.
+                            const skip_dup_pop = try self.emitJump(.op_jump_if_false, line);
+                            // true path: pop true, pop S_dup, push true
+                            try self.emitOp(.op_pop, line); // pop true -> [S_dup]
+                            try self.emitOp(.op_pop, line); // pop S_dup -> []
+                            try self.emitOp(.op_true, line); // [true]
+                            const skip_false_path = try self.emitJump(.op_jump, line);
+                            // false path: pop false, pop S_dup, push false
+                            try self.patchJump(skip_dup_pop);
+                            try self.emitOp(.op_pop, line); // pop false -> [S_dup]
+                            try self.emitOp(.op_pop, line); // pop S_dup -> []
+                            try self.emitOp(.op_false, line); // [false]
+                            try self.patchJump(skip_false_path);
                         }
                     } else {
                         try self.emitError(pattern_idx, .E002, "unknown variant");
+                        try self.emitOp(.op_pop, line); // consume dup'd scrutinee
                         try self.emitOp(.op_false, line);
                     }
                 } else {
                     try self.emitError(pattern_idx, .E002, "unknown type in pattern");
+                    try self.emitOp(.op_pop, line); // consume dup'd scrutinee
                     try self.emitOp(.op_false, line);
                 }
             },
@@ -1952,6 +2020,19 @@ pub const Compiler = struct {
     }
 
     /// End scope and emit pops/close_upvalues for the specified number of locals.
+    /// End scope for match arms: pop all locals in the current scope depth.
+    fn endScopeForMatch(self: *Self, line: u32) void {
+        while (self.local_count > 0 and self.locals[self.local_count - 1].depth >= self.scope_depth) {
+            self.local_count -= 1;
+            if (self.locals[self.local_count].is_captured) {
+                self.emitOp(.op_close_upvalue, line) catch {};
+            } else {
+                self.emitOp(.op_pop, line) catch {};
+            }
+        }
+        self.scope_depth -= 1;
+    }
+
     fn endScopeWithPops(self: *Self, count: u32, line: u32) void {
         var remaining = count;
         while (remaining > 0 and self.local_count > 0) {
@@ -2804,14 +2885,14 @@ test "compile: match expression emits conditional jumps" {
 
     try std.testing.expect(!tc.result.hasErrors());
     const chunk = tc.getChunk();
-    // Should have op_dup (for pattern check) and op_jump_if_false (conditional).
-    var dup_count: u32 = 0;
+    // Should have op_get_local (for scrutinee copy) and op_jump_if_false (conditional).
+    var get_local_count: u32 = 0;
     var jif_count: u32 = 0;
     for (chunk.code.items) |byte| {
-        if (@as(OpCode, @enumFromInt(byte)) == .op_dup) dup_count += 1;
+        if (@as(OpCode, @enumFromInt(byte)) == .op_get_local) get_local_count += 1;
         if (@as(OpCode, @enumFromInt(byte)) == .op_jump_if_false) jif_count += 1;
     }
-    try std.testing.expect(dup_count >= 2);
+    try std.testing.expect(get_local_count >= 2);
     try std.testing.expect(jif_count >= 2);
 }
 

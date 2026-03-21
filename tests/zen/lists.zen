@@ -1,0 +1,47 @@
+-- List literal creation
+let xs = [1, 2, 3]
+print(xs)
+
+-- Empty list
+let empty = []
+print(empty)
+
+-- List.get returns Option
+let first = List.get(xs, 0)
+print(first)
+let oob = List.get(xs, 10)
+print(oob)
+
+-- List.map with closure
+let doubled = List.map(xs, |x| x * 2)
+print(doubled)
+
+-- List.filter
+let evens = List.filter([1,2,3,4,5], |x| x % 2 == 0)
+print(evens)
+
+-- List.reduce
+let sum = List.reduce(xs, 0, |acc, x| acc + x)
+print(sum)
+
+-- List.reverse
+print(List.reverse(xs))
+
+-- List.sort
+print(List.sort([3, 1, 2]))
+
+-- List.contains
+print(List.contains(xs, 2))
+print(List.contains(xs, 99))
+
+-- List.append (immutable)
+print(List.append(xs, 4))
+print(xs)
+
+-- List.map with upvalue capture
+let factor = 10
+let scaled = List.map(xs, |x| x * factor)
+print(scaled)
+
+-- len() on lists
+print(len(xs))

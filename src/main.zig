@@ -9,6 +9,7 @@ const Chunk = zenith.chunk.Chunk;
 const Diagnostic = zenith.err.Diagnostic;
 const ErrorCode = zenith.err.ErrorCode;
 const Value = zenith.value.Value;
+const builtins = zenith.builtins;
 
 const version_string = "Zenith v0.1.0";
 
@@ -135,9 +136,16 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     const atom_names = try buildAtomNames(&compile_result, allocator);
     defer allocator.free(atom_names);
 
+    // Build ADT type info for pretty-printing.
+    const adt_info = try buildAdtTypeInfo(&compile_result, allocator);
+    defer allocator.free(adt_info);
+
     // 4. Execute -- use closure-based VM.
     var vm = VM.initWithClosure(compile_result.closure, allocator);
     try vm.setAtomNames(atom_names, allocator);
+    if (adt_info.len > 0) {
+        vm.setAdtTypes(adt_info);
+    }
 
     _ = vm.run() catch {
         renderDiagnostics(vm.errors.items, source, file_path, use_color, allocator);
@@ -146,6 +154,21 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     };
 
     vm.deinit();
+}
+
+/// Build ADT type info array from compiler's adt_types for pretty-printing.
+fn buildAdtTypeInfo(compile_result: *CompileResult, allocator: std.mem.Allocator) ![]const builtins.AdtTypeInfo {
+    const adt_types = compile_result.adt_types.items;
+    if (adt_types.len == 0) return allocator.alloc(builtins.AdtTypeInfo, 0);
+
+    const info = try allocator.alloc(builtins.AdtTypeInfo, adt_types.len);
+    for (adt_types, 0..) |meta, i| {
+        info[i] = .{
+            .name = meta.name,
+            .variant_names = meta.variant_names,
+        };
+    }
+    return info;
 }
 
 /// Build an atom name array ordered by atom ID from the compiler's atom_table.

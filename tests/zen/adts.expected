@@ -1,0 +1,7 @@
+Color.Red
+Color.Hex(#ff0000)
+Shape.Circle(5.0)
+Shape.Rect(3.0, 4.0)
+IntList.Cons(1, IntList.Cons(2, IntList.Empty))
+true
+false

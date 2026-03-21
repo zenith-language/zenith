@@ -1,0 +1,5 @@
+{name: alice, age: 30}
+{name: alice, age: 31}
+{name: alice, age: 30}
+{name: alice, age: 30, email: alice@example.com}
+{user: {name: bob}, active: true}

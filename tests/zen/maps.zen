@@ -1,0 +1,33 @@
+-- Map literal
+let m = {"name": "alice", "age": 30}
+print(m)
+
+-- Map.get returns Option
+print(Map.get(m, "name"))
+print(Map.get(m, "missing"))
+
+-- Map.set (immutable)
+let m2 = Map.set(m, "age", 31)
+print(Map.get(m2, "age"))
+print(Map.get(m, "age"))
+
+-- Map.delete
+let m3 = Map.delete(m, "age")
+print(Map.get(m3, "age"))
+
+-- Map.keys and Map.values
+print(Map.keys(m))
+print(Map.values(m))
+
+-- Map.merge
+let m4 = Map.merge({"a": 1}, {"b": 2, "a": 99})
+print(Map.get(m4, "a"))
+print(Map.get(m4, "b"))
+
+-- Map.contains
+print(Map.contains(m, "name"))
+
+-- Empty map
+let empty = {}
+print(empty)
+print(Map.length(empty))

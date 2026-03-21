@@ -47,6 +47,7 @@ pub const VM = struct {
     objects: ?*obj_mod.Obj, // Head of allocated objects linked list
     open_upvalues: ?*ObjUpvalue, // Head of sorted open upvalue list
     atom_names: std.ArrayListUnmanaged([]const u8),
+    adt_type_info: ?[]const builtins_mod.AdtTypeInfo,
     allocator: Allocator,
     errors: std.ArrayListUnmanaged(Diagnostic),
     // Output writer for tests (captures print output instead of stdout).
@@ -66,6 +67,7 @@ pub const VM = struct {
             .objects = null,
             .open_upvalues = null,
             .atom_names = .empty,
+            .adt_type_info = null,
             .allocator = allocator,
             .errors = .empty,
             .output_buf = null,
@@ -84,6 +86,7 @@ pub const VM = struct {
             .objects = null,
             .open_upvalues = null,
             .atom_names = .empty,
+            .adt_type_info = null,
             .allocator = allocator,
             .errors = .empty,
             .output_buf = null,
@@ -116,6 +119,11 @@ pub const VM = struct {
         self.freeObjects();
         self.atom_names.deinit(self.allocator);
         self.errors.deinit(self.allocator);
+        // Clear module-level ADT type info to avoid stale references.
+        if (self.adt_type_info != null) {
+            builtins_mod.clearAdtTypes();
+            self.adt_type_info = null;
+        }
     }
 
     /// Set atom name mapping (from compiler's atom table).
@@ -125,11 +133,18 @@ pub const VM = struct {
         }
     }
 
+    /// Set ADT type info for pretty-printing ADT values.
+    pub fn setAdtTypes(self: *VM, info: []const builtins_mod.AdtTypeInfo) void {
+        self.adt_type_info = info;
+        builtins_mod.setAdtTypes(info);
+    }
+
     /// Register a heap-allocated object for cleanup.
     fn trackObject(self: *VM, obj: *obj_mod.Obj) void {
         obj.next = self.objects;
         self.objects = obj;
     }
+
 
     /// Free all tracked heap objects.
     fn freeObjects(self: *VM) void {
@@ -947,8 +962,9 @@ pub const VM = struct {
             return;
         }
 
-        // Set VM pointer for higher-order builtins that need to invoke closures.
-        builtins_mod.setVM(@ptrCast(self), &callClosureFromBuiltin);
+        // Set VM pointer for higher-order builtins that need to invoke closures
+        // and track intermediate heap objects.
+        builtins_mod.setVM(@ptrCast(self), &callClosureFromBuiltin, &trackObjectFromBuiltin);
         defer builtins_mod.clearVM();
 
         var err_msg: []const u8 = "";
@@ -968,6 +984,12 @@ pub const VM = struct {
 
         self.stack_top -= (@as(u32, arg_count) + 1);
         try self.push(result);
+    }
+
+    /// Callback function for builtins to register intermediate heap objects.
+    fn trackObjectFromBuiltin(vm_ptr: *anyopaque, obj: *obj_mod.Obj) void {
+        const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+        vm.trackObject(obj);
     }
 
     /// Callback function for builtins to invoke user closures through the VM.
@@ -1387,13 +1409,12 @@ pub const VM = struct {
         const lst = try ObjList.create(self.allocator);
         self.trackObject(&lst.obj);
 
-        // Reserve capacity and fill from stack.
+        // Reserve capacity and fill from stack in order (first pushed = index 0).
         try lst.items.ensureTotalCapacity(self.allocator, count);
-        // Pop values in reverse order (first pushed is earliest in list).
-        var i: u16 = count;
-        while (i > 0) {
-            i -= 1;
-            lst.items.appendAssumeCapacity(self.stack[self.stack_top - count + i]);
+        const base = self.stack_top - count;
+        var i: u16 = 0;
+        while (i < count) : (i += 1) {
+            lst.items.appendAssumeCapacity(self.stack[base + i]);
         }
         self.stack_top -= count;
 

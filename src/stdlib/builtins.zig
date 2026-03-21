@@ -37,20 +37,60 @@ pub const BuiltinDesc = struct {
 /// Returns null on error (the VM will have already recorded the error).
 pub const CallClosureFn = *const fn (vm_ptr: *anyopaque, closure_val: Value, args: []const Value) ?Value;
 
+/// Callback type: register a heap object with the VM for cleanup.
+pub const TrackObjFn = *const fn (vm_ptr: *anyopaque, obj: *obj_mod.Obj) void;
+
 /// Module-level state set by the VM before calling builtins.
 var current_vm: ?*anyopaque = null;
 var call_closure_fn: ?CallClosureFn = null;
+var track_obj_fn: ?TrackObjFn = null;
 
 /// Called by the VM before dispatching a builtin function.
-pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn) void {
+pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {
     current_vm = vm_ptr;
     call_closure_fn = closure_fn;
+    track_obj_fn = track_fn;
 }
 
 /// Called by the VM after a builtin returns.
 pub fn clearVM() void {
     current_vm = null;
     call_closure_fn = null;
+    track_obj_fn = null;
+}
+
+/// Track an intermediate heap object with the VM (called by builtins that
+/// create objects other than the final return value).
+pub fn trackObj(obj: *obj_mod.Obj) void {
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |f| {
+            f(vm_ptr, obj);
+        }
+    }
+}
+
+// ── ADT Type Name Resolution ─────────────────────────────────────────
+// Module-level state for ADT type/variant name lookup during formatting.
+// Set by the VM (or e2e runner) so that formatValue can print ADTs as
+// "Color.Red" instead of "ADT(2.0)".
+
+/// ADT type info for display purposes.
+pub const AdtTypeInfo = struct {
+    name: []const u8,
+    variant_names: []const []const u8,
+};
+
+/// Module-level ADT type registry for formatValue.
+var adt_type_info: ?[]const AdtTypeInfo = null;
+
+/// Set ADT type info for formatting. Called once after compilation.
+pub fn setAdtTypes(info: []const AdtTypeInfo) void {
+    adt_type_info = info;
+}
+
+/// Clear ADT type info.
+pub fn clearAdtTypes() void {
+    adt_type_info = null;
 }
 
 /// Internal helper: invoke a closure from within a builtin.
@@ -295,7 +335,23 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
             },
             .adt => {
                 const a = ObjAdt.fromObj(obj_ptr);
-                try writer.print("ADT({d}.{d})", .{ a.type_id, a.variant_idx });
+                // Try to resolve type and variant names from module-level registry.
+                if (adt_type_info) |info| {
+                    if (a.type_id < info.len) {
+                        const meta = info[a.type_id];
+                        try writer.writeAll(meta.name);
+                        try writer.writeByte('.');
+                        if (a.variant_idx < meta.variant_names.len) {
+                            try writer.writeAll(meta.variant_names[a.variant_idx]);
+                        } else {
+                            try writer.print("{d}", .{a.variant_idx});
+                        }
+                    } else {
+                        try writer.print("ADT({d}.{d})", .{ a.type_id, a.variant_idx });
+                    }
+                } else {
+                    try writer.print("ADT({d}.{d})", .{ a.type_id, a.variant_idx });
+                }
                 if (a.payload.len > 0) {
                     try writer.writeByte('(');
                     for (a.payload, 0..) |p, i| {
@@ -626,6 +682,7 @@ fn builtinListZip(args: []const Value, allocator: Allocator, err_msg: *[]const u
     for (0..min_len) |i| {
         const pair = [_]Value{ lst1.items.items[i], lst2.items.items[i] };
         const tup = try ObjTuple.create(allocator, &pair);
+        trackObj(&tup.obj); // Track intermediate tuple for GC
         new_list.items.appendAssumeCapacity(Value.fromObj(&tup.obj));
     }
     return Value.fromObj(&new_list.obj);
@@ -835,6 +892,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
         // Empty separator: split into individual characters.
         for (str_bytes) |byte| {
             const s = try ObjString.create(allocator, &[_]u8{byte});
+            trackObj(&s.obj);
             try new_list.items.append(allocator, Value.fromObj(&s.obj));
         }
     } else if (sep_bytes.len == 1) {
@@ -842,6 +900,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
         var it = std.mem.splitScalar(u8, str_bytes, sep_bytes[0]);
         while (it.next()) |part| {
             const s = try ObjString.create(allocator, part);
+            trackObj(&s.obj);
             try new_list.items.append(allocator, Value.fromObj(&s.obj));
         }
     } else {
@@ -851,6 +910,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
         while (pos + sep_bytes.len <= str_bytes.len) {
             if (std.mem.eql(u8, str_bytes[pos..][0..sep_bytes.len], sep_bytes)) {
                 const s = try ObjString.create(allocator, str_bytes[seg_start..pos]);
+                trackObj(&s.obj);
                 try new_list.items.append(allocator, Value.fromObj(&s.obj));
                 pos += sep_bytes.len;
                 seg_start = pos;
@@ -860,6 +920,7 @@ fn builtinStringSplit(args: []const Value, allocator: Allocator, err_msg: *[]con
         }
         // Remaining segment.
         const s = try ObjString.create(allocator, str_bytes[seg_start..]);
+        trackObj(&s.obj);
         try new_list.items.append(allocator, Value.fromObj(&s.obj));
     }
 

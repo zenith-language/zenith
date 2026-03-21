@@ -249,6 +249,18 @@ pub const Value = struct {
             return ObjInt.fromObj(a.asObj()).value == @as(i64, b.asInt());
         }
 
+        // ADT structural equality: same type, same variant, same payload.
+        if (a.isObjType(.adt) and b.isObjType(.adt)) {
+            const aa = obj_mod.ObjAdt.fromObj(a.asObj());
+            const ba = obj_mod.ObjAdt.fromObj(b.asObj());
+            if (aa.type_id != ba.type_id or aa.variant_idx != ba.variant_idx) return false;
+            if (aa.payload.len != ba.payload.len) return false;
+            for (aa.payload, ba.payload) |pa, pb| {
+                if (!eql(pa, pb)) return false;
+            }
+            return true;
+        }
+
         return false;
     }
 

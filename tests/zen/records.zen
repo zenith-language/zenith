@@ -1,0 +1,18 @@
+-- Record literal
+let person = {name: "alice", age: 30}
+print(person)
+
+-- Record spread syntax
+let older = {..person, age: 31}
+print(older)
+
+-- Original unchanged
+print(person)
+
+-- Spread with new field
+let detailed = {..person, email: "alice@example.com"}
+print(detailed)
+
+-- Nested record
+let nested = {user: {name: "bob"}, active: true}
+print(nested)
