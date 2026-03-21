@@ -7,6 +7,13 @@ const Obj = obj_mod.Obj;
 const ObjAdt = obj_mod.ObjAdt;
 const ObjList = obj_mod.ObjList;
 const ObjRange = obj_mod.ObjRange;
+const ObjTuple = obj_mod.ObjTuple;
+const ObjStream = obj_mod.ObjStream;
+
+/// Error type matching builtins.zig NativeError.
+pub const NativeError = error{
+    RuntimeError,
+} || Allocator.Error;
 
 /// Pull-based stream state. Each variant represents a different stream
 /// operator (generator, transform, or terminal helper). The `next()`
@@ -20,6 +27,16 @@ pub const StreamState = union(enum) {
     filter_op: FilterOp,
     take_op: TakeOp,
     drop_op: DropOp,
+    flat_map_op: FlatMapOp,
+    filter_map_op: FilterMapOp,
+    scan_op: ScanOp,
+    distinct_op: DistinctOp,
+    zip_op: ZipOp,
+    flatten_op: FlattenOp,
+    tap_op: TapOp,
+    batch_op: BatchOp,
+    partition_ok: PartitionOp,
+    partition_err: PartitionOp,
 
     pub const RangeIter = struct {
         current: i32,
@@ -58,9 +75,65 @@ pub const StreamState = union(enum) {
         started: bool,
     };
 
+    pub const FlatMapOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        fn_val: Value,
+        inner: Value, // NaN-boxed inner ObjStream or nil
+    };
+
+    pub const FilterMapOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        fn_val: Value,
+    };
+
+    pub const ScanOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        acc: Value,
+        fn_val: Value,
+    };
+
+    pub const DistinctOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        seen: std.AutoArrayHashMapUnmanaged(u64, void),
+    };
+
+    pub const ZipOp = struct {
+        upstream_a: Value, // NaN-boxed ObjStream pointer
+        upstream_b: Value, // NaN-boxed ObjStream pointer
+    };
+
+    pub const FlattenOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        inner_list: Value, // NaN-boxed ObjList or nil
+        inner_idx: usize,
+        inner_stream: Value, // NaN-boxed inner ObjStream or nil (flatten stream of streams)
+    };
+
+    pub const TapOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        fn_val: Value,
+    };
+
+    pub const BatchOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        size: i32,
+        exhausted: bool,
+    };
+
+    pub const PartitionOp = struct {
+        shared: *PartitionState,
+    };
+
+    /// Shared state for partition_result: both ok and err streams reference this.
+    pub const PartitionState = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        ok_queue: std.ArrayListUnmanaged(Value),
+        err_queue: std.ArrayListUnmanaged(Value),
+    };
+
     /// Pull the next element from this stream.
     /// Returns Some(val) or None as ObjAdt Option values.
-    pub fn next(self: *StreamState, allocator: Allocator) !Value {
+    pub fn next(self: *StreamState, allocator: Allocator) NativeError!Value {
         switch (self.*) {
             .range_iter => |*s| {
                 if (s.step > 0) {
@@ -86,7 +159,7 @@ pub const StreamState = union(enum) {
                 return makeSome(result, allocator);
             },
             .map_op => |s| {
-                const upstream_stream = obj_mod.ObjStream.fromObj(s.upstream.asObj());
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 const upstream_val = try upstream_stream.state.next(allocator);
                 // If upstream returned None, pass it through.
                 if (isNone(upstream_val)) return upstream_val;
@@ -96,7 +169,7 @@ pub const StreamState = union(enum) {
                 return makeSome(mapped, allocator);
             },
             .filter_op => |s| {
-                const upstream_stream = obj_mod.ObjStream.fromObj(s.upstream.asObj());
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 // Keep pulling until we find a matching element or upstream is exhausted.
                 while (true) {
                     const upstream_val = try upstream_stream.state.next(allocator);
@@ -110,14 +183,14 @@ pub const StreamState = union(enum) {
             },
             .take_op => |*s| {
                 if (s.remaining <= 0) return makeNone(allocator);
-                const upstream_stream = obj_mod.ObjStream.fromObj(s.upstream.asObj());
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 const upstream_val = try upstream_stream.state.next(allocator);
                 if (isNone(upstream_val)) return upstream_val;
                 s.remaining -= 1;
                 return upstream_val;
             },
             .drop_op => |*s| {
-                const upstream_stream = obj_mod.ObjStream.fromObj(s.upstream.asObj());
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 if (!s.started) {
                     // Discard `remaining` elements.
                     var dropped: i32 = 0;
@@ -129,16 +202,207 @@ pub const StreamState = union(enum) {
                 }
                 return upstream_stream.state.next(allocator);
             },
+            .flat_map_op => |*s| {
+                while (true) {
+                    // If we have an active inner stream, pull from it.
+                    if (!s.inner.isNil()) {
+                        const inner_stream = ObjStream.fromObj(s.inner.asObj());
+                        const inner_val = try inner_stream.state.next(allocator);
+                        if (!isNone(inner_val)) return inner_val;
+                        // Inner stream exhausted, clear it.
+                        s.inner = Value.nil;
+                    }
+                    // Pull from upstream.
+                    const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) return upstream_val;
+                    const elem = adtPayload(upstream_val, 0);
+                    // Apply function to get new inner stream or list.
+                    const result = try callClosure(s.fn_val, &[_]Value{elem});
+                    if (result.isObjType(.stream)) {
+                        s.inner = result;
+                    } else if (result.isObjType(.list)) {
+                        // Auto-wrap list into a stream (list_iter).
+                        const list_obj = ObjList.fromObj(result.asObj());
+                        const items = list_obj.items.items;
+                        // Create a range_iter-like stream over the list items by
+                        // wrapping each element. Use a flatten approach: store
+                        // the list as a flatten_op with inner_list.
+                        const state = try allocator.create(StreamState);
+                        state.* = .{ .flatten_op = .{
+                            .upstream = Value.nil, // no upstream; single-list flatten
+                            .inner_list = result,
+                            .inner_idx = 0,
+                            .inner_stream = Value.nil,
+                        } };
+                        _ = items; // already captured via result
+                        const wrapped = try ObjStream.create(allocator, state);
+                        trackObj(&wrapped.obj);
+                        s.inner = Value.fromObj(&wrapped.obj);
+                    } else {
+                        // If fn returns a range, auto-wrap to stream.
+                        if (result.isObjType(.range)) {
+                            const r = ObjRange.fromObj(result.asObj());
+                            const state = try allocator.create(StreamState);
+                            state.* = .{ .range_iter = .{
+                                .current = r.start,
+                                .end = r.end,
+                                .step = r.step,
+                            } };
+                            const wrapped = try ObjStream.create(allocator, state);
+                            trackObj(&wrapped.obj);
+                            s.inner = Value.fromObj(&wrapped.obj);
+                        } else {
+                            // Not a stream/list/range -- treat as single-element.
+                            return makeSome(result, allocator);
+                        }
+                    }
+                }
+            },
+            .filter_map_op => |s| {
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                while (true) {
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) return upstream_val;
+                    const elem = adtPayload(upstream_val, 0);
+                    const result = try callClosure(s.fn_val, &[_]Value{elem});
+                    // Check if result is Some(v) (type_id=0, variant=0).
+                    if (result.isObjType(.adt)) {
+                        const adt = ObjAdt.fromObj(result.asObj());
+                        if (adt.type_id == 0 and adt.variant_idx == 0) {
+                            // Some(v) -- extract and yield.
+                            return makeSome(adt.payload[0], allocator);
+                        }
+                        // None -- skip and continue.
+                    }
+                    // Non-Option values are skipped (filter_map contract: fn must return Option).
+                }
+            },
+            .scan_op => |*s| {
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const upstream_val = try upstream_stream.state.next(allocator);
+                if (isNone(upstream_val)) return upstream_val;
+                const elem = adtPayload(upstream_val, 0);
+                const result = try callClosure(s.fn_val, &[_]Value{ s.acc, elem });
+                s.acc = result;
+                return makeSome(result, allocator);
+            },
+            .distinct_op => |*s| {
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                while (true) {
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) return upstream_val;
+                    const elem = adtPayload(upstream_val, 0);
+                    const key = elem.bits;
+                    const entry = try s.seen.getOrPut(allocator, key);
+                    if (!entry.found_existing) {
+                        return makeSome(elem, allocator);
+                    }
+                    // Duplicate -- skip.
+                }
+            },
+            .zip_op => |s| {
+                const stream_a = ObjStream.fromObj(s.upstream_a.asObj());
+                const stream_b = ObjStream.fromObj(s.upstream_b.asObj());
+                const val_a = try stream_a.state.next(allocator);
+                if (isNone(val_a)) return val_a;
+                const val_b = try stream_b.state.next(allocator);
+                if (isNone(val_b)) return val_b;
+                const elem_a = adtPayload(val_a, 0);
+                const elem_b = adtPayload(val_b, 0);
+                const tuple = try ObjTuple.create(allocator, &[_]Value{ elem_a, elem_b });
+                trackObj(&tuple.obj);
+                return makeSome(Value.fromObj(&tuple.obj), allocator);
+            },
+            .flatten_op => |*s| {
+                while (true) {
+                    // If we have an active inner stream, pull from it.
+                    if (!s.inner_stream.isNil()) {
+                        const inner_s = ObjStream.fromObj(s.inner_stream.asObj());
+                        const inner_val = try inner_s.state.next(allocator);
+                        if (!isNone(inner_val)) return inner_val;
+                        s.inner_stream = Value.nil;
+                    }
+                    // If we have an active inner list, yield from it.
+                    if (!s.inner_list.isNil()) {
+                        const list_obj = ObjList.fromObj(s.inner_list.asObj());
+                        if (s.inner_idx < list_obj.items.items.len) {
+                            const elem = list_obj.items.items[s.inner_idx];
+                            s.inner_idx += 1;
+                            return makeSome(elem, allocator);
+                        }
+                        // Inner list exhausted.
+                        s.inner_list = Value.nil;
+                        s.inner_idx = 0;
+                    }
+                    // If no upstream (single-list flatten from flat_map auto-wrap), we are done.
+                    if (s.upstream.isNil()) return makeNone(allocator);
+                    // Pull from upstream.
+                    const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) return upstream_val;
+                    const elem = adtPayload(upstream_val, 0);
+                    if (elem.isObjType(.list)) {
+                        s.inner_list = elem;
+                        s.inner_idx = 0;
+                    } else if (elem.isObjType(.stream)) {
+                        s.inner_stream = elem;
+                    } else {
+                        // Non-list, non-stream element -- yield directly.
+                        return makeSome(elem, allocator);
+                    }
+                }
+            },
+            .tap_op => |s| {
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const upstream_val = try upstream_stream.state.next(allocator);
+                if (isNone(upstream_val)) return upstream_val;
+                const elem = adtPayload(upstream_val, 0);
+                // Invoke side-effect function, ignore result.
+                _ = try callClosure(s.fn_val, &[_]Value{elem});
+                return makeSome(elem, allocator);
+            },
+            .batch_op => |*s| {
+                if (s.exhausted) return makeNone(allocator);
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const batch_list = try ObjList.create(allocator);
+                trackObj(&batch_list.obj);
+                var count: i32 = 0;
+                while (count < s.size) : (count += 1) {
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) {
+                        s.exhausted = true;
+                        break;
+                    }
+                    const elem = adtPayload(upstream_val, 0);
+                    try batch_list.items.append(allocator, elem);
+                }
+                if (batch_list.items.items.len == 0) return makeNone(allocator);
+                return makeSome(Value.fromObj(&batch_list.obj), allocator);
+            },
+            .partition_ok => |s| {
+                return partitionNext(s.shared, true, allocator);
+            },
+            .partition_err => |s| {
+                return partitionNext(s.shared, false, allocator);
+            },
         }
     }
 
     /// Free any owned memory for this stream state.
     pub fn deinit(self: *StreamState, allocator: Allocator) void {
-        _ = self;
-        _ = allocator;
-        // StreamState variants don't own heap memory beyond the StreamState
-        // allocation itself (freed by ObjStream.destroy). GC-managed references
-        // (closures, upstream streams) are freed by the GC.
+        switch (self.*) {
+            .distinct_op => |*s| {
+                s.seen.deinit(allocator);
+            },
+            .partition_ok, .partition_err => |s| {
+                // Only free shared state once. We use a simple convention:
+                // partition_ok owns the shared state.
+                // But since both may be collected independently, we let GC handle it.
+                _ = s;
+            },
+            else => {},
+        }
     }
 
     /// Trace GC references in this stream state for nursery collection.
@@ -166,6 +430,48 @@ pub const StreamState = union(enum) {
             },
             .drop_op => |*s| {
                 try nursery.processValue(&s.upstream, gc);
+            },
+            .flat_map_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.fn_val, gc);
+                try nursery.processValue(&s.inner, gc);
+            },
+            .filter_map_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.fn_val, gc);
+            },
+            .scan_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.acc, gc);
+                try nursery.processValue(&s.fn_val, gc);
+            },
+            .distinct_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+            },
+            .zip_op => |*s| {
+                try nursery.processValue(&s.upstream_a, gc);
+                try nursery.processValue(&s.upstream_b, gc);
+            },
+            .flatten_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.inner_list, gc);
+                try nursery.processValue(&s.inner_stream, gc);
+            },
+            .tap_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.fn_val, gc);
+            },
+            .batch_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+            },
+            .partition_ok, .partition_err => |*s| {
+                try nursery.processValue(&s.shared.upstream, gc);
+                for (s.shared.ok_queue.items) |*v| {
+                    try nursery.processValue(v, gc);
+                }
+                for (s.shared.err_queue.items) |*v| {
+                    try nursery.processValue(v, gc);
+                }
             },
         }
     }
@@ -195,19 +501,95 @@ pub const StreamState = union(enum) {
             .drop_op => |*s| {
                 try oldgen.processValue(&s.upstream, gc);
             },
+            .flat_map_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.fn_val, gc);
+                try oldgen.processValue(&s.inner, gc);
+            },
+            .filter_map_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.fn_val, gc);
+            },
+            .scan_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.acc, gc);
+                try oldgen.processValue(&s.fn_val, gc);
+            },
+            .distinct_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+            },
+            .zip_op => |*s| {
+                try oldgen.processValue(&s.upstream_a, gc);
+                try oldgen.processValue(&s.upstream_b, gc);
+            },
+            .flatten_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.inner_list, gc);
+                try oldgen.processValue(&s.inner_stream, gc);
+            },
+            .tap_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.fn_val, gc);
+            },
+            .batch_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+            },
+            .partition_ok, .partition_err => |*s| {
+                try oldgen.processValue(&s.shared.upstream, gc);
+                for (s.shared.ok_queue.items) |*v| {
+                    try oldgen.processValue(v, gc);
+                }
+                for (s.shared.err_queue.items) |*v| {
+                    try oldgen.processValue(v, gc);
+                }
+            },
         }
     }
 };
+
+/// Shared helper for partition_ok and partition_err next() logic.
+/// If `want_ok` is true, returns from the ok_queue; otherwise from err_queue.
+fn partitionNext(shared: *StreamState.PartitionState, want_ok: bool, allocator: Allocator) NativeError!Value {
+    // Check our queue first.
+    const my_queue = if (want_ok) &shared.ok_queue else &shared.err_queue;
+    if (my_queue.items.len > 0) {
+        const val = my_queue.orderedRemove(0);
+        return makeSome(val, allocator);
+    }
+    // Pull from upstream and classify.
+    const other_queue = if (want_ok) &shared.err_queue else &shared.ok_queue;
+    const upstream_stream = ObjStream.fromObj(shared.upstream.asObj());
+    while (true) {
+        const upstream_val = try upstream_stream.state.next(allocator);
+        if (isNone(upstream_val)) return upstream_val;
+        const elem = adtPayload(upstream_val, 0);
+        // Classify: Result type_id=1, Ok=variant 0, Err=variant 1.
+        if (elem.isObjType(.adt)) {
+            const adt = ObjAdt.fromObj(elem.asObj());
+            if (adt.type_id == 1) {
+                const payload_val = if (adt.payload.len > 0) adt.payload[0] else Value.nil;
+                if (adt.variant_idx == 0) {
+                    // Ok variant.
+                    if (want_ok) return makeSome(payload_val, allocator);
+                    try other_queue.append(allocator, payload_val);
+                } else {
+                    // Err variant.
+                    if (!want_ok) return makeSome(payload_val, allocator);
+                    try other_queue.append(allocator, payload_val);
+                }
+                continue;
+            }
+        }
+        // Non-Result values go to ok queue by default.
+        if (want_ok) return makeSome(elem, allocator);
+        try other_queue.append(allocator, elem);
+    }
+}
 
 // ── VM Callback Interface ─────────────────────────────────────────────
 // Stream.next() needs to invoke closures (for iterate, map, filter).
 // Uses the same callback pattern as builtins.zig -- the VM sets these
 // before running any stream terminal.
-
-/// Error type matching builtins.zig NativeError.
-pub const NativeError = error{
-    RuntimeError,
-} || Allocator.Error;
 
 /// Callback type: invoke a closure Value with given arguments.
 pub const CallClosureFn = *const fn (vm_ptr: *anyopaque, closure_val: Value, args: []const Value) ?Value;
