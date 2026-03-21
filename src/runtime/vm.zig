@@ -353,6 +353,25 @@ pub const VM = struct {
                     const jump_offset = self.readU16Legacy();
                     try self.execForIter(jump_offset, &self.legacy_ip);
                 },
+
+                // Phase 3 opcodes -- not yet implemented in legacy mode.
+                .op_list,
+                .op_map,
+                .op_tuple,
+                .op_record,
+                .op_record_spread,
+                .op_adt_construct,
+                .op_adt_get_field,
+                .op_get_field,
+                .op_get_index,
+                .op_check_tag,
+                .op_list_len,
+                .op_list_slice,
+                .op_dup,
+                => {
+                    try self.runtimeErrorLegacy(.E001, "Phase 3 opcodes not yet implemented");
+                    return error.RuntimeErr;
+                },
             }
         }
 
@@ -537,6 +556,25 @@ pub const VM = struct {
                 .op_for_iter => {
                     const jump_offset = self.readU16Frame();
                     try self.execForIterFrame(jump_offset);
+                },
+
+                // Phase 3 opcodes -- not yet implemented in frame mode.
+                .op_list,
+                .op_map,
+                .op_tuple,
+                .op_record,
+                .op_record_spread,
+                .op_adt_construct,
+                .op_adt_get_field,
+                .op_get_field,
+                .op_get_index,
+                .op_check_tag,
+                .op_list_len,
+                .op_list_slice,
+                .op_dup,
+                => {
+                    try self.runtimeErrorFrame(.E001, "Phase 3 opcodes not yet implemented");
+                    return error.RuntimeErr;
                 },
             }
         }

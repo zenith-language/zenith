@@ -203,7 +203,7 @@ fn builtinStr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     return Value.fromObj(&str_obj.obj);
 }
 
-/// len(value) -- for strings: return byte length.
+/// len(value) -- for strings, lists, maps, tuples, records: return element count.
 fn builtinLen(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
     _ = allocator;
     const val = args[0];
@@ -211,7 +211,23 @@ fn builtinLen(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
         const str = ObjString.fromObj(val.asObj());
         return Value.fromInt(@intCast(str.bytes.len));
     }
-    err_msg.* = "len() expects a string argument";
+    if (val.isObjType(.list)) {
+        const lst = obj_mod.ObjList.fromObj(val.asObj());
+        return Value.fromInt(@intCast(lst.items.items.len));
+    }
+    if (val.isObjType(.map)) {
+        const m = obj_mod.ObjMap.fromObj(val.asObj());
+        return Value.fromInt(@intCast(m.entries.count()));
+    }
+    if (val.isObjType(.tuple)) {
+        const t = obj_mod.ObjTuple.fromObj(val.asObj());
+        return Value.fromInt(@intCast(t.fields.len));
+    }
+    if (val.isObjType(.record)) {
+        const rec = obj_mod.ObjRecord.fromObj(val.asObj());
+        return Value.fromInt(@intCast(rec.field_count));
+    }
+    err_msg.* = "len() expects a string, list, map, tuple, or record argument";
     return error.RuntimeError;
 }
 
@@ -231,6 +247,11 @@ fn builtinTypeOf(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     if (val.isAtom()) return Value.fromAtom(6); // :atom
     if (val.isObjType(.range)) return Value.fromAtom(7); // :range
     if (val.isObjType(.closure) or val.isObjType(.function)) return Value.fromAtom(8); // :function
+    if (val.isObjType(.list)) return Value.fromAtom(9); // :list
+    if (val.isObjType(.map)) return Value.fromAtom(10); // :map
+    if (val.isObjType(.tuple)) return Value.fromAtom(11); // :tuple
+    if (val.isObjType(.record)) return Value.fromAtom(12); // :record
+    if (val.isObjType(.adt)) return Value.fromAtom(13); // :adt
     return Value.fromAtom(3); // fallback: nil
 }
 
@@ -370,7 +391,7 @@ test "builtins: len errors on non-string" {
     var err_msg: []const u8 = "";
     const result = builtinLen(&[_]Value{Value.fromInt(42)}, allocator, &err_msg);
     try std.testing.expectError(error.RuntimeError, result);
-    try std.testing.expectEqualStrings("len() expects a string argument", err_msg);
+    try std.testing.expectEqualStrings("len() expects a string, list, map, tuple, or record argument", err_msg);
 }
 
 test "builtins: type_of returns correct atoms" {

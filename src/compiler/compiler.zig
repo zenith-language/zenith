@@ -278,6 +278,30 @@ pub const Compiler = struct {
                 try self.emitError(node_idx, .E005, "unexpected named argument outside of function call");
             },
 
+            // Phase 3 collection/ADT/pattern matching nodes -- compilation implemented in later plans.
+            .list_literal,
+            .map_literal,
+            .tuple_literal,
+            .record_literal,
+            .record_spread,
+            .type_decl,
+            .adt_constructor,
+            .field_access,
+            .match_expr,
+            .match_arm,
+            .match_arm_guarded,
+            .pattern_wildcard,
+            .pattern_literal,
+            .pattern_binding,
+            .pattern_adt,
+            .pattern_list,
+            .pattern_tuple,
+            .pattern_record,
+            .pattern_rest,
+            => {
+                try self.emitError(node_idx, .E005, "not yet implemented");
+            },
+
             .root => {}, // handled above
         }
     }

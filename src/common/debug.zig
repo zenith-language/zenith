@@ -71,6 +71,25 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, writer: anytyp
         .op_atom => try constantInstruction("OP_ATOM", chunk, offset, writer),
         .op_get_builtin => try byteInstruction("OP_GET_BUILTIN", chunk, offset, writer),
         .op_for_iter => try jumpInstruction("OP_FOR_ITER", 1, chunk, offset, writer),
+
+        // Phase 3: Collections
+        .op_list => try u16Instruction("OP_LIST", chunk, offset, writer),
+        .op_map => try u16Instruction("OP_MAP", chunk, offset, writer),
+        .op_tuple => try u16Instruction("OP_TUPLE", chunk, offset, writer),
+        .op_record => try recordInstruction("OP_RECORD", chunk, offset, writer),
+        .op_record_spread => try byteInstruction("OP_RECORD_SPREAD", chunk, offset, writer),
+
+        // Phase 3: ADTs
+        .op_adt_construct => try adtConstructInstruction("OP_ADT_CONSTRUCT", chunk, offset, writer),
+        .op_adt_get_field => try byteInstruction("OP_ADT_GET_FIELD", chunk, offset, writer),
+
+        // Phase 3: Pattern matching support
+        .op_get_field => try u16Instruction("OP_GET_FIELD", chunk, offset, writer),
+        .op_get_index => try u16Instruction("OP_GET_INDEX", chunk, offset, writer),
+        .op_check_tag => try checkTagInstruction("OP_CHECK_TAG", chunk, offset, writer),
+        .op_list_len => try simpleInstruction("OP_LIST_LEN", offset, writer),
+        .op_list_slice => try u16Instruction("OP_LIST_SLICE", chunk, offset, writer),
+        .op_dup => try simpleInstruction("OP_DUP", offset, writer),
     };
 }
 
@@ -107,6 +126,46 @@ fn byteInstruction(name: []const u8, chunk: *const Chunk, offset: usize, writer:
     const slot = chunk.code.items[offset + 1];
     try writer.print("{s:<20} {d:>4}\n", .{ name, slot });
     return offset + 2;
+}
+
+fn u16Instruction(name: []const u8, chunk: *const Chunk, offset: usize, writer: anytype) !usize {
+    const hi: u16 = chunk.code.items[offset + 1];
+    const lo: u16 = chunk.code.items[offset + 2];
+    const val = (hi << 8) | lo;
+    try writer.print("{s:<20} {d:>4}\n", .{ name, val });
+    return offset + 3;
+}
+
+fn recordInstruction(name: []const u8, chunk: *const Chunk, offset: usize, writer: anytype) !usize {
+    const hi: u16 = chunk.code.items[offset + 1];
+    const lo: u16 = chunk.code.items[offset + 2];
+    const count = (hi << 8) | lo;
+    try writer.print("{s:<20} {d:>4} fields\n", .{ name, count });
+    // Skip count u16 field-name constant indices.
+    return offset + 3 + @as(usize, count) * 2;
+}
+
+fn adtConstructInstruction(name: []const u8, chunk: *const Chunk, offset: usize, writer: anytype) !usize {
+    const type_hi: u16 = chunk.code.items[offset + 1];
+    const type_lo: u16 = chunk.code.items[offset + 2];
+    const type_id = (type_hi << 8) | type_lo;
+    const var_hi: u16 = chunk.code.items[offset + 3];
+    const var_lo: u16 = chunk.code.items[offset + 4];
+    const variant_idx = (var_hi << 8) | var_lo;
+    const arity = chunk.code.items[offset + 5];
+    try writer.print("{s:<20} type={d} variant={d} arity={d}\n", .{ name, type_id, variant_idx, arity });
+    return offset + 6;
+}
+
+fn checkTagInstruction(name: []const u8, chunk: *const Chunk, offset: usize, writer: anytype) !usize {
+    const type_hi: u16 = chunk.code.items[offset + 1];
+    const type_lo: u16 = chunk.code.items[offset + 2];
+    const type_id = (type_hi << 8) | type_lo;
+    const var_hi: u16 = chunk.code.items[offset + 3];
+    const var_lo: u16 = chunk.code.items[offset + 4];
+    const variant_idx = (var_hi << 8) | var_lo;
+    try writer.print("{s:<20} type={d} variant={d}\n", .{ name, type_id, variant_idx });
+    return offset + 5;
 }
 
 fn jumpInstruction(name: []const u8, sign: i32, chunk: *const Chunk, offset: usize, writer: anytype) !usize {

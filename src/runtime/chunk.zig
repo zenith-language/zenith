@@ -74,6 +74,27 @@ pub const OpCode = enum(u8) {
 
     // -- Iteration ----------------------------------------------------------
     op_for_iter,
+
+    // -- Collections (Phase 3) -----------------------------------------------
+    op_list, // [count: u16] pops count values, creates ObjList
+    op_map, // [count: u16] pops 2*count values (key-value pairs), creates ObjMap
+    op_tuple, // [count: u16] pops count values, creates ObjTuple
+    op_record, // [count: u16] followed by count u16 field-name constant indices, pops count values
+
+    // -- Record spread -------------------------------------------------------
+    op_record_spread, // [override_count: u8] pops base record + override values, creates new record
+
+    // -- ADTs (Phase 3) ------------------------------------------------------
+    op_adt_construct, // [type_id: u16, variant_idx: u16, arity: u8] pops arity values, creates ObjAdt
+    op_adt_get_field, // [field_idx: u8] pops ADT, pushes payload[field_idx]
+
+    // -- Pattern matching support (Phase 3) ----------------------------------
+    op_get_field, // [const_idx: u16] pops obj (record/map), pushes field/key value or nil
+    op_get_index, // [index: u16] pops list/tuple, pushes element at index
+    op_check_tag, // [type_id: u16, variant_idx: u16] peeks top, pushes bool if ADT matches
+    op_list_len, // pops list, pushes its length as int
+    op_list_slice, // [start: u16] pops list, pushes new list from start to end (for ..rest)
+    op_dup, // duplicates top of stack (needed for pattern matching to keep scrutinee)
 };
 
 /// Bytecode container with constant pool and line information.

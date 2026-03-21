@@ -85,6 +85,31 @@ pub const Ast = struct {
             for_stmt, // data.lhs = iterable, data.rhs = extra_data index -> {var_token, body}
             expr_stmt, // data.lhs = expression
 
+            // ── Collections (Phase 3) ──────────────────────────────────
+            list_literal, // data.lhs = extra_start, data.rhs = extra_end (element node indices)
+            map_literal, // data.lhs = extra_start, data.rhs = extra_end (alternating key/value node indices)
+            tuple_literal, // data.lhs = extra_start, data.rhs = extra_end (element node indices)
+            record_literal, // data.lhs = extra_start, data.rhs = extra_end (alternating name_token/value_node)
+            record_spread, // data.lhs = base_record node, data.rhs = extra_idx (override name/value pairs)
+
+            // ── ADTs (Phase 3) ─────────────────────────────────────────
+            type_decl, // data.lhs = extra_idx (type metadata), data.rhs = unused
+            adt_constructor, // data.lhs = extra_idx (type_name, variant_name), data.rhs = extra_idx for args
+            field_access, // data.lhs = object node, data.rhs = field name token index
+
+            // ── Pattern matching (Phase 3) ─────────────────────────────
+            match_expr, // data.lhs = scrutinee node, data.rhs = extra_idx (start of arms metadata)
+            match_arm, // data.lhs = pattern node, data.rhs = body node
+            match_arm_guarded, // data.lhs = extra_idx (pattern, guard, body), data.rhs = unused
+            pattern_wildcard, // no data needed
+            pattern_literal, // data.lhs = literal node index
+            pattern_binding, // data.lhs = name token index
+            pattern_adt, // data.lhs = extra_idx (type_token, variant_token), data.rhs = extra_idx (sub-patterns)
+            pattern_list, // data.lhs = extra_start, data.rhs = extra_end (element patterns)
+            pattern_tuple, // data.lhs = extra_start, data.rhs = extra_end
+            pattern_record, // data.lhs = extra_start, data.rhs = extra_end (name_token/pattern pairs)
+            pattern_rest, // data.lhs = binding name token (for ..rest patterns)
+
             // ── Root ────────────────────────────────────────────────────
             root, // data.lhs = extra_data start, data.rhs = extra_data end
         };
@@ -196,7 +221,18 @@ test "Ast: all Tag variants exist" {
         .fn_decl,      .lambda_expr,   .pipe_expr,      .return_expr,
         .named_arg,
         .let_decl,     .assign_stmt,   .while_stmt,     .for_stmt,
-        .expr_stmt,    .root,
+        .expr_stmt,
+        // Phase 3: Collections
+        .list_literal, .map_literal,   .tuple_literal,  .record_literal,
+        .record_spread,
+        // Phase 3: ADTs
+        .type_decl,    .adt_constructor, .field_access,
+        // Phase 3: Pattern matching
+        .match_expr,   .match_arm,     .match_arm_guarded,
+        .pattern_wildcard, .pattern_literal, .pattern_binding,
+        .pattern_adt,  .pattern_list,  .pattern_tuple,
+        .pattern_record, .pattern_rest,
+        .root,
     };
     try std.testing.expect(tags.len > 0);
 }
