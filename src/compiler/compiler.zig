@@ -208,7 +208,7 @@ pub const Compiler = struct {
                 } else if (tag == .while_stmt or tag == .for_stmt) {
                     // while and for emit op_nil as their result -- pop it when not last.
                     try self.emitOp(.op_pop, self.getLine(stmt_idx));
-                } else if (tag != .let_decl and tag != .assign_stmt and tag != .fn_decl) {
+                } else if (tag != .let_decl and tag != .assign_stmt and tag != .fn_decl and tag != .type_decl) {
                     try self.emitOp(.op_pop, self.getLine(stmt_idx));
                 }
             }

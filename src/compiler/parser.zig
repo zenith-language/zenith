@@ -77,6 +77,7 @@ pub const Parser = struct {
             .kw_for => self.parseForStmt(),
             .kw_fn => self.parseFnDecl(),
             .kw_return => self.parseReturnStmt(),
+            .kw_type => self.parseTypeDecl(),
             else => self.parseExprStmt(),
         };
     }
@@ -241,6 +242,7 @@ pub const Parser = struct {
             .kw_false => self.parseLiteral(.bool_literal),
             .kw_nil => self.parseLiteral(.nil_literal),
             .identifier => self.parseIdentifier(),
+            .kw_match => self.parseMatchExpr(),
             else => {
                 try self.emitError("expected expression");
                 return error.ParseError;
@@ -740,6 +742,516 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
+    // ── Type declaration parsing ──────────────────────────────────────
+
+    /// Parse `type Name = | Variant1 | Variant2(T1, T2) | ...`
+    fn parseTypeDecl(self: *Parser) Error!Node.Index {
+        const type_tok = self.pos;
+        self.advance(); // consume 'type'
+
+        // Expect type name (uppercase identifier).
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected type name after 'type'");
+            return error.ParseError;
+        }
+        const name_tok = self.pos;
+        self.advance(); // consume type name
+
+        // Expect '='.
+        if (self.peekTag() != .equal) {
+            try self.emitError("expected '=' after type name");
+            return error.ParseError;
+        }
+        self.advance(); // consume '='
+
+        // Parse variants: | Variant1 | Variant2(T1, T2) | ...
+        var variant_data: std.ArrayListUnmanaged(u32) = .empty;
+        defer variant_data.deinit(self.allocator);
+
+        // First variant must start with '|'.
+        if (self.peekTag() != .pipe) {
+            try self.emitError("expected '|' before variant");
+            return error.ParseError;
+        }
+
+        var variant_count: u32 = 0;
+        while (self.peekTag() == .pipe) {
+            self.advance(); // consume '|'
+
+            if (self.peekTag() != .identifier) {
+                try self.emitError("expected variant name after '|'");
+                return error.ParseError;
+            }
+            const variant_tok = self.pos;
+            self.advance(); // consume variant name
+
+            // Check for payload: `(Type1, Type2)`
+            var arity: u32 = 0;
+            if (self.peekTag() == .left_paren) {
+                self.advance(); // consume '('
+                if (self.peekTag() != .right_paren) {
+                    // Count params (type names or identifiers for arity tracking).
+                    arity = 1;
+                    if (self.peekTag() == .identifier) {
+                        self.advance(); // consume first type name
+                    } else {
+                        try self.emitError("expected type name in variant payload");
+                        return error.ParseError;
+                    }
+                    while (self.peekTag() == .comma) {
+                        self.advance(); // consume ','
+                        if (self.peekTag() == .identifier) {
+                            self.advance(); // consume type name
+                        } else {
+                            try self.emitError("expected type name in variant payload");
+                            return error.ParseError;
+                        }
+                        arity += 1;
+                    }
+                }
+                if (self.peekTag() != .right_paren) {
+                    try self.emitError("expected ')' to close variant payload");
+                    return error.ParseError;
+                }
+                self.advance(); // consume ')'
+            }
+
+            try variant_data.append(self.allocator, variant_tok);
+            try variant_data.append(self.allocator, arity);
+            variant_count += 1;
+        }
+
+        // Store in extra_data: [name_token, variant_count, then per variant: name_token, arity]
+        const extra_idx = try self.ast.addExtra(name_tok, self.allocator);
+        _ = try self.ast.addExtra(variant_count, self.allocator);
+        for (variant_data.items) |v| {
+            _ = try self.ast.addExtra(v, self.allocator);
+        }
+
+        return self.ast.addNode(.{
+            .tag = .type_decl,
+            .main_token = type_tok,
+            .data = .{ .lhs = extra_idx, .rhs = 0 },
+        }, self.allocator);
+    }
+
+    // ── Match expression parsing ──────────────────────────────────────
+
+    /// Parse `match scrutinee | pattern -> body | pattern when guard -> body | ...`
+    fn parseMatchExpr(self: *Parser) Error!Node.Index {
+        const match_tok = self.pos;
+        self.advance(); // consume 'match'
+
+        // Parse the scrutinee expression -- stop before '|' (pipe at arm start).
+        // We parse at a precedence that stops at pipe (which starts match arms).
+        // Since pipe_prec is used for |>, and bare | is used for lambdas/match arms,
+        // we need to parse the scrutinee as a full expression but stop at bare '|'.
+        // Strategy: parse expression, but since | has no infix precedence for bare pipe,
+        // parseExpression will stop naturally at '|'.
+        const scrutinee = try self.parseExpression();
+
+        // Parse arms.
+        var arm_nodes: std.ArrayListUnmanaged(u32) = .empty;
+        defer arm_nodes.deinit(self.allocator);
+
+        if (self.peekTag() != .pipe) {
+            try self.emitError("expected '|' to start match arm");
+            return error.ParseError;
+        }
+
+        while (self.peekTag() == .pipe) {
+            self.advance(); // consume '|'
+            const arm = try self.parseMatchArm();
+            try arm_nodes.append(self.allocator, arm);
+        }
+
+        // Store arm node indices in extra_data.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (arm_nodes.items) |a| {
+            _ = try self.ast.addExtra(a, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        // Store start/end in extra_data.
+        const arms_extra = try self.ast.addExtra(extra_start, self.allocator);
+        _ = try self.ast.addExtra(extra_end, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .match_expr,
+            .main_token = match_tok,
+            .data = .{ .lhs = scrutinee, .rhs = arms_extra },
+        }, self.allocator);
+    }
+
+    /// Parse a single match arm: `pattern -> body` or `pattern when guard -> body`
+    fn parseMatchArm(self: *Parser) Error!Node.Index {
+        const arm_tok = self.pos;
+        const pattern = try self.parsePattern();
+
+        // Check for guard: `when guard_expr`
+        if (self.peekTag() == .kw_when) {
+            self.advance(); // consume 'when'
+            const guard = try self.parseExpression();
+
+            if (self.peekTag() != .arrow) {
+                try self.emitError("expected '->' after guard expression");
+                return error.ParseError;
+            }
+            self.advance(); // consume '->'
+
+            const body = try self.parseExpression();
+
+            // Store pattern, guard, body in extra_data.
+            const extra_idx = try self.ast.addExtra(pattern, self.allocator);
+            _ = try self.ast.addExtra(guard, self.allocator);
+            _ = try self.ast.addExtra(body, self.allocator);
+
+            return self.ast.addNode(.{
+                .tag = .match_arm_guarded,
+                .main_token = arm_tok,
+                .data = .{ .lhs = extra_idx, .rhs = 0 },
+            }, self.allocator);
+        }
+
+        // No guard.
+        if (self.peekTag() != .arrow) {
+            try self.emitError("expected '->' after pattern");
+            return error.ParseError;
+        }
+        self.advance(); // consume '->'
+
+        const body = try self.parseExpression();
+
+        return self.ast.addNode(.{
+            .tag = .match_arm,
+            .main_token = arm_tok,
+            .data = .{ .lhs = pattern, .rhs = body },
+        }, self.allocator);
+    }
+
+    /// Parse a pattern (wildcard, literal, binding, ADT, list, tuple, record).
+    fn parsePattern(self: *Parser) Error!Node.Index {
+        const tag = self.peekTag();
+
+        switch (tag) {
+            // `_` -> wildcard (but could also be identifier binding)
+            .identifier => {
+                const name = self.tokenSlice(self.pos);
+
+                // Check if it's `_` (wildcard).
+                if (std.mem.eql(u8, name, "_")) {
+                    const tok = self.pos;
+                    self.advance(); // consume '_'
+                    return self.ast.addNode(.{
+                        .tag = .pattern_wildcard,
+                        .main_token = tok,
+                        .data = .{ .lhs = 0, .rhs = 0 },
+                    }, self.allocator);
+                }
+
+                // Check if first char is uppercase -> ADT pattern: TypeName.Variant(...)
+                if (name.len > 0 and name[0] >= 'A' and name[0] <= 'Z') {
+                    return self.parseAdtPattern();
+                }
+
+                // Lowercase identifier -> binding pattern.
+                const tok = self.pos;
+                self.advance(); // consume identifier
+                return self.ast.addNode(.{
+                    .tag = .pattern_binding,
+                    .main_token = tok,
+                    .data = .{ .lhs = tok, .rhs = 0 },
+                }, self.allocator);
+            },
+
+            // Integer/float/string/bool/nil/atom literal -> pattern_literal
+            .int_literal, .float_literal, .string_literal, .atom_literal => {
+                const lit = try self.parseLiteral(switch (tag) {
+                    .int_literal => .int_literal,
+                    .float_literal => .float_literal,
+                    .string_literal => .string_literal,
+                    .atom_literal => .atom_literal,
+                    else => unreachable,
+                });
+                return self.ast.addNode(.{
+                    .tag = .pattern_literal,
+                    .main_token = self.ast.nodes.items(.main_token)[lit],
+                    .data = .{ .lhs = lit, .rhs = 0 },
+                }, self.allocator);
+            },
+            .kw_true, .kw_false => {
+                const lit = try self.parseLiteral(.bool_literal);
+                return self.ast.addNode(.{
+                    .tag = .pattern_literal,
+                    .main_token = self.ast.nodes.items(.main_token)[lit],
+                    .data = .{ .lhs = lit, .rhs = 0 },
+                }, self.allocator);
+            },
+            .kw_nil => {
+                const lit = try self.parseLiteral(.nil_literal);
+                return self.ast.addNode(.{
+                    .tag = .pattern_literal,
+                    .main_token = self.ast.nodes.items(.main_token)[lit],
+                    .data = .{ .lhs = lit, .rhs = 0 },
+                }, self.allocator);
+            },
+
+            // `[` -> list pattern
+            .left_bracket => return self.parseListPattern(),
+
+            // `(` -> tuple pattern
+            .left_paren => return self.parseTuplePattern(),
+
+            // `{` -> record pattern
+            .left_brace => return self.parseRecordPattern(),
+
+            else => {
+                try self.emitError("expected pattern");
+                return error.ParseError;
+            },
+        }
+    }
+
+    /// Parse ADT pattern: `TypeName.Variant` or `TypeName.Variant(sub_pat, ...)`
+    fn parseAdtPattern(self: *Parser) Error!Node.Index {
+        const type_tok = self.pos;
+        self.advance(); // consume TypeName
+
+        if (self.peekTag() != .dot) {
+            try self.emitError("expected '.' after type name in pattern");
+            return error.ParseError;
+        }
+        self.advance(); // consume '.'
+
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected variant name after '.'");
+            return error.ParseError;
+        }
+        const variant_tok = self.pos;
+        self.advance(); // consume VariantName
+
+        // Store type_token and variant_token in extra_data.
+        const type_extra = try self.ast.addExtra(type_tok, self.allocator);
+        _ = try self.ast.addExtra(variant_tok, self.allocator);
+
+        // Check for sub-patterns: `(sub_pat, ...)`
+        var sub_pats_start: u32 = @intCast(self.ast.extra_data.items.len);
+        var sub_pats_end: u32 = sub_pats_start;
+
+        if (self.peekTag() == .left_paren) {
+            self.advance(); // consume '('
+
+            var sub_pats: std.ArrayListUnmanaged(u32) = .empty;
+            defer sub_pats.deinit(self.allocator);
+
+            if (self.peekTag() != .right_paren) {
+                const first = try self.parsePattern();
+                try sub_pats.append(self.allocator, first);
+
+                while (self.peekTag() == .comma) {
+                    self.advance(); // consume ','
+                    if (self.peekTag() == .right_paren) break;
+                    const sub = try self.parsePattern();
+                    try sub_pats.append(self.allocator, sub);
+                }
+            }
+
+            if (self.peekTag() != .right_paren) {
+                try self.emitError("expected ')' to close ADT sub-patterns");
+                return error.ParseError;
+            }
+            self.advance(); // consume ')'
+
+            sub_pats_start = @intCast(self.ast.extra_data.items.len);
+            for (sub_pats.items) |sp| {
+                _ = try self.ast.addExtra(sp, self.allocator);
+            }
+            sub_pats_end = @intCast(self.ast.extra_data.items.len);
+        }
+
+        // Store sub-pattern range in extra_data.
+        const sub_extra = try self.ast.addExtra(sub_pats_start, self.allocator);
+        _ = try self.ast.addExtra(sub_pats_end, self.allocator);
+
+        return self.ast.addNode(.{
+            .tag = .pattern_adt,
+            .main_token = type_tok,
+            .data = .{ .lhs = type_extra, .rhs = sub_extra },
+        }, self.allocator);
+    }
+
+    /// Parse list pattern: `[p1, p2, ..rest]`
+    fn parseListPattern(self: *Parser) Error!Node.Index {
+        const bracket_tok = self.pos;
+        self.advance(); // consume '['
+
+        var elements: std.ArrayListUnmanaged(u32) = .empty;
+        defer elements.deinit(self.allocator);
+
+        if (self.peekTag() != .right_bracket) {
+            // Check for `..rest` at start.
+            if (self.peekTag() == .dot_dot) {
+                const rest = try self.parseRestPattern();
+                try elements.append(self.allocator, rest);
+            } else {
+                const first = try self.parsePattern();
+                try elements.append(self.allocator, first);
+            }
+
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                if (self.peekTag() == .right_bracket) break;
+                if (self.peekTag() == .dot_dot) {
+                    const rest = try self.parseRestPattern();
+                    try elements.append(self.allocator, rest);
+                    break; // rest must be last
+                }
+                const elem = try self.parsePattern();
+                try elements.append(self.allocator, elem);
+            }
+        }
+
+        if (self.peekTag() != .right_bracket) {
+            try self.emitError("expected ']' to close list pattern");
+            return error.ParseError;
+        }
+        self.advance(); // consume ']'
+
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (elements.items) |e| {
+            _ = try self.ast.addExtra(e, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .pattern_list,
+            .main_token = bracket_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Parse tuple pattern: `(p1, p2)`
+    fn parseTuplePattern(self: *Parser) Error!Node.Index {
+        const paren_tok = self.pos;
+        self.advance(); // consume '('
+
+        var elements: std.ArrayListUnmanaged(u32) = .empty;
+        defer elements.deinit(self.allocator);
+
+        if (self.peekTag() != .right_paren) {
+            const first = try self.parsePattern();
+            try elements.append(self.allocator, first);
+
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                if (self.peekTag() == .right_paren) break;
+                const elem = try self.parsePattern();
+                try elements.append(self.allocator, elem);
+            }
+        }
+
+        if (self.peekTag() != .right_paren) {
+            try self.emitError("expected ')' to close tuple pattern");
+            return error.ParseError;
+        }
+        self.advance(); // consume ')'
+
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (elements.items) |e| {
+            _ = try self.ast.addExtra(e, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .pattern_tuple,
+            .main_token = paren_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Parse record pattern: `{field: pattern, ...}`
+    fn parseRecordPattern(self: *Parser) Error!Node.Index {
+        const brace_tok = self.pos;
+        self.advance(); // consume '{'
+
+        var pairs: std.ArrayListUnmanaged(u32) = .empty;
+        defer pairs.deinit(self.allocator);
+
+        if (self.peekTag() != .right_brace) {
+            // Parse first field pattern.
+            if (self.peekTag() != .identifier) {
+                try self.emitError("expected field name in record pattern");
+                return error.ParseError;
+            }
+            const name_tok = self.pos;
+            self.advance(); // consume identifier
+            if (self.peekTag() != .colon) {
+                try self.emitError("expected ':' after field name in record pattern");
+                return error.ParseError;
+            }
+            self.advance(); // consume ':'
+            const pat = try self.parsePattern();
+            try pairs.append(self.allocator, name_tok);
+            try pairs.append(self.allocator, pat);
+
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                if (self.peekTag() == .right_brace) break;
+                if (self.peekTag() != .identifier) {
+                    try self.emitError("expected field name in record pattern");
+                    return error.ParseError;
+                }
+                const fname_tok = self.pos;
+                self.advance(); // consume identifier
+                if (self.peekTag() != .colon) {
+                    try self.emitError("expected ':' after field name in record pattern");
+                    return error.ParseError;
+                }
+                self.advance(); // consume ':'
+                const fpat = try self.parsePattern();
+                try pairs.append(self.allocator, fname_tok);
+                try pairs.append(self.allocator, fpat);
+            }
+        }
+
+        if (self.peekTag() != .right_brace) {
+            try self.emitError("expected '}' to close record pattern");
+            return error.ParseError;
+        }
+        self.advance(); // consume '}'
+
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (pairs.items) |p| {
+            _ = try self.ast.addExtra(p, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .pattern_record,
+            .main_token = brace_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Parse rest pattern: `..rest`
+    fn parseRestPattern(self: *Parser) Error!Node.Index {
+        const dot_tok = self.pos;
+        self.advance(); // consume '..'
+
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected identifier after '..' in rest pattern");
+            return error.ParseError;
+        }
+        const name_tok = self.pos;
+        self.advance(); // consume identifier
+
+        return self.ast.addNode(.{
+            .tag = .pattern_rest,
+            .main_token = dot_tok,
+            .data = .{ .lhs = name_tok, .rhs = 0 },
+        }, self.allocator);
+    }
+
     fn parseBlockExpr(self: *Parser) Error!Node.Index {
         if (self.peekTag() != .left_brace) {
             try self.emitError("expected '{'");
@@ -1183,7 +1695,7 @@ pub const Parser = struct {
         while (!self.atEnd()) {
             // Stop at tokens that can start a new statement.
             switch (self.peekTag()) {
-                .kw_let, .kw_if, .kw_while, .kw_for, .kw_fn, .kw_return, .right_brace => return,
+                .kw_let, .kw_if, .kw_while, .kw_for, .kw_fn, .kw_return, .kw_type, .kw_match, .right_brace => return,
                 else => self.advance(),
             }
         }
@@ -2182,4 +2694,211 @@ test "parser: block expression still works with { statements }" {
     const stmts = rootStmts(&r.ast);
     const expr = nodeData(&r.ast, stmts[0]).lhs;
     try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, expr));
+}
+
+// ── Phase 3 ADT and Pattern Matching Parsing Tests ────────────────────
+
+test "parser: type declaration with variants" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("type Color = | Red | Green | Blue | Hex(String)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(@as(usize, 1), stmts.len);
+    try std.testing.expectEqual(Node.Tag.type_decl, nodeTag(&r.ast, stmts[0]));
+
+    // Extract extra_data: [name_token, variant_count, then per variant: name_token, arity]
+    const data = nodeData(&r.ast, stmts[0]);
+    const extra_idx = data.lhs;
+    const ed = r.ast.extra_data.items;
+    const variant_count = ed[extra_idx + 1];
+    try std.testing.expectEqual(@as(u32, 4), variant_count);
+
+    // Red: arity 0
+    try std.testing.expectEqual(@as(u32, 0), ed[extra_idx + 3]); // Red arity
+    // Green: arity 0
+    try std.testing.expectEqual(@as(u32, 0), ed[extra_idx + 5]); // Green arity
+    // Blue: arity 0
+    try std.testing.expectEqual(@as(u32, 0), ed[extra_idx + 7]); // Blue arity
+    // Hex: arity 1
+    try std.testing.expectEqual(@as(u32, 1), ed[extra_idx + 9]); // Hex arity
+}
+
+test "parser: type declaration with multi-field variant" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("type Shape = | Circle(Float) | Rect(Float, Float)", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    try std.testing.expectEqual(Node.Tag.type_decl, nodeTag(&r.ast, stmts[0]));
+
+    const data = nodeData(&r.ast, stmts[0]);
+    const extra_idx = data.lhs;
+    const ed = r.ast.extra_data.items;
+    const variant_count = ed[extra_idx + 1];
+    try std.testing.expectEqual(@as(u32, 2), variant_count);
+
+    // Circle: arity 1
+    try std.testing.expectEqual(@as(u32, 1), ed[extra_idx + 3]);
+    // Rect: arity 2
+    try std.testing.expectEqual(@as(u32, 2), ed[extra_idx + 5]);
+}
+
+test "parser: match expression with literal patterns" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("match x | 1 -> \"one\" | 2 -> \"two\" | _ -> \"other\"", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.match_expr, nodeTag(&r.ast, expr));
+
+    // Scrutinee is identifier.
+    const match_data = nodeData(&r.ast, expr);
+    try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, match_data.lhs));
+
+    // 3 arms stored in extra_data.
+    const arms_extra = match_data.rhs;
+    const arms_start = r.ast.extra_data.items[arms_extra];
+    const arms_end = r.ast.extra_data.items[arms_extra + 1];
+    const arms = r.ast.extra_data.items[arms_start..arms_end];
+    try std.testing.expectEqual(@as(usize, 3), arms.len);
+
+    // First arm: match_arm with pattern_literal
+    try std.testing.expectEqual(Node.Tag.match_arm, nodeTag(&r.ast, arms[0]));
+    const arm0_data = nodeData(&r.ast, arms[0]);
+    try std.testing.expectEqual(Node.Tag.pattern_literal, nodeTag(&r.ast, arm0_data.lhs));
+
+    // Third arm: match_arm with pattern_wildcard
+    try std.testing.expectEqual(Node.Tag.match_arm, nodeTag(&r.ast, arms[2]));
+    const arm2_data = nodeData(&r.ast, arms[2]);
+    try std.testing.expectEqual(Node.Tag.pattern_wildcard, nodeTag(&r.ast, arm2_data.lhs));
+}
+
+test "parser: match with guarded arm" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("match x | n when n > 0 -> n | _ -> 0", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.match_expr, nodeTag(&r.ast, expr));
+
+    const match_data = nodeData(&r.ast, expr);
+    const arms_extra = match_data.rhs;
+    const arms_start = r.ast.extra_data.items[arms_extra];
+    const arms_end = r.ast.extra_data.items[arms_extra + 1];
+    const arms = r.ast.extra_data.items[arms_start..arms_end];
+    try std.testing.expectEqual(@as(usize, 2), arms.len);
+
+    // First arm is guarded.
+    try std.testing.expectEqual(Node.Tag.match_arm_guarded, nodeTag(&r.ast, arms[0]));
+    // Second arm is unguarded wildcard.
+    try std.testing.expectEqual(Node.Tag.match_arm, nodeTag(&r.ast, arms[1]));
+}
+
+test "parser: match with ADT pattern" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("match v | Option.Some(x) -> x | Option.None -> 0", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.match_expr, nodeTag(&r.ast, expr));
+
+    const match_data = nodeData(&r.ast, expr);
+    const arms_extra = match_data.rhs;
+    const arms_start = r.ast.extra_data.items[arms_extra];
+    const arms_end = r.ast.extra_data.items[arms_extra + 1];
+    const arms = r.ast.extra_data.items[arms_start..arms_end];
+    try std.testing.expectEqual(@as(usize, 2), arms.len);
+
+    // First arm has ADT pattern.
+    const arm0_data = nodeData(&r.ast, arms[0]);
+    try std.testing.expectEqual(Node.Tag.pattern_adt, nodeTag(&r.ast, arm0_data.lhs));
+}
+
+test "parser: match with binding pattern" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("match x | val -> val", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.match_expr, nodeTag(&r.ast, expr));
+
+    const match_data = nodeData(&r.ast, expr);
+    const arms_extra = match_data.rhs;
+    const arms_start = r.ast.extra_data.items[arms_extra];
+    const arms_end = r.ast.extra_data.items[arms_extra + 1];
+    const arms = r.ast.extra_data.items[arms_start..arms_end];
+
+    const arm_data = nodeData(&r.ast, arms[0]);
+    try std.testing.expectEqual(Node.Tag.pattern_binding, nodeTag(&r.ast, arm_data.lhs));
+}
+
+test "parser: list pattern [a, b, ..rest]" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("match xs | [a, b, ..rest] -> a", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    try std.testing.expectEqual(Node.Tag.match_expr, nodeTag(&r.ast, expr));
+
+    const match_data = nodeData(&r.ast, expr);
+    const arms_extra = match_data.rhs;
+    const arms_start = r.ast.extra_data.items[arms_extra];
+    const arms_end = r.ast.extra_data.items[arms_extra + 1];
+    const arms = r.ast.extra_data.items[arms_start..arms_end];
+
+    const arm_data = nodeData(&r.ast, arms[0]);
+    try std.testing.expectEqual(Node.Tag.pattern_list, nodeTag(&r.ast, arm_data.lhs));
+
+    // List pattern should have 3 elements: binding a, binding b, rest.
+    const list_data = nodeData(&r.ast, arm_data.lhs);
+    const elements = r.ast.extra_data.items[list_data.lhs..list_data.rhs];
+    try std.testing.expectEqual(@as(usize, 3), elements.len);
+    try std.testing.expectEqual(Node.Tag.pattern_binding, nodeTag(&r.ast, elements[0]));
+    try std.testing.expectEqual(Node.Tag.pattern_binding, nodeTag(&r.ast, elements[1]));
+    try std.testing.expectEqual(Node.Tag.pattern_rest, nodeTag(&r.ast, elements[2]));
+}
+
+test "parser: tuple pattern (a, b)" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("match p | (x, y) -> x", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    const match_data = nodeData(&r.ast, expr);
+    const arms_extra = match_data.rhs;
+    const arms_start = r.ast.extra_data.items[arms_extra];
+    const arms_end = r.ast.extra_data.items[arms_extra + 1];
+    const arms = r.ast.extra_data.items[arms_start..arms_end];
+
+    const arm_data = nodeData(&r.ast, arms[0]);
+    try std.testing.expectEqual(Node.Tag.pattern_tuple, nodeTag(&r.ast, arm_data.lhs));
+}
+
+test "parser: record pattern {field: pat}" {
+    const allocator = std.testing.allocator;
+    var r = try testParseOwned("match r | {name: n, age: a} -> n", allocator);
+    defer r.deinit(allocator);
+
+    const stmts = rootStmts(&r.ast);
+    const expr = nodeData(&r.ast, stmts[0]).lhs;
+    const match_data = nodeData(&r.ast, expr);
+    const arms_extra = match_data.rhs;
+    const arms_start = r.ast.extra_data.items[arms_extra];
+    const arms_end = r.ast.extra_data.items[arms_extra + 1];
+    const arms = r.ast.extra_data.items[arms_start..arms_end];
+
+    const arm_data = nodeData(&r.ast, arms[0]);
+    try std.testing.expectEqual(Node.Tag.pattern_record, nodeTag(&r.ast, arm_data.lhs));
+
+    // Record pattern should have 4 entries (2 fields * 2).
+    const rec_data = nodeData(&r.ast, arm_data.lhs);
+    const pairs = r.ast.extra_data.items[rec_data.lhs..rec_data.rhs];
+    try std.testing.expectEqual(@as(usize, 4), pairs.len);
 }
