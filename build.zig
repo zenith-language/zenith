@@ -185,6 +185,16 @@ pub fn build(b: *std.Build) void {
     gc_nursery_mod.addImport("stream", stream_mod_build);
     gc_oldgen_mod.addImport("stream", stream_mod_build);
 
+    const json_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/json.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+        },
+    });
+
     const builtins_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib/builtins.zig"),
         .target = target,
@@ -193,6 +203,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "value", .module = value_mod },
             .{ .name = "obj", .module = obj_mod },
             .{ .name = "stream", .module = stream_mod_build },
+            .{ .name = "json", .module = json_mod },
         },
     });
 
@@ -329,6 +340,7 @@ pub fn build(b: *std.Build) void {
         compiler_mod,
         builtins_mod,
         stream_mod_build,
+        json_mod,
         vm_mod,
     };
 
