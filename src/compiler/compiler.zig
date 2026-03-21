@@ -183,6 +183,13 @@ pub const Compiler = struct {
         "map", "filter", "take", "drop",
         // Stream terminals (64-65)
         "collect", "count",
+        // Stream transforms continued (66-73)
+        "flat_map", "filter_map", "scan", "distinct",
+        "zip", "flatten", "tap", "batch",
+        // Stream terminals continued (74-80)
+        "sum", "reduce", "first", "last", "each", "min", "max",
+        // Stream error handling (81)
+        "partition_result",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-14 to match

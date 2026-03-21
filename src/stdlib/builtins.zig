@@ -259,6 +259,28 @@ pub const builtins = [_]BuiltinDesc{
     // ── Stream terminals (indices 64-65) ──────────────────────────
     .{ .name = "collect", .func = &builtinCollect, .arity_min = 1, .arity_max = 1 },
     .{ .name = "count", .func = &builtinCount, .arity_min = 1, .arity_max = 1 },
+
+    // ── Stream transforms continued (indices 66-73) ─────────────
+    .{ .name = "flat_map", .func = &builtinFlatMap, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "filter_map", .func = &builtinFilterMap, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "scan", .func = &builtinScan, .arity_min = 3, .arity_max = 3 },
+    .{ .name = "distinct", .func = &builtinDistinct, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "zip", .func = &builtinZip, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "flatten", .func = &builtinFlatten, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "tap", .func = &builtinTap, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "batch", .func = &builtinBatch, .arity_min = 2, .arity_max = 2 },
+
+    // ── Stream terminals continued (indices 74-80) ──────────────
+    .{ .name = "sum", .func = &builtinSum, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "reduce", .func = &builtinReduce, .arity_min = 3, .arity_max = 3 },
+    .{ .name = "first", .func = &builtinFirst, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "last", .func = &builtinLast, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "each", .func = &builtinEach, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "min", .func = &builtinMin, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "max", .func = &builtinMax, .arity_min = 1, .arity_max = 1 },
+
+    // ── Stream error handling (index 81) ────────────────────────
+    .{ .name = "partition_result", .func = &builtinPartitionResult, .arity_min = 1, .arity_max = 1 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -1635,6 +1657,499 @@ fn builtinCount(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     }
 
     return Value.fromInt(n);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Stream transforms (continued) ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+/// flat_map(stream, fn) -> Stream: apply fn to each element (fn returns stream/list), flatten results.
+fn builtinFlatMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "flat_map() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isObjType(.closure)) {
+        err_msg.* = "flat_map() expects a function as second argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .flat_map_op = .{
+        .upstream = first,
+        .fn_val = args[1],
+        .inner = Value.nil,
+    } };
+    return createStream(state, allocator);
+}
+
+/// filter_map(stream_or_list, fn) -> Stream or List: overloaded dispatch.
+/// For streams: apply fn, keep only Some values. For lists: delegate to List.filter_map.
+fn builtinFilterMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (first.isObjType(.stream)) {
+        if (!args[1].isObjType(.closure)) {
+            err_msg.* = "filter_map() expects a function as second argument";
+            return error.RuntimeError;
+        }
+        const state = try allocator.create(StreamState);
+        state.* = .{ .filter_map_op = .{
+            .upstream = first,
+            .fn_val = args[1],
+        } };
+        return createStream(state, allocator);
+    }
+    if (first.isObjType(.list)) {
+        return builtinListFilterMap(args, allocator, err_msg);
+    }
+    err_msg.* = "filter_map() expects a stream or list as first argument";
+    return error.RuntimeError;
+}
+
+/// scan(stream, init, fn) -> Stream: accumulate state across elements.
+fn builtinScan(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "scan() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[2].isObjType(.closure)) {
+        err_msg.* = "scan() expects a function as third argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .scan_op = .{
+        .upstream = first,
+        .acc = args[1],
+        .fn_val = args[2],
+    } };
+    return createStream(state, allocator);
+}
+
+/// distinct(stream) -> Stream: remove duplicate elements.
+fn builtinDistinct(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "distinct() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .distinct_op = .{
+        .upstream = first,
+        .seen = .{},
+    } };
+    return createStream(state, allocator);
+}
+
+/// zip(stream_or_list, stream_or_list) -> Stream or List: overloaded dispatch.
+/// For streams: zip element-wise into tuples. For lists: delegate to List.zip.
+fn builtinZip(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (first.isObjType(.stream)) {
+        var second = args[1];
+        if (second.isObjType(.range)) {
+            second = try autoWrapRange(second, allocator);
+        }
+        if (!second.isObjType(.stream)) {
+            err_msg.* = "zip() expects a stream as second argument when first is stream";
+            return error.RuntimeError;
+        }
+        const state = try allocator.create(StreamState);
+        state.* = .{ .zip_op = .{
+            .upstream_a = first,
+            .upstream_b = second,
+        } };
+        return createStream(state, allocator);
+    }
+    if (first.isObjType(.list)) {
+        return builtinListZip(args, allocator, err_msg);
+    }
+    err_msg.* = "zip() expects a stream or list as first argument";
+    return error.RuntimeError;
+}
+
+/// flatten(stream_or_list) -> Stream or List: overloaded dispatch.
+/// For streams: flatten stream of lists/streams. For lists: delegate to List.flatten.
+fn builtinFlatten(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (first.isObjType(.stream)) {
+        const state = try allocator.create(StreamState);
+        state.* = .{ .flatten_op = .{
+            .upstream = first,
+            .inner_list = Value.nil,
+            .inner_idx = 0,
+            .inner_stream = Value.nil,
+        } };
+        return createStream(state, allocator);
+    }
+    if (first.isObjType(.list)) {
+        return builtinListFlatten(args, allocator, err_msg);
+    }
+    err_msg.* = "flatten() expects a stream or list as first argument";
+    return error.RuntimeError;
+}
+
+/// tap(stream, fn) -> Stream: invoke side-effect function without altering elements.
+fn builtinTap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "tap() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isObjType(.closure)) {
+        err_msg.* = "tap() expects a function as second argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .tap_op = .{
+        .upstream = first,
+        .fn_val = args[1],
+    } };
+    return createStream(state, allocator);
+}
+
+/// batch(stream, size) -> Stream: group elements into fixed-size lists.
+fn builtinBatch(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "batch() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isInt()) {
+        err_msg.* = "batch() expects an integer as second argument";
+        return error.RuntimeError;
+    }
+    const size = args[1].asInt();
+    if (size <= 0) {
+        err_msg.* = "batch() size must be positive";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .batch_op = .{
+        .upstream = first,
+        .size = size,
+        .exhausted = false,
+    } };
+    return createStream(state, allocator);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Stream terminals (continued) ───────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+/// sum(stream) -> Int/Float: terminal that sums all elements.
+fn builtinSum(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "sum() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    var int_sum: i64 = 0;
+    var has_float = false;
+    var float_sum: f64 = 0.0;
+
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        if (isAdtVariant(val, 0, 1)) break;
+        const elem = adtPayload(val, 0);
+        if (elem.isInt()) {
+            if (has_float) {
+                float_sum += @as(f64, @floatFromInt(elem.asInt()));
+            } else {
+                int_sum += @as(i64, elem.asInt());
+            }
+        } else if (elem.isFloat()) {
+            if (!has_float) {
+                has_float = true;
+                float_sum = @as(f64, @floatFromInt(int_sum));
+            }
+            float_sum += elem.asFloat();
+        }
+    }
+
+    if (has_float) {
+        return Value.fromFloat(float_sum);
+    }
+    // Try to return as i32 if it fits, otherwise use i64.
+    if (int_sum >= @as(i64, std.math.minInt(i32)) and int_sum <= @as(i64, std.math.maxInt(i32))) {
+        return Value.fromInt(@intCast(int_sum));
+    }
+    return Value.fromI64(int_sum, allocator);
+}
+
+/// reduce(stream_or_list, init, fn) -> value: overloaded dispatch.
+/// For streams: fold with accumulator. For lists: delegate to List.reduce.
+fn builtinReduce(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (first.isObjType(.stream)) {
+        if (!args[2].isObjType(.closure)) {
+            err_msg.* = "reduce() expects a function as third argument";
+            return error.RuntimeError;
+        }
+        setStreamCallbacks();
+        defer stream_mod.clearVM();
+
+        const stream_obj = ObjStream.fromObj(first.asObj());
+        var acc = args[1];
+        const closure_val = args[2];
+
+        while (true) {
+            const val = try stream_obj.state.next(allocator);
+            if (isAdtVariant(val, 0, 1)) break;
+            const elem = adtPayload(val, 0);
+            acc = try callClosure(closure_val, &[_]Value{ acc, elem });
+        }
+        return acc;
+    }
+    if (first.isObjType(.list)) {
+        return builtinListReduce(args, allocator, err_msg);
+    }
+    err_msg.* = "reduce() expects a stream or list as first argument";
+    return error.RuntimeError;
+}
+
+/// first(stream) -> Option: terminal that returns Some(first element) or None.
+fn builtinFirst(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "first() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    const val = try stream_obj.state.next(allocator);
+    if (isAdtVariant(val, 0, 1)) {
+        // Empty stream -> None.
+        return makeNone(allocator);
+    }
+    const elem = adtPayload(val, 0);
+    return makeSome(elem, allocator);
+}
+
+/// last(stream) -> Option: terminal that returns Some(last element) or None.
+fn builtinLast(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "last() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    var last_val: ?Value = null;
+
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        if (isAdtVariant(val, 0, 1)) break;
+        last_val = adtPayload(val, 0);
+    }
+
+    if (last_val) |lv| {
+        return makeSome(lv, allocator);
+    }
+    return makeNone(allocator);
+}
+
+/// each(stream, fn) -> nil: terminal that calls fn on each element for side effects.
+fn builtinEach(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "each() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isObjType(.closure)) {
+        err_msg.* = "each() expects a function as second argument";
+        return error.RuntimeError;
+    }
+
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    const closure_val = args[1];
+
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        if (isAdtVariant(val, 0, 1)) break;
+        const elem = adtPayload(val, 0);
+        _ = try callClosure(closure_val, &[_]Value{elem});
+    }
+
+    return Value.nil;
+}
+
+/// min(stream) -> Option: terminal that returns Some(minimum) or None.
+fn builtinMin(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "min() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    var min_val: ?Value = null;
+
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        if (isAdtVariant(val, 0, 1)) break;
+        const elem = adtPayload(val, 0);
+        if (min_val) |current_min| {
+            if (valueLessThan(elem, current_min)) {
+                min_val = elem;
+            }
+        } else {
+            min_val = elem;
+        }
+    }
+
+    if (min_val) |mv| {
+        return makeSome(mv, allocator);
+    }
+    return makeNone(allocator);
+}
+
+/// max(stream) -> Option: terminal that returns Some(maximum) or None.
+fn builtinMax(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "max() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+    var max_val: ?Value = null;
+
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        if (isAdtVariant(val, 0, 1)) break;
+        const elem = adtPayload(val, 0);
+        if (max_val) |current_max| {
+            if (valueLessThan(current_max, elem)) {
+                max_val = elem;
+            }
+        } else {
+            max_val = elem;
+        }
+    }
+
+    if (max_val) |mv| {
+        return makeSome(mv, allocator);
+    }
+    return makeNone(allocator);
+}
+
+/// Helper: compare two numeric values for less-than ordering.
+fn valueLessThan(a: Value, b: Value) bool {
+    if (a.isInt() and b.isInt()) return a.asInt() < b.asInt();
+    // Promote to float for mixed comparisons.
+    const fa: f64 = if (a.isInt()) @floatFromInt(a.asInt()) else if (a.isFloat()) a.asFloat() else return false;
+    const fb: f64 = if (b.isInt()) @floatFromInt(b.asInt()) else if (b.isFloat()) b.asFloat() else return false;
+    return fa < fb;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Stream error handling ──────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+/// partition_result(stream) -> Record {ok: Stream, err: Stream}: split stream of Results.
+fn builtinPartitionResult(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "partition_result() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    // Create shared partition state.
+    const shared = try allocator.create(StreamState.PartitionState);
+    shared.* = .{
+        .upstream = first,
+        .ok_queue = .{},
+        .err_queue = .{},
+    };
+
+    // Create ok stream.
+    const ok_state = try allocator.create(StreamState);
+    ok_state.* = .{ .partition_ok = .{ .shared = shared } };
+    const ok_stream = try ObjStream.create(allocator, ok_state);
+    trackObj(&ok_stream.obj);
+
+    // Create err stream.
+    const err_state = try allocator.create(StreamState);
+    err_state.* = .{ .partition_err = .{ .shared = shared } };
+    const err_stream = try ObjStream.create(allocator, err_state);
+    trackObj(&err_stream.obj);
+
+    // Create record {ok: Stream, err: Stream}.
+    const names = [_][]const u8{ "ok", "err" };
+    const values = [_]Value{ Value.fromObj(&ok_stream.obj), Value.fromObj(&err_stream.obj) };
+    const record = try ObjRecord.create(allocator, &names, &values);
+    trackObj(&record.obj);
+
+    return Value.fromObj(&record.obj);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
