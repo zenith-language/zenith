@@ -56,6 +56,8 @@ const normal_tests = [_]TestCase{
     // Phase 4 tests
     .{ .name = "gc", .zen_path = "tests/zen/gc.zen", .expected_path = "tests/zen/gc.expected", .is_error_test = false },
     .{ .name = "gc_stress", .zen_path = "tests/zen/gc_stress.zen", .expected_path = "tests/zen/gc_stress.expected", .is_error_test = false },
+    // Phase 5 tests
+    .{ .name = "streams_basic", .zen_path = "tests/zen/streams_basic.zen", .expected_path = "tests/zen/streams_basic.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
@@ -421,6 +423,22 @@ test "e2e: result_option" {
 
 test "e2e: string_ops" {
     try runNormalTest(normal_tests[21]);
+}
+
+// ── Phase 4 normal tests ──────────────────────────────────────────────────
+
+test "e2e: gc" {
+    try runNormalTest(normal_tests[22]);
+}
+
+test "e2e: gc_stress" {
+    try runNormalTest(normal_tests[23]);
+}
+
+// ── Phase 5 normal tests ──────────────────────────────────────────────────
+
+test "e2e: streams_basic" {
+    try runNormalTest(normal_tests[24]);
 }
 
 // ── Phase 3 error tests ──────────────────────────────────────────────────

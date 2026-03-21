@@ -212,20 +212,35 @@ pub const NativeError = error{
 /// Callback type: invoke a closure Value with given arguments.
 pub const CallClosureFn = *const fn (vm_ptr: *anyopaque, closure_val: Value, args: []const Value) ?Value;
 
+/// Callback type: register a heap object with the VM for cleanup.
+pub const TrackObjFn = *const fn (vm_ptr: *anyopaque, o: *Obj) void;
+
 /// Module-level callback state (set by builtins.zig before terminal execution).
 var current_vm: ?*anyopaque = null;
 var call_closure_fn: ?CallClosureFn = null;
+var track_obj_fn: ?TrackObjFn = null;
 
 /// Set VM callbacks for stream operations.
-pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn) void {
+pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {
     current_vm = vm_ptr;
     call_closure_fn = closure_fn;
+    track_obj_fn = track_fn;
 }
 
 /// Clear VM callbacks.
 pub fn clearVM() void {
     current_vm = null;
     call_closure_fn = null;
+    track_obj_fn = null;
+}
+
+/// Track an intermediate heap object with the VM.
+fn trackObj(o: *Obj) void {
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |f| {
+            f(vm_ptr, o);
+        }
+    }
 }
 
 /// Internal helper: invoke a closure from within a stream operation.
@@ -240,11 +255,13 @@ fn callClosure(closure_val: Value, args: []const Value) NativeError!Value {
 
 fn makeNone(allocator: Allocator) NativeError!Value {
     const adt = try ObjAdt.create(allocator, 0, 1, &[_]Value{});
+    trackObj(&adt.obj);
     return Value.fromObj(&adt.obj);
 }
 
 fn makeSome(val: Value, allocator: Allocator) NativeError!Value {
     const adt = try ObjAdt.create(allocator, 0, 0, &[_]Value{val});
+    trackObj(&adt.obj);
     return Value.fromObj(&adt.obj);
 }
 

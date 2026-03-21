@@ -1415,6 +1415,16 @@ fn valueCompare(ctx: void, a: Value, b: Value) bool {
 
 // ── Stream builtin implementations ────────────────────────────────────
 
+/// Set up stream.zig callbacks from the builtins module-level state.
+/// The stream module needs call_closure and track_obj to function.
+fn setStreamCallbacks() void {
+    if (current_vm) |vm_ptr| {
+        const closure_fn = call_closure_fn orelse return;
+        const tfn = track_obj_fn orelse return;
+        stream_mod.setVM(vm_ptr, closure_fn, tfn);
+    }
+}
+
 /// Helper: create an ObjStream with the given state, track it with the VM.
 fn createStream(state: *StreamState, allocator: Allocator) NativeError!Value {
     const s = try ObjStream.create(allocator, state);
@@ -1579,11 +1589,7 @@ fn builtinCollect(args: []const Value, allocator: Allocator, err_msg: *[]const u
     }
 
     // Set stream module callbacks to match our current VM callbacks.
-    if (current_vm) |vm_ptr| {
-        if (call_closure_fn) |fn_ptr| {
-            stream_mod.setVM(vm_ptr, fn_ptr);
-        }
-    }
+    setStreamCallbacks();
     defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
@@ -1616,11 +1622,7 @@ fn builtinCount(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     }
 
     // Set stream module callbacks.
-    if (current_vm) |vm_ptr| {
-        if (call_closure_fn) |fn_ptr| {
-            stream_mod.setVM(vm_ptr, fn_ptr);
-        }
-    }
+    setStreamCallbacks();
     defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());

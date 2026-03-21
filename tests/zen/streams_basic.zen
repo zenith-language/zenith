@@ -1,0 +1,25 @@
+-- TYPE-08: Stream is a first-class type
+print(type_of(repeat(1)))
+
+-- STRM-02: Generators (range auto-wrap, repeat, iterate)
+-- Note: tick() deferred to Phase 7 (requires fiber scheduler)
+print(repeat(42) |> take(3) |> collect())
+print(iterate(1, |x| x * 2) |> take(5) |> collect())
+print(range(1, 6) |> collect())
+
+-- STRM-03: Transforms (map, filter)
+print(range(1, 6) |> map(|x| x * 10) |> collect())
+print(range(1, 11) |> filter(|x| x > 7) |> collect())
+
+-- STRM-04: take/drop
+print(range(1, 11) |> drop(7) |> collect())
+
+-- STRM-10: Terminals (collect, count)
+print(range(1, 11) |> count())
+
+-- STRM-11 + STRM-12: Lazy eval + backpressure
+-- take(5) on infinite repeat stream completes without hanging
+-- This proves pull-based backpressure: the terminal (collect) drives
+-- evaluation, and take(5) stops pulling after 5 elements, so the
+-- infinite repeat never runs unbounded
+print(repeat(99) |> take(5) |> collect())
