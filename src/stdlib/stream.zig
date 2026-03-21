@@ -9,6 +9,9 @@ const ObjList = obj_mod.ObjList;
 const ObjRange = obj_mod.ObjRange;
 const ObjTuple = obj_mod.ObjTuple;
 const ObjStream = obj_mod.ObjStream;
+const ObjString = obj_mod.ObjString;
+const ObjRecord = obj_mod.ObjRecord;
+const json_mod = @import("json");
 
 /// Error type matching builtins.zig NativeError.
 pub const NativeError = error{
@@ -37,6 +40,9 @@ pub const StreamState = union(enum) {
     batch_op: BatchOp,
     partition_ok: PartitionOp,
     partition_err: PartitionOp,
+    file_reader: FileReaderOp,
+    jsonl_reader: JsonlReaderOp,
+    stdin_reader: StdinReaderOp,
 
     pub const RangeIter = struct {
         current: i32,
@@ -131,6 +137,117 @@ pub const StreamState = union(enum) {
         ok_queue: std.ArrayListUnmanaged(Value),
         err_queue: std.ArrayListUnmanaged(Value),
         ref_count: u8,
+    };
+
+    /// Heap-allocated state for file-based readers. Contains the read buffer
+    /// and File.Reader so that the reader's internal pointer to the buffer
+    /// remains stable (the buffer must outlive the reader).
+    pub const FileReaderState = struct {
+        file: std.fs.File,
+        read_buf: *[READ_BUF_SIZE]u8,
+        reader: std.fs.File.Reader,
+        done: bool,
+        line_buf: std.ArrayListUnmanaged(u8), // accumulator for StreamTooLong
+        is_stdin: bool, // if true, do NOT close file on deinit
+        line_number: usize, // tracks line count for JSONL error reporting
+
+        pub fn create(allocator: Allocator, file: std.fs.File, is_stdin: bool) !*FileReaderState {
+            const buf = try allocator.create([READ_BUF_SIZE]u8);
+            const state = try allocator.create(FileReaderState);
+            state.* = .{
+                .file = file,
+                .read_buf = buf,
+                .reader = file.reader(buf),
+                .done = false,
+                .line_buf = .{},
+                .is_stdin = is_stdin,
+                .line_number = 0,
+            };
+            return state;
+        }
+
+        pub fn deinit(self: *FileReaderState, allocator: Allocator) void {
+            self.line_buf.deinit(allocator);
+            if (!self.is_stdin) {
+                self.file.close();
+            }
+            allocator.destroy(self.read_buf);
+            allocator.destroy(self);
+        }
+
+        /// Read one line from the file. Returns the line bytes (owned by line_buf
+        /// or by the reader's internal buffer), or null on EOF.
+        /// File I/O errors are mapped to RuntimeError.
+        pub fn readLine(self: *FileReaderState, allocator: Allocator) NativeError!?[]const u8 {
+            if (self.done) return null;
+
+            // Reset accumulator for this line.
+            self.line_buf.clearRetainingCapacity();
+
+            while (true) {
+                const line_with_delim = self.reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+                    error.EndOfStream => {
+                        // Check for remaining data in buffer (last line without trailing newline).
+                        const remaining = self.reader.interface.buffer[self.reader.interface.seek..self.reader.interface.end];
+                        if (remaining.len > 0 or self.line_buf.items.len > 0) {
+                            // Accumulate remaining into line_buf if needed.
+                            if (remaining.len > 0) {
+                                self.line_buf.appendSlice(allocator, remaining) catch return error.OutOfMemory;
+                            }
+                            self.done = true;
+                            self.line_number += 1;
+                            return self.line_buf.items;
+                        }
+                        self.done = true;
+                        return null;
+                    },
+                    error.StreamTooLong => {
+                        // Line exceeds buffer -- accumulate what we have and continue.
+                        const partial = self.reader.interface.buffer[self.reader.interface.seek..self.reader.interface.end];
+                        self.line_buf.appendSlice(allocator, partial) catch return error.OutOfMemory;
+                        // Toss the buffered data so the reader refills.
+                        self.reader.interface.toss(@intCast(self.reader.interface.end - self.reader.interface.seek));
+                        continue;
+                    },
+                    else => return error.RuntimeError, // File I/O error
+                };
+
+                // Got a line (possibly with trailing \n). Strip it.
+                const line = if (line_with_delim.len > 0 and line_with_delim[line_with_delim.len - 1] == '\n')
+                    line_with_delim[0 .. line_with_delim.len - 1]
+                else
+                    line_with_delim;
+
+                // Also strip \r for Windows line endings.
+                const clean_line = if (line.len > 0 and line[line.len - 1] == '\r')
+                    line[0 .. line.len - 1]
+                else
+                    line;
+
+                self.line_number += 1;
+
+                // If we had accumulated partial data, append this final part.
+                if (self.line_buf.items.len > 0) {
+                    try self.line_buf.appendSlice(allocator, clean_line);
+                    return self.line_buf.items;
+                }
+                return clean_line;
+            }
+        }
+    };
+
+    pub const READ_BUF_SIZE = 256 * 1024; // 256KB read buffer
+
+    pub const FileReaderOp = struct {
+        frs: *FileReaderState,
+    };
+
+    pub const JsonlReaderOp = struct {
+        frs: *FileReaderState,
+    };
+
+    pub const StdinReaderOp = struct {
+        frs: *FileReaderState,
     };
 
     /// Pull the next element from this stream.
@@ -388,6 +505,15 @@ pub const StreamState = union(enum) {
             .partition_err => |s| {
                 return partitionNext(s.shared, false, allocator);
             },
+            .file_reader => |s| {
+                return fileReaderNext(s.frs, allocator);
+            },
+            .stdin_reader => |s| {
+                return fileReaderNext(s.frs, allocator);
+            },
+            .jsonl_reader => |s| {
+                return jsonlReaderNext(s.frs, allocator);
+            },
         }
     }
 
@@ -405,6 +531,15 @@ pub const StreamState = union(enum) {
                     allocator.destroy(s.shared);
                 }
             },
+            .file_reader => |*s| {
+                s.frs.deinit(allocator);
+            },
+            .jsonl_reader => |*s| {
+                s.frs.deinit(allocator);
+            },
+            .stdin_reader => |*s| {
+                s.frs.deinit(allocator);
+            },
             else => {},
         }
     }
@@ -413,7 +548,7 @@ pub const StreamState = union(enum) {
     /// All Value fields that might hold object references must be traced.
     pub fn traceGCRefs(self: *StreamState, nursery: anytype, gc: anytype) !void {
         switch (self.*) {
-            .range_iter => {},
+            .range_iter, .file_reader, .jsonl_reader, .stdin_reader => {},
             .repeat_iter => |*s| {
                 try nursery.processValue(&s.value, gc);
             },
@@ -483,7 +618,7 @@ pub const StreamState = union(enum) {
     /// Trace GC references for old-gen collection.
     pub fn traceGCRefsOldGen(self: *StreamState, oldgen: anytype, gc: anytype) !void {
         switch (self.*) {
-            .range_iter => {},
+            .range_iter, .file_reader, .jsonl_reader, .stdin_reader => {},
             .repeat_iter => |*s| {
                 try oldgen.processValue(&s.value, gc);
             },
@@ -550,6 +685,64 @@ pub const StreamState = union(enum) {
         }
     }
 };
+
+/// Helper for file_reader and stdin_reader next(): read one line as ObjString.
+fn fileReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) NativeError!Value {
+    const line = try frs.readLine(allocator);
+    if (line) |line_bytes| {
+        const str = try ObjString.create(allocator, line_bytes, null);
+        trackObj(&str.obj);
+        return makeSome(Value.fromObj(&str.obj), allocator);
+    }
+    return makeNone(allocator);
+}
+
+/// Helper for jsonl_reader next(): read one line, parse as JSON, wrap in Result.
+fn jsonlReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) NativeError!Value {
+    while (true) {
+        const line = try frs.readLine(allocator);
+        if (line) |line_bytes| {
+            // Skip empty lines between records.
+            if (line_bytes.len == 0) continue;
+
+            // Set JSON module callbacks for tracking.
+            if (current_vm) |vm_ptr| {
+                if (track_obj_fn) |tfn| {
+                    json_mod.setVM(vm_ptr, tfn);
+                }
+            }
+            defer json_mod.clearVM();
+
+            // Parse the line as JSON.
+            const parse_result = json_mod.parse(line_bytes, allocator);
+            switch (parse_result) {
+                .ok => |val| {
+                    // Wrap in Result.Ok (type_id=1, variant_idx=0).
+                    const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{val});
+                    trackObj(&ok_adt.obj);
+                    return makeSome(Value.fromObj(&ok_adt.obj), allocator);
+                },
+                .err => |e| {
+                    // Create ParseError record {message: String, line: Int}.
+                    const msg_str = try ObjString.create(allocator, e.message, null);
+                    trackObj(&msg_str.obj);
+                    const field_names = [_][]const u8{ "message", "line" };
+                    const field_values = [_]Value{
+                        Value.fromObj(&msg_str.obj),
+                        Value.fromInt(@intCast(@min(frs.line_number, @as(usize, @intCast(std.math.maxInt(i32)))))),
+                    };
+                    const record = try ObjRecord.create(allocator, &field_names, &field_values);
+                    trackObj(&record.obj);
+                    // Wrap in Result.Err (type_id=1, variant_idx=1).
+                    const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&record.obj)});
+                    trackObj(&err_adt.obj);
+                    return makeSome(Value.fromObj(&err_adt.obj), allocator);
+                },
+            }
+        }
+        return makeNone(allocator);
+    }
+}
 
 /// Shared helper for partition_ok and partition_err next() logic.
 /// If `want_ok` is true, returns from the ok_queue; otherwise from err_queue.

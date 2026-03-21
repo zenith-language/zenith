@@ -195,6 +195,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Wire stream_mod_build to import json for JSONL parsing.
+    stream_mod_build.addImport("json", json_mod);
+
     const builtins_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib/builtins.zig"),
         .target = target,
