@@ -1,0 +1,27 @@
+-- STRM-01: source() reads files line-by-line
+-- Count lines from a plain text file
+print(source("tests/zen/fixtures/sample.txt") |> count())
+
+-- Collect lines from plain text file
+print(source("tests/zen/fixtures/sample.txt") |> collect())
+
+-- STRM-15: JSONL source with format dispatch
+-- source with format: :jsonl parses each line as JSON wrapped in Result
+let results = source("tests/zen/fixtures/sample.jsonl", :jsonl) |> collect()
+print(len(results))
+
+-- First record should be Ok with a map (unwrap Option from List.get)
+let first = Option.unwrap_or(List.get(results, 0), nil)
+print(Result.is_ok(first))
+
+-- Third record (malformed JSON) should be Err
+let third = Option.unwrap_or(List.get(results, 2), nil)
+print(Result.is_err(third))
+
+-- STRM-09: sink() writes stream to file (plain text)
+range(1, 4) |> sink("/tmp/zen_e2e_sink_test.txt")
+print(source("/tmp/zen_e2e_sink_test.txt") |> collect())
+
+-- sink with JSONL format
+range(1, 4) |> sink("/tmp/zen_e2e_sink_jsonl.jsonl", :jsonl)
+print(source("/tmp/zen_e2e_sink_jsonl.jsonl") |> count())

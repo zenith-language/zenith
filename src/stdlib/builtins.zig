@@ -294,6 +294,10 @@ pub const builtins = [_]BuiltinDesc{
     // ── Json module (indices 82-83) ──────────────────────────────
     .{ .name = "Json.decode", .func = &builtinJsonDecode, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Json.encode", .func = &builtinJsonEncode, .arity_min = 1, .arity_max = 1 },
+
+    // ── File I/O (indices 84-85) ────────────────────────────────
+    .{ .name = "source", .func = &builtinSource, .arity_min = 1, .arity_max = 2 },
+    .{ .name = "sink", .func = &builtinSink, .arity_min = 2, .arity_max = 3 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -2232,6 +2236,221 @@ fn builtinJsonEncode(args: []const Value, allocator: Allocator, err_msg: *[]cons
             return makeErr(Value.fromObj(&err_str.obj), allocator);
         },
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── File I/O: source() and sink() ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Resolve an atom value to its name string using the current atom table.
+fn atomName(val: Value) ?[]const u8 {
+    if (!val.isAtom()) return null;
+    const names = current_atom_names orelse return null;
+    const id = val.asAtom();
+    if (id < names.len) return names[id];
+    return null;
+}
+
+/// source(path_or_atom, format?) -> Stream
+/// source("file.txt") creates a stream of lines from a plain text file.
+/// source("file.jsonl", format: :jsonl) creates Stream(Result(Map, ParseError)).
+/// source(:stdin) reads from standard input.
+fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    const first = args[0];
+
+    // Check for atom :stdin.
+    if (first.isAtom()) {
+        if (atomName(first)) |name| {
+            if (std.mem.eql(u8, name, "stdin")) {
+                const stdin_file = std.fs.File.stdin();
+                const frs = StreamState.FileReaderState.create(allocator, stdin_file, true) catch {
+                    err_msg.* = "failed to create stdin reader";
+                    return error.RuntimeError;
+                };
+                const state = try allocator.create(StreamState);
+                state.* = .{ .stdin_reader = .{ .frs = frs } };
+                return createStream(state, allocator);
+            }
+        }
+        err_msg.* = "source() expects a string path or :stdin atom";
+        return error.RuntimeError;
+    }
+
+    // Must be a string path.
+    if (!first.isString()) {
+        err_msg.* = "source() expects a string path or :stdin atom as first argument";
+        return error.RuntimeError;
+    }
+
+    const path_str = ObjString.fromObj(first.asObj());
+    const path = path_str.bytes;
+
+    // Open the file.
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        err_msg.* = switch (err) {
+            error.FileNotFound => "file not found",
+            error.AccessDenied => "permission denied",
+            else => "failed to open file",
+        };
+        return error.RuntimeError;
+    };
+
+    // Determine format: if arity == 2 and args[1] is atom :jsonl, use JSONL reader.
+    const is_jsonl = if (args.len > 1) blk: {
+        if (atomName(args[1])) |name| {
+            break :blk std.mem.eql(u8, name, "jsonl");
+        }
+        break :blk false;
+    } else false;
+
+    const frs = StreamState.FileReaderState.create(allocator, file, false) catch {
+        file.close();
+        err_msg.* = "failed to create file reader";
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    if (is_jsonl) {
+        state.* = .{ .jsonl_reader = .{ .frs = frs } };
+    } else {
+        state.* = .{ .file_reader = .{ .frs = frs } };
+    }
+    return createStream(state, allocator);
+}
+
+/// sink(stream, path_or_atom, format?) -> Nil
+/// Consumes the stream and writes elements to a file.
+/// sink(stream, "out.txt") writes each element as a line.
+/// sink(stream, "out.jsonl", format: :jsonl) writes each element as JSON per line.
+/// sink(stream, :stdout) writes to standard output.
+/// sink(stream, :stderr) writes to standard error.
+fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // First arg must be a stream (or range, auto-wrapped).
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "sink() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    const dest = args[1];
+
+    // Determine format.
+    const is_jsonl = if (args.len > 2) blk: {
+        if (atomName(args[2])) |name| {
+            break :blk std.mem.eql(u8, name, "jsonl");
+        }
+        break :blk false;
+    } else false;
+
+    // Determine output target.
+    var out_file: std.fs.File = undefined;
+    var is_std_handle = false;
+
+    if (dest.isAtom()) {
+        if (atomName(dest)) |name| {
+            if (std.mem.eql(u8, name, "stdout")) {
+                out_file = std.fs.File.stdout();
+                is_std_handle = true;
+            } else if (std.mem.eql(u8, name, "stderr")) {
+                out_file = std.fs.File.stderr();
+                is_std_handle = true;
+            } else {
+                err_msg.* = "sink() expects :stdout, :stderr, or a string path";
+                return error.RuntimeError;
+            }
+        } else {
+            err_msg.* = "sink() expects :stdout, :stderr, or a string path";
+            return error.RuntimeError;
+        }
+    } else if (dest.isString()) {
+        const path_str = ObjString.fromObj(dest.asObj());
+        out_file = std.fs.cwd().createFile(path_str.bytes, .{}) catch |err| {
+            err_msg.* = switch (err) {
+                error.AccessDenied => "permission denied",
+                else => "failed to create file",
+            };
+            return error.RuntimeError;
+        };
+    } else {
+        err_msg.* = "sink() expects a string path or :stdout/:stderr atom as second argument";
+        return error.RuntimeError;
+    }
+    defer {
+        if (!is_std_handle) out_file.close();
+    }
+
+    // Set up buffered writer.
+    var write_buf: [64 * 1024]u8 = undefined;
+    var bw = out_file.writer(&write_buf);
+
+    // Set stream module callbacks for pulling.
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+
+    // Pull loop: consume all elements from the stream.
+    while (true) {
+        const val = try stream_obj.state.next(allocator);
+        if (isAdtVariant(val, 0, 1)) break; // None
+        const elem = adtPayload(val, 0);
+
+        if (is_jsonl) {
+            // JSON encode each element.
+            if (current_vm) |vm_ptr| {
+                if (track_obj_fn) |tfn| {
+                    json_mod.setVM(vm_ptr, tfn);
+                }
+            }
+            if (current_atom_names) |names| {
+                json_mod.setAtomNames(names);
+            }
+            const emit_result = json_mod.emit(elem, allocator);
+            json_mod.clearVM();
+            switch (emit_result) {
+                .ok => |json_bytes| {
+                    bw.interface.writeAll(json_bytes) catch {
+                        allocator.free(json_bytes);
+                        err_msg.* = "failed to write to file";
+                        return error.RuntimeError;
+                    };
+                    allocator.free(json_bytes);
+                },
+                .err => |msg| {
+                    err_msg.* = msg;
+                    return error.RuntimeError;
+                },
+            }
+        } else {
+            // Plain text: format as string, write as line.
+            const formatted = formatValue(elem, allocator, current_atom_names) catch {
+                err_msg.* = "failed to format value for sink";
+                return error.RuntimeError;
+            };
+            defer allocator.free(formatted);
+            bw.interface.writeAll(formatted) catch {
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
+        }
+
+        // Write newline after each element.
+        bw.interface.writeByte('\n') catch {
+            err_msg.* = "failed to write newline to file";
+            return error.RuntimeError;
+        };
+    }
+
+    // CRITICAL: flush buffered writer before closing.
+    bw.interface.flush() catch {
+        err_msg.* = "failed to flush output file";
+        return error.RuntimeError;
+    };
+
+    return Value.nil;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

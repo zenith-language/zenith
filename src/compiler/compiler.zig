@@ -192,6 +192,8 @@ pub const Compiler = struct {
         "partition_result",
         // Json module (82-83)
         "Json.decode", "Json.encode",
+        // File I/O (84-85)
+        "source", "sink",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-14 to match

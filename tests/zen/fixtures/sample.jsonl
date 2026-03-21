@@ -1,0 +1,4 @@
+{"name": "alice", "age": 30}
+{"name": "bob", "age": 25}
+not valid json
+{"name": "charlie", "age": 35}
