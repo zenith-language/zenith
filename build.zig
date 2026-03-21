@@ -62,6 +62,19 @@ pub fn build(b: *std.Build) void {
     obj_mod.addImport("value", value_mod);
     obj_mod.addImport("chunk", chunk_mod);
 
+    const gc_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/gc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "intern", .module = intern_mod },
+        },
+    });
+
+    // Wire memory_mod to import gc for createGC function.
+    memory_mod.addImport("gc", gc_mod);
+
     const error_mod = b.createModule(.{
         .root_source_file = b.path("src/common/error.zig"),
         .target = target,
@@ -130,6 +143,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "obj", .module = obj_mod },
             .{ .name = "error", .module = error_mod },
             .{ .name = "builtins", .module = builtins_mod },
+            .{ .name = "gc", .module = gc_mod },
         },
     });
 
@@ -212,6 +226,7 @@ pub fn build(b: *std.Build) void {
         token_mod,
         memory_mod,
         intern_mod,
+        gc_mod,
         obj_mod,
         value_mod,
         chunk_mod,

@@ -1,5 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const gc_mod = @import("gc");
+const GC = gc_mod.GC;
+const GCAllocator = gc_mod.GCAllocator;
 
 /// Create the allocator appropriate for the current build mode.
 ///
@@ -7,12 +10,21 @@ const builtin = @import("builtin");
 ///   `DebugAllocator` that catches leaks, use-after-free, and double-free.
 /// - In release builds: returns `std.heap.page_allocator` directly.
 ///
-/// Future phases will replace this with GC-aware allocation.
+/// This is the legacy allocator for backwards compatibility during
+/// the transition to GC-aware allocation. New code should prefer
+/// `createGC()` which routes through the GCAllocator for byte tracking.
 pub fn create() Allocator {
     if (builtin.mode == .Debug or builtin.is_test) {
         return debug_allocator.allocator();
     }
     return std.heap.page_allocator;
+}
+
+/// Return a GC-aware allocator backed by the given GC state.
+/// The returned allocator tracks bytes_allocated and will eventually
+/// trigger nursery collection when the threshold is reached.
+pub fn createGC(gc_alloc: *GCAllocator) Allocator {
+    return gc_alloc.allocator();
 }
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
