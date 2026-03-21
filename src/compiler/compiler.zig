@@ -173,6 +173,8 @@ pub const Compiler = struct {
         // Option (48-54)
         "Option.Some", "Option.None", "Option.map",     "Option.unwrap_or",
         "Option.is_some", "Option.is_none", "Option.to_result",
+        // List.filter_map (55)
+        "List.filter_map",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-6 to match
@@ -1577,8 +1579,10 @@ pub const Compiler = struct {
                 const skip_fail = try self.emitJump(.op_jump, line);
 
                 // Fail path: length check failed.
+                // Stack at this point: [..., <list_slot>, false]
                 try self.patchJump(len_fail);
-                try self.emitOp(.op_pop, line); // pop the false from length check
+                try self.emitOp(.op_pop, line); // pop false from comparison
+                try self.emitOp(.op_pop, line); // pop hidden ` list` local
                 try self.emitOp(.op_false, line);
 
                 try self.patchJump(skip_fail);

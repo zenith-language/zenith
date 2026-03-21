@@ -23,3 +23,5 @@ Result.Err(no value)
 0
 got: 42
 error: oops
+[20, 40, 60]
+[1, 3, 5]

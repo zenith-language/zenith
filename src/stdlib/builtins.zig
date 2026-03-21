@@ -207,6 +207,9 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "Option.is_some", .func = &builtinOptionIsSome, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Option.is_none", .func = &builtinOptionIsNone, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Option.to_result", .func = &builtinOptionToResult, .arity_min = 2, .arity_max = 2 },
+
+    // ── List.filter_map (index 55) ──────────────────────────────────
+    .{ .name = "List.filter_map", .func = &builtinListFilterMap, .arity_min = 2, .arity_max = 2 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -719,6 +722,30 @@ fn builtinListContains(args: []const Value, allocator: Allocator, err_msg: *[]co
         if (Value.eql(item, args[1])) return Value.true_val;
     }
     return Value.false_val;
+}
+
+/// List.filter_map(list, fn) -> List: apply fn to each element, collect non-None results.
+/// fn must return Option (Some(x) or None). Collects the x values from Some, skipping None.
+fn builtinListFilterMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.filter_map expects a list as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const closure_val = args[1];
+    const new_list = try ObjList.create(allocator);
+
+    for (src.items.items) |elem| {
+        const result = try callClosure(closure_val, &[_]Value{elem});
+        // Check if result is Some(x): ADT with type_id=0 (Option), variant_idx=0 (Some)
+        if (isAdtVariant(result, 0, 0)) {
+            const payload = adtPayload(result, 0);
+            try new_list.items.append(allocator, payload);
+        }
+        // None (variant_idx=1) or non-ADT results are skipped.
+    }
+
+    return Value.fromObj(&new_list.obj);
 }
 
 // ── Map module implementations ───────────────────────────────────────

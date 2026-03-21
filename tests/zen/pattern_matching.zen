@@ -47,3 +47,37 @@ let classify = fn(n) {
 }
 print(classify(5))
 print(classify(-1))
+
+-- Tuple pattern matching
+let point = (10, 20)
+match point
+  | (x, y) -> print("x=" ++ str(x) ++ " y=" ++ str(y))
+
+-- Record pattern matching
+let person = {name: "Alice", age: 30}
+match person
+  | {name: n, age: a} -> print(n ++ " is " ++ str(a))
+
+-- List pattern matching: exact length
+let triple = [1, 2, 3]
+match triple
+  | [a, b, c] -> print("three: " ++ str(a) ++ "," ++ str(b) ++ "," ++ str(c))
+  | _ -> print("other")
+
+-- List pattern with rest
+let nums = [1, 2, 3, 4]
+match nums
+  | [first, ..rest] -> print("first=" ++ str(first) ++ " rest_len=" ++ str(List.length(rest)))
+  | _ -> print("other")
+
+-- List pattern: multi-arm with different lengths
+let describe_list = fn(lst) {
+  match lst
+    | [a, b, c] -> "three: " ++ str(a) ++ "," ++ str(b) ++ "," ++ str(c)
+    | [a, b] -> "two: " ++ str(a) ++ "," ++ str(b)
+    | [a] -> "one: " ++ str(a)
+    | _ -> "other"
+}
+print(describe_list([10, 20, 30]))
+print(describe_list([5, 6]))
+print(describe_list([42]))
