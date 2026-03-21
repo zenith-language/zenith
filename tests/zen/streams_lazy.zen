@@ -1,0 +1,12 @@
+-- STRM-11: Lazy evaluation -- take(10) on infinite stream completes
+-- If streams were eager, this would hang/OOM. take(10) stops after 10.
+let result = repeat(42) |> take(10) |> collect()
+print(result)
+
+-- STRM-12: Pull-based backpressure
+-- take(N) on an infinite stream proves backpressure works:
+-- the terminal (collect) pulls one element at a time through take,
+-- take decrements its counter and stops pulling after N,
+-- so the infinite source (iterate) never runs unbounded.
+let result2 = iterate(1, |x| x + 1) |> map(|x| x * x) |> take(5) |> collect()
+print(result2)
