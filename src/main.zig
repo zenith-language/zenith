@@ -117,6 +117,12 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "repl")) {
+        const repl = zenith.repl;
+        try repl.runRepl(gpa);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "explain")) {
         if (args.len < 3) {
             writeStderr("error: 'explain' requires an error code (e.g., E001)\n");
