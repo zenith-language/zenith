@@ -264,6 +264,44 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── REPL modules ────────────────────────────────────────────────────
+    const colors_mod = b.createModule(.{
+        .root_source_file = b.path("src/repl/colors.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+        },
+    });
+
+    const line_editor_mod = b.createModule(.{
+        .root_source_file = b.path("src/repl/line_editor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const repl_mod = b.createModule(.{
+        .root_source_file = b.path("src/repl/repl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "chunk", .module = chunk_mod },
+            .{ .name = "error", .module = error_mod },
+            .{ .name = "token", .module = token_mod },
+            .{ .name = "lexer", .module = lexer_mod },
+            .{ .name = "parser", .module = parser_mod },
+            .{ .name = "compiler", .module = compiler_mod },
+            .{ .name = "builtins", .module = builtins_mod },
+            .{ .name = "vm", .module = vm_mod },
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "line_editor", .module = line_editor_mod },
+            .{ .name = "colors", .module = colors_mod },
+        },
+    });
+
     // ── Library module (public API) ────────────────────────────────────
     const lib_mod = b.addModule("zenith", .{
         .root_source_file = b.path("src/lib.zig"),
@@ -284,6 +322,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "builtins", .module = builtins_mod },
             .{ .name = "vm", .module = vm_mod },
             .{ .name = "gc", .module = gc_mod },
+            .{ .name = "repl", .module = repl_mod },
         },
     });
 
@@ -346,6 +385,9 @@ pub fn build(b: *std.Build) void {
         stream_mod_build,
         json_mod,
         vm_mod,
+        colors_mod,
+        line_editor_mod,
+        repl_mod,
     };
 
     for (test_modules) |mod| {

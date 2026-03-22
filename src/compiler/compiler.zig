@@ -143,6 +143,8 @@ pub const Compiler = struct {
     /// When field_access detects an ADT constructor with arity > 0,
     /// it sets this to signal compileCallExpr.
     pending_adt_construct: ?struct { type_id: u16, variant_idx: u16 },
+    /// When true, the last statement's value is kept on the stack for REPL display.
+    repl_mode: bool,
 
     const Self = @This();
 
@@ -226,6 +228,7 @@ pub const Compiler = struct {
             .allocator = allocator,
             .adt_types = .empty,
             .pending_adt_construct = null,
+            .repl_mode = false,
         };
 
         // Pre-register built-in ADT types.
@@ -266,6 +269,105 @@ pub const Compiler = struct {
         try self.emitOp(.op_return, 0);
 
         // Wrap in ObjClosure.
+        const closure = try ObjClosure.create(allocator, func);
+
+        return .{
+            .closure = closure,
+            .errors = self.errors,
+            .atom_table = self.atom_table,
+            .atom_count = self.atom_count,
+            .adt_types = self.adt_types,
+        };
+    }
+
+    /// Compile an AST in REPL mode: the last statement's value is kept on
+    /// the stack so vm.run() returns it for display. If the last statement is
+    /// an expr_stmt its value stays; for let_decl the bound value is pushed;
+    /// for other statement types nil is emitted.
+    pub fn compileRepl(ast_ptr: *const Ast, allocator: Allocator) !CompileResult {
+        const func = try ObjFunction.create(allocator);
+        func.name = null;
+
+        var self = Self{
+            .function = func,
+            .fn_type = .script,
+            .ast = ast_ptr,
+            .locals = undefined,
+            .local_count = 0,
+            .scope_depth = 0,
+            .upvalues = undefined,
+            .parent = null,
+            .is_tail_position = false,
+            .atom_table = .{},
+            .atom_count = 0,
+            .errors = .empty,
+            .allocator = allocator,
+            .adt_types = .empty,
+            .pending_adt_construct = null,
+            .repl_mode = true,
+        };
+
+        // Pre-register built-in ADT types (same as compile).
+        try self.adt_types.append(allocator, .{
+            .name = "Option",
+            .variant_names = &[_][]const u8{ "Some", "None" },
+            .variant_arities = &[_]u8{ 1, 0 },
+        });
+        try self.adt_types.append(allocator, .{
+            .name = "Result",
+            .variant_names = &[_][]const u8{ "Ok", "Err" },
+            .variant_arities = &[_]u8{ 1, 1 },
+        });
+
+        self.locals[0] = .{ .name = "", .depth = 0, .is_captured = false };
+        self.local_count = 1;
+
+        for (type_atom_names) |name| {
+            try self.atom_table.put(allocator, name, self.atom_count);
+            self.atom_count += 1;
+        }
+
+        const root_idx: u32 = @intCast(ast_ptr.nodes.len - 1);
+        const root_tag = ast_ptr.nodes.items(.tag)[root_idx];
+        if (root_tag == .root) {
+            const data = ast_ptr.nodes.items(.data)[root_idx];
+            const stmts = ast_ptr.extra_data.items[data.lhs..data.rhs];
+            try self.compileStatements(stmts);
+
+            // In REPL mode, the last statement should leave a value for display.
+            // compileStatements already handles most cases, but for the last
+            // statement we need special treatment.
+            if (stmts.len > 0) {
+                const last_idx = stmts[stmts.len - 1];
+                const last_tag = ast_ptr.nodes.items(.tag)[last_idx];
+                if (last_tag == .expr_stmt) {
+                    // expr_stmt emits a pop after the expression. We need to undo
+                    // that pop so the value stays on the stack. The simplest way:
+                    // the last opcode emitted was op_pop -- remove it.
+                    const code = &self.function.chunk.code;
+                    if (code.items.len > 0 and code.items[code.items.len - 1] == @intFromEnum(OpCode.op_pop)) {
+                        _ = code.pop();
+                        _ = self.function.chunk.lines.pop();
+                    }
+                } else if (last_tag == .let_decl) {
+                    // Push the value of the just-bound variable back onto the stack.
+                    const slot: u8 = self.local_count - 1;
+                    try self.emitOp(.op_get_local, 0);
+                    try self.emitByte(slot, 0);
+                } else {
+                    // fn_decl, type_decl, while_stmt, for_stmt, assign_stmt, etc.
+                    try self.emitOp(.op_nil, 0);
+                }
+            } else {
+                try self.emitOp(.op_nil, 0);
+            }
+        } else {
+            try self.emitOp(.op_nil, 0);
+        }
+
+        // In REPL mode, emit only op_return (value is already on stack).
+        try self.emitOp(.op_return, 0);
+
         const closure = try ObjClosure.create(allocator, func);
 
         return .{
@@ -463,6 +565,7 @@ pub const Compiler = struct {
             .allocator = self.allocator,
             .adt_types = self.adt_types,
             .pending_adt_construct = null,
+            .repl_mode = false,
         };
 
         // Reserve slot 0 for the function itself (enables recursion).
@@ -561,6 +664,7 @@ pub const Compiler = struct {
             .allocator = self.allocator,
             .adt_types = self.adt_types,
             .pending_adt_construct = null,
+            .repl_mode = false,
         };
 
         // Slot 0 for the lambda itself (unnamed).

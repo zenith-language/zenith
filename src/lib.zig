@@ -17,6 +17,7 @@ pub const compiler = @import("compiler");
 pub const builtins = @import("builtins");
 pub const vm = @import("vm");
 pub const gc = @import("gc");
+pub const repl = @import("repl");
 
 test {
     // Force the test runner to analyse all transitive dependencies so
