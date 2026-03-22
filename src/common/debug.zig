@@ -1,10 +1,14 @@
 const std = @import("std");
 const chunk_mod = @import("chunk");
 const value_mod = @import("value");
+const obj_mod = @import("obj");
 
 const Chunk = chunk_mod.Chunk;
 const OpCode = chunk_mod.OpCode;
 const Value = value_mod.Value;
+const Obj = obj_mod.Obj;
+const ObjFunction = obj_mod.ObjFunction;
+const ObjString = obj_mod.ObjString;
 
 /// Disassemble an entire chunk, printing all instructions.
 pub fn disassembleChunk(chunk: *const Chunk, name: []const u8, writer: anytype) !void {
@@ -175,6 +179,98 @@ fn jumpInstruction(name: []const u8, sign: i32, chunk: *const Chunk, offset: usi
     const target: i64 = @as(i64, @intCast(offset)) + 3 + @as(i64, sign) * @as(i64, jump);
     try writer.print("{s:<20} {d:>4} -> {d}\n", .{ name, offset, target });
     return offset + 3;
+}
+
+// ── Recursive disassembly with verbose mode ────────────────────────────
+
+/// Disassemble a chunk and all nested function bodies found in the constant pool.
+/// If `verbose` is true, also prints the constant pool, atom table, and debug info.
+pub fn disassembleRecursive(chunk: *const Chunk, name: []const u8, writer: anytype, verbose: bool) !void {
+    // Disassemble the top-level chunk.
+    try disassembleChunk(chunk, name, writer);
+
+    // Verbose: show constant pool, atom table, and debug info.
+    if (verbose) {
+        try printConstantPool(chunk, writer);
+        try printAtomTable(chunk, writer);
+        try printDebugInfo(chunk, writer);
+    }
+
+    // Recurse into nested function bodies found in constants.
+    for (chunk.constants.items) |val| {
+        if (val.isObj()) {
+            const obj_ptr = val.asObj();
+            if (obj_ptr.obj_type == .function) {
+                const func = ObjFunction.fromObj(obj_ptr);
+                const func_name = func.name orelse "<anonymous>";
+                try writer.writeAll("\n");
+                try disassembleRecursive(&func.chunk, func_name, writer, verbose);
+            }
+        }
+    }
+}
+
+/// Print the constant pool for a chunk.
+fn printConstantPool(chunk: *const Chunk, writer: anytype) !void {
+    if (chunk.constants.items.len == 0) return;
+
+    try writer.writeAll("\n-- Constant Pool --\n");
+    for (chunk.constants.items, 0..) |val, i| {
+        try writer.print("  [{d}] ", .{i});
+
+        if (val.isFloat()) {
+            try writer.print("Float: {d}\n", .{val.asFloat()});
+        } else if (val.isNil()) {
+            try writer.writeAll("Nil: nil\n");
+        } else if (val.isBool()) {
+            try writer.print("Bool: {s}\n", .{if (val.asBool()) "true" else "false"});
+        } else if (val.isInt()) {
+            try writer.print("Int: {d}\n", .{val.asInt()});
+        } else if (val.isAtom()) {
+            try writer.print("Atom: :{d}\n", .{val.asAtom()});
+        } else if (val.isObj()) {
+            const obj_ptr = val.asObj();
+            switch (obj_ptr.obj_type) {
+                .string => {
+                    const str = ObjString.fromObj(obj_ptr);
+                    try writer.print("String: \"{s}\"\n", .{str.bytes});
+                },
+                .function => {
+                    const func = ObjFunction.fromObj(obj_ptr);
+                    if (func.name) |fname| {
+                        try writer.print("Function: <fn {s}>\n", .{fname});
+                    } else {
+                        try writer.writeAll("Function: <fn>\n");
+                    }
+                },
+                else => {
+                    try writer.writeAll("Object: ");
+                    try val.format("", .{}, writer);
+                    try writer.writeByte('\n');
+                },
+            }
+        } else {
+            try writer.writeAll("Unknown\n");
+        }
+    }
+}
+
+/// Print the atom table from a chunk's atom_names.
+fn printAtomTable(chunk: *const Chunk, writer: anytype) !void {
+    if (chunk.atom_names.items.len == 0) return;
+
+    try writer.writeAll("\n-- Atom Table --\n");
+    for (chunk.atom_names.items, 0..) |name, i| {
+        try writer.print("  [{d}] {s}\n", .{ i, name });
+    }
+}
+
+/// Print debug info metadata from a chunk.
+fn printDebugInfo(chunk: *const Chunk, writer: anytype) !void {
+    try writer.writeAll("\n-- Debug Info --\n");
+    try writer.print("  Source: {s}\n", .{chunk.name});
+    try writer.print("  Code size: {d} bytes\n", .{chunk.code.items.len});
+    try writer.print("  Constants: {d}\n", .{chunk.constants.items.len});
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

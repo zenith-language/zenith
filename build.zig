@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "chunk", .module = chunk_mod },
             .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
         },
     });
 
