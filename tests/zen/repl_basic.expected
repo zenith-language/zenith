@@ -1,0 +1,6 @@
+# REPL basic expression evaluation (TOOL-01)
+# Verifies: expression evaluation, variable binding, value display
+# Input: let x = 42\nx + 1\n
+# Expected stdout contains: 42, 43
+42
+43

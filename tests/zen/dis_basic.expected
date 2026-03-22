@@ -1,0 +1,7 @@
+# Disassembler basic output (TOOL-05)
+# Verifies: script header, opcode names, recursive function traversal
+# Input: zenith dis tests/zen/arithmetic.zen
+# Expected stdout contains: == <script> ==, OP_CONSTANT, OP_ADD
+== <script> ==
+OP_CONSTANT
+OP_ADD

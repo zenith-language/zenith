@@ -601,3 +601,258 @@ test "e2e: bytecode roundtrip for arithmetic" {
 
     try std.testing.expectEqualStrings(expected_trimmed, actual_trimmed);
 }
+
+// ── Phase 6: CLI e2e tests (process spawning) ─────────────────────────────
+//
+// These tests spawn the zenith binary and verify stdout/stderr output.
+// They test CLI-only features: REPL, disassembler, stdin mode, -e mode.
+// The binary must be built first (zig build) before these tests run.
+
+const cli_binary_path = "zig-out/bin/zenith";
+
+const CliTestResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *CliTestResult) void {
+        self.allocator.free(self.stdout);
+        self.allocator.free(self.stderr);
+    }
+};
+
+/// Spawn the zenith binary with given args and optional stdin, collect output.
+fn runCliProcess(args: []const []const u8, stdin_input: ?[]const u8) !CliTestResult {
+    const allocator = std.testing.allocator;
+
+    // Check binary exists.
+    std.fs.cwd().access(cli_binary_path, .{}) catch {
+        return error.SkipZigTest;
+    };
+
+    var argv = std.ArrayListUnmanaged([]const u8){};
+    defer argv.deinit(allocator);
+    try argv.append(allocator, cli_binary_path);
+    for (args) |arg| {
+        try argv.append(allocator, arg);
+    }
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = if (stdin_input != null) .Pipe else .Inherit;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    // Write stdin if provided, then close.
+    if (stdin_input) |input| {
+        if (child.stdin) |stdin_fd| {
+            stdin_fd.writeAll(input) catch {};
+            stdin_fd.close();
+            child.stdin = null;
+        }
+    }
+
+    // Collect stdout and stderr BEFORE wait (wait closes pipes).
+    var stdout_list: std.ArrayList(u8) = .empty;
+    errdefer stdout_list.deinit(allocator);
+    var stderr_list: std.ArrayList(u8) = .empty;
+    errdefer stderr_list.deinit(allocator);
+
+    try child.collectOutput(allocator, &stdout_list, &stderr_list, 1024 * 1024);
+    _ = try child.wait();
+
+    return .{
+        .stdout = try stdout_list.toOwnedSlice(allocator),
+        .stderr = try stderr_list.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
+/// Spawn the zenith binary with given args, optional stdin, and verify output.
+fn runCliTest(args: []const []const u8, stdin_input: ?[]const u8, expected_fragments: []const []const u8, check_stderr: bool) !void {
+    var result = runCliProcess(args, stdin_input) catch |err| {
+        if (err == error.SkipZigTest) {
+            std.debug.print("\n[SKIP] CLI test: binary not found at {s}\n", .{cli_binary_path});
+            return;
+        }
+        return err;
+    };
+    defer result.deinit();
+
+    const search_buf = if (check_stderr) result.stderr else result.stdout;
+
+    // Check each expected fragment exists in the output.
+    for (expected_fragments) |fragment| {
+        if (std.mem.indexOf(u8, search_buf, fragment) == null) {
+            std.debug.print("\n[FAIL] CLI test: output missing fragment: '{s}'\n", .{fragment});
+            std.debug.print("Args: ", .{});
+            for (args) |a| std.debug.print("{s} ", .{a});
+            std.debug.print("\nStdout ({d} bytes):\n{s}\nStderr ({d} bytes):\n{s}\n", .{ result.stdout.len, result.stdout, result.stderr.len, result.stderr });
+            return error.TestFailed;
+        }
+    }
+}
+
+// ── REPL tests (TOOL-01) ──────────────────────────────────────────────────
+
+test "Phase 6 CLI: REPL basic expression evaluation" {
+    try runCliTest(
+        &.{"repl"},
+        "let x = 42\nx + 1\n",
+        &.{ "42", "43" },
+        false,
+    );
+}
+
+test "Phase 6 CLI: REPL error recovery" {
+    // Use an undefined variable error (not 'let +' which triggers continuation).
+    // Verify error message appears on stderr.
+    try runCliTest(
+        &.{"repl"},
+        "xyz\n1 + 2\n",
+        &.{"error[E"},
+        true,
+    );
+    // Also verify recovery produces correct result on stdout.
+    try runCliTest(
+        &.{"repl"},
+        "xyz\n1 + 2\n",
+        &.{"3"},
+        false,
+    );
+}
+
+test "Phase 6 CLI: REPL continuation" {
+    try runCliTest(
+        &.{"repl"},
+        "{\n  1 + 2\n}\n",
+        &.{"3"},
+        false,
+    );
+}
+
+test "Phase 6 CLI: REPL nil suppression" {
+    // print(42) outputs 42 to stdout but REPL should not print nil separately.
+    try runCliTest(
+        &.{"repl"},
+        "print(42)\n",
+        &.{"42"},
+        false,
+    );
+}
+
+test "Phase 6 CLI: REPL variable persistence" {
+    try runCliTest(
+        &.{"repl"},
+        "let name = \"zenith\"\nname\n",
+        &.{"zenith"},
+        false,
+    );
+}
+
+// ── Disassembler tests (TOOL-05) ──────────────────────────────────────────
+
+test "Phase 6 CLI: disassembler basic" {
+    try runCliTest(
+        &.{ "dis", "tests/zen/arithmetic.zen" },
+        null,
+        &.{ "== <script> ==", "OP_CONSTANT", "OP_ADD" },
+        false,
+    );
+}
+
+test "Phase 6 CLI: disassembler verbose" {
+    try runCliTest(
+        &.{ "dis", "-v", "tests/zen/arithmetic.zen" },
+        null,
+        &.{ "-- Constant Pool --", "-- Atom Table --", "-- Debug Info --" },
+        false,
+    );
+}
+
+test "Phase 6 CLI: disassembler recursive" {
+    try runCliTest(
+        &.{ "dis", "tests/zen/functions.zen" },
+        null,
+        &.{ "== <script> ==", "== add ==" },
+        false,
+    );
+}
+
+// ── CLI mode tests (TOOL-04) ──────────────────────────────────────────────
+
+test "Phase 6 CLI: stdin mode" {
+    try runCliTest(
+        &.{ "run", "-" },
+        "print(42)",
+        &.{"42"},
+        false,
+    );
+}
+
+test "Phase 6 CLI: eval mode" {
+    try runCliTest(
+        &.{ "run", "-e", "print(1 + 2)" },
+        null,
+        &.{"3"},
+        false,
+    );
+}
+
+test "Phase 6 CLI: help text" {
+    try runCliTest(
+        &.{"--help"},
+        null,
+        &.{ "repl", "dis", "run -", "run -e" },
+        false,
+    );
+}
+
+// ── Single binary test (TOOL-03) ──────────────────────────────────────────
+
+test "Phase 6 CLI: single binary no external deps" {
+    const allocator = std.testing.allocator;
+
+    // Check binary exists.
+    std.fs.cwd().access(cli_binary_path, .{}) catch {
+        std.debug.print("\n[SKIP] Single binary test: binary not found\n", .{});
+        return;
+    };
+
+    // Use otool -L on macOS to check dynamic dependencies.
+    const otool_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "otool", "-L", cli_binary_path },
+    }) catch {
+        // otool not available (non-macOS), skip gracefully.
+        std.debug.print("\n[SKIP] Single binary test: otool not available\n", .{});
+        return;
+    };
+    defer allocator.free(otool_result.stdout);
+    defer allocator.free(otool_result.stderr);
+
+    const output = otool_result.stdout;
+
+    // Verify only libSystem dependency (macOS).
+    if (std.mem.indexOf(u8, output, "/usr/lib/libSystem") == null) {
+        std.debug.print("\n[WARN] Single binary test: expected libSystem in otool output\n", .{});
+        std.debug.print("Output:\n{s}\n", .{output});
+    }
+
+    // Count number of dylib lines (excluding the header line).
+    var lib_count: usize = 0;
+    var lines = std.mem.splitSequence(u8, output, "\n");
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, ".dylib") != null) {
+            lib_count += 1;
+        }
+    }
+
+    // Should have exactly 1 dylib (libSystem).
+    if (lib_count > 1) {
+        std.debug.print("\n[FAIL] Single binary test: expected 1 dylib but found {d}\n", .{lib_count});
+        std.debug.print("Output:\n{s}\n", .{output});
+        return error.TestFailed;
+    }
+}

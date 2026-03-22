@@ -1,0 +1,7 @@
+# REPL error recovery (TOOL-01)
+# Verifies: error display with error[E code, recovery after error
+# Input: xyz\n1 + 2\n
+# Expected stderr contains: error[E
+# Expected stdout contains: 3 (recovery after error)
+error[E
+3

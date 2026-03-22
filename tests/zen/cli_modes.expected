@@ -1,0 +1,11 @@
+# CLI modes (TOOL-04)
+# Verifies: stdin mode, -e eval mode, help text
+#
+# stdin mode: echo 'print(42)' | zenith run -
+# Expected: 42
+#
+# eval mode: zenith run -e 'print(1 + 2)'
+# Expected: 3
+#
+# help text: zenith --help
+# Expected contains: repl, dis, run -, run -e

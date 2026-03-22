@@ -1,0 +1,5 @@
+# REPL continuation (TOOL-01)
+# Verifies: multi-line input with unclosed braces triggers continuation
+# Input: {\n  1 + 2\n}\n
+# Expected stdout contains: 3
+3
