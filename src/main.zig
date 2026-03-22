@@ -51,11 +51,31 @@ pub fn main() !void {
             printUsage();
             std.process.exit(1);
         }
-        const file_path = args[2];
-        if (std.mem.endsWith(u8, file_path, ".znth")) {
-            try runBytecode(file_path, gpa);
+        const arg2 = args[2];
+
+        // zenith run - (stdin mode)
+        if (std.mem.eql(u8, arg2, "-")) {
+            const source = readStdin(gpa);
+            defer gpa.free(source);
+            try runSourceFromString(source, "<stdin>", gpa);
+            return;
+        }
+
+        // zenith run -e '<expr>' (inline expression mode)
+        if (std.mem.eql(u8, arg2, "-e")) {
+            if (args.len < 4) {
+                writeStderr("error: '-e' requires an expression argument\n");
+                printUsage();
+                std.process.exit(1);
+            }
+            try runSourceFromString(args[3], "<eval>", gpa);
+            return;
+        }
+
+        if (std.mem.endsWith(u8, arg2, ".znth")) {
+            try runBytecode(arg2, gpa);
         } else {
-            try runSource(file_path, gpa);
+            try runSource(arg2, gpa);
         }
         return;
     }
@@ -68,6 +88,32 @@ pub fn main() !void {
         }
         const file_path = args[2];
         try compileToFile(file_path, gpa);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "dis")) {
+        if (args.len < 3) {
+            writeStderr("error: 'dis' requires a file argument\n");
+            printUsage();
+            std.process.exit(1);
+        }
+
+        // Parse -v/--verbose flag and file path.
+        var verbose = false;
+        var dis_file_path: []const u8 = undefined;
+        if (std.mem.eql(u8, args[2], "-v") or std.mem.eql(u8, args[2], "--verbose")) {
+            if (args.len < 4) {
+                writeStderr("error: 'dis -v' requires a file argument\n");
+                printUsage();
+                std.process.exit(1);
+            }
+            verbose = true;
+            dis_file_path = args[3];
+        } else {
+            dis_file_path = args[2];
+        }
+
+        try disassembleFile(dis_file_path, verbose, gpa);
         return;
     }
 
@@ -101,6 +147,12 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(source);
 
+    try runSourceFromString(source, file_path, allocator);
+}
+
+/// Run Zenith source code from a string with a given display name.
+/// Shared pipeline for file, stdin, and -e modes.
+fn runSourceFromString(source: []const u8, file_name: []const u8, allocator: std.mem.Allocator) !void {
     const use_color = detectColor();
 
     // 1. Lex
@@ -110,7 +162,7 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     defer lex.errors.deinit(allocator);
 
     if (lex.errors.hasErrors()) {
-        renderDiagnostics(lex.errors.items.items, source, file_path, use_color, allocator);
+        renderDiagnostics(lex.errors.items.items, source, file_name, use_color, allocator);
         std.process.exit(1);
     }
 
@@ -121,7 +173,7 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     defer ast.deinit(allocator);
 
     if (ast.errors.hasErrors()) {
-        renderDiagnostics(ast.errors.items.items, source, file_path, use_color, allocator);
+        renderDiagnostics(ast.errors.items.items, source, file_name, use_color, allocator);
         std.process.exit(1);
     }
 
@@ -130,7 +182,7 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     defer compile_result.deinit(allocator);
 
     if (compile_result.hasErrors()) {
-        renderDiagnostics(compile_result.errors.items, source, file_path, use_color, allocator);
+        renderDiagnostics(compile_result.errors.items, source, file_name, use_color, allocator);
         std.process.exit(1);
     }
 
@@ -157,12 +209,119 @@ fn runSource(file_path: []const u8, allocator: std.mem.Allocator) !void {
     }
 
     _ = vm.run() catch {
-        renderDiagnostics(vm.errors.items, source, file_path, use_color, allocator);
+        renderDiagnostics(vm.errors.items, source, file_name, use_color, allocator);
         vm.deinit();
         std.process.exit(1);
     };
 
     vm.deinit();
+}
+
+// ── Pipeline: disassemble .zen or .znth ──────────────────────────────────
+
+fn disassembleFile(file_path: []const u8, verbose: bool, allocator: std.mem.Allocator) !void {
+    const debug = zenith.debug;
+
+    if (std.mem.endsWith(u8, file_path, ".znth")) {
+        // Deserialize bytecode and disassemble.
+        const file_data = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch |err| {
+            writeStderr("error: cannot open file '");
+            writeStderr(file_path);
+            writeStderr("': ");
+            writeStderr(@errorName(err));
+            writeStderr("\n");
+            std.process.exit(1);
+        };
+        defer allocator.free(file_data);
+
+        var stream = std.io.fixedBufferStream(file_data);
+        var chunk = Chunk.deserialize(stream.reader(), allocator) catch |err| {
+            writeStderr("error: cannot read bytecode file '");
+            writeStderr(file_path);
+            writeStderr("': ");
+            writeStderr(@errorName(err));
+            writeStderr("\n");
+            std.process.exit(1);
+        };
+        defer chunk.deinit(allocator);
+
+        const display_name = if (!std.mem.eql(u8, chunk.name, "<script>")) chunk.name else "<bytecode>";
+
+        var out_buf = std.ArrayListUnmanaged(u8){};
+        defer out_buf.deinit(allocator);
+        debug.disassembleRecursive(&chunk, display_name, out_buf.writer(allocator), verbose) catch |err| {
+            writeStderr("error: disassembly failed: ");
+            writeStderr(@errorName(err));
+            writeStderr("\n");
+            std.process.exit(1);
+        };
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(out_buf.items) catch {};
+    } else {
+        // Compile .zen source and disassemble the result.
+        const source = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch |err| {
+            writeStderr("error: cannot read file '");
+            writeStderr(file_path);
+            writeStderr("': ");
+            writeStderr(@errorName(err));
+            writeStderr("\n");
+            std.process.exit(1);
+        };
+        defer allocator.free(source);
+
+        const use_color = detectColor();
+
+        // 1. Lex
+        var lex = Lexer.init(source);
+        try lex.tokenize(allocator);
+        defer lex.tokens.deinit(allocator);
+        defer lex.errors.deinit(allocator);
+
+        if (lex.errors.hasErrors()) {
+            renderDiagnostics(lex.errors.items.items, source, file_path, use_color, allocator);
+            std.process.exit(1);
+        }
+
+        // 2. Parse
+        var ast = Parser.parse(lex.tokens.items, source, allocator) catch {
+            std.process.exit(1);
+        };
+        defer ast.deinit(allocator);
+
+        if (ast.errors.hasErrors()) {
+            renderDiagnostics(ast.errors.items.items, source, file_path, use_color, allocator);
+            std.process.exit(1);
+        }
+
+        // 3. Compile
+        var compile_result = try Compiler.compile(&ast, allocator);
+        defer compile_result.deinit(allocator);
+
+        if (compile_result.hasErrors()) {
+            renderDiagnostics(compile_result.errors.items, source, file_path, use_color, allocator);
+            std.process.exit(1);
+        }
+
+        // Build atom names and store in chunk for verbose display.
+        const atom_names = try buildAtomNames(&compile_result, allocator);
+        defer allocator.free(atom_names);
+
+        const top_chunk = &compile_result.closure.function.chunk;
+        for (atom_names) |name| {
+            try top_chunk.atom_names.append(allocator, name);
+        }
+
+        var dis_buf = std.ArrayListUnmanaged(u8){};
+        defer dis_buf.deinit(allocator);
+        debug.disassembleRecursive(top_chunk, "<script>", dis_buf.writer(allocator), verbose) catch |err| {
+            writeStderr("error: disassembly failed: ");
+            writeStderr(@errorName(err));
+            writeStderr("\n");
+            std.process.exit(1);
+        };
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(dis_buf.items) catch {};
+    }
 }
 
 /// Build ADT type info array from compiler's adt_types for pretty-printing.
@@ -435,15 +594,32 @@ fn printUsage() void {
         \\Usage: zenith <command> [arguments]
         \\
         \\Commands:
-        \\  run <file>        Run a .zen source file or .znth bytecode file
-        \\  compile <file>    Compile a .zen file to .znth bytecode
-        \\  explain <code>    Explain an error code (e.g., zenith explain E001)
+        \\  run <file>          Run a .zen source file or .znth bytecode file
+        \\  run -               Read and run Zenith source from stdin
+        \\  run -e <expr>       Evaluate an inline expression
+        \\  compile <file>      Compile a .zen file to .znth bytecode
+        \\  dis <file>          Disassemble a .zen or .znth file
+        \\  dis -v <file>       Disassemble with verbose output (constants, atoms, debug info)
+        \\  repl                Launch interactive REPL
+        \\  explain <code>      Explain an error code (e.g., zenith explain E001)
         \\
         \\Options:
-        \\  --help, -h        Show this help message
-        \\  --version, -V     Show version information
+        \\  --help, -h          Show this help message
+        \\  --version, -V       Show version information
         \\
     ) catch {};
+}
+
+/// Read all of stdin into a heap-allocated buffer.
+fn readStdin(allocator: std.mem.Allocator) []const u8 {
+    const stdin_file = std.fs.File.stdin();
+    var read_buf: [256 * 1024]u8 = undefined;
+    var rdr = stdin_file.reader(&read_buf);
+    const source = rdr.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024)) catch {
+        writeStderr("error: cannot read stdin\n");
+        std.process.exit(1);
+    };
+    return source;
 }
 
 fn writeStderr(msg: []const u8) void {
