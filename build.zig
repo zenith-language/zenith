@@ -272,6 +272,10 @@ pub fn build(b: *std.Build) void {
     // Wire stream_mod_build to import json for JSONL parsing.
     stream_mod_build.addImport("json", json_mod);
 
+    // Wire stream_mod_build to import fiber and scheduler for par_map dispatch.
+    stream_mod_build.addImport("fiber", fiber_mod);
+    stream_mod_build.addImport("scheduler", scheduler_mod);
+
     const builtins_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib/builtins.zig"),
         .target = target,

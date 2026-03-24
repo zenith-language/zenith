@@ -11,7 +11,12 @@ const ObjTuple = obj_mod.ObjTuple;
 const ObjStream = obj_mod.ObjStream;
 const ObjString = obj_mod.ObjString;
 const ObjRecord = obj_mod.ObjRecord;
+const ObjClosure = obj_mod.ObjClosure;
 const json_mod = @import("json");
+const fiber_mod = @import("fiber");
+const ObjFiber = fiber_mod.ObjFiber;
+const scheduler_mod = @import("scheduler");
+const Scheduler = scheduler_mod.Scheduler;
 
 /// Error type matching builtins.zig NativeError.
 pub const NativeError = error{
@@ -265,6 +270,7 @@ pub const StreamState = union(enum) {
         // Batch processing state
         result_buf: ?[*]Value, // Heap-allocated result buffer for current batch
         input_buf: ?[*]Value, // Heap-allocated input buffer for current batch
+        fiber_buf: ?[*]*ObjFiber = null, // Heap-allocated fiber pointer buffer for batch dispatch
         batch_size: u32, // Number of items in current batch
         next_emit: u32, // Next index to return from result_buf
         upstream_done: bool, // True when upstream returns None
@@ -281,6 +287,7 @@ pub const StreamState = union(enum) {
         concurrency: u32,
         result_buf: ?[*]Value,
         input_buf: ?[*]Value,
+        fiber_buf: ?[*]*ObjFiber = null,
         batch_size: u32,
         next_emit: u32,
         upstream_done: bool,
@@ -296,6 +303,7 @@ pub const StreamState = union(enum) {
         concurrency: u32,
         result_buf: ?[*]Value,
         input_buf: ?[*]Value,
+        fiber_buf: ?[*]*ObjFiber = null,
         batch_size: u32,
         next_emit: u32,
         upstream_done: bool,
@@ -612,18 +620,72 @@ pub const StreamState = union(enum) {
 
                 if (count == 0) return makeNone(allocator);
 
-                // Process batch: sequential fallback (callClosure) with fail-fast.
-                // When scheduler integration enables true parallelism, each item
-                // would be dispatched to a fiber via scheduler.schedule().
-                var i: u32 = 0;
-                while (i < count) : (i += 1) {
-                    const mapped = callClosure(s.transform_fn, &[_]Value{s.input_buf.?[i]}) catch |err| {
-                        // Fail-fast: first error terminates the stream.
-                        s.had_error = true;
-                        s.upstream_done = true;
-                        return err;
-                    };
-                    s.result_buf.?[i] = mapped;
+                // Dispatch batch to fibers via scheduler for parallel execution.
+                if (current_scheduler) |sched_ptr| {
+                    const sched: *Scheduler = @ptrCast(@alignCast(sched_ptr));
+
+                    // Allocate fiber_buf on first use.
+                    if (s.fiber_buf == null) {
+                        const fiber_mem = try allocator.alloc(*ObjFiber, batch_max);
+                        s.fiber_buf = fiber_mem.ptr;
+                    }
+
+                    // Create one fiber per batch item, each wrapping the transform closure.
+                    var i: u32 = 0;
+                    while (i < count) : (i += 1) {
+                        const closure_obj = s.transform_fn.asObj();
+                        const closure: *ObjClosure = ObjClosure.fromObj(closure_obj);
+                        const fiber = ObjFiber.create(sched.allocator, closure, null, null) catch {
+                            return error.OutOfMemory;
+                        };
+                        // Push the input item as the first argument (stack slot 1).
+                        fiber.stack[fiber.stack_top] = s.input_buf.?[i];
+                        fiber.stack_top += 1;
+                        trackObj(&fiber.obj);
+                        sched.registerFiber(fiber);
+                        sched.schedule(fiber);
+                        s.fiber_buf.?[i] = fiber;
+                    }
+
+                    // Wait for all fibers to complete (spin-yield).
+                    var all_done = false;
+                    while (!all_done) {
+                        all_done = true;
+                        var j: u32 = 0;
+                        while (j < count) : (j += 1) {
+                            if (s.fiber_buf.?[j].state != .dead) {
+                                all_done = false;
+                                break;
+                            }
+                        }
+                        if (!all_done) {
+                            std.atomic.spinLoopHint();
+                        }
+                    }
+
+                    // Collect results with fail-fast.
+                    var k: u32 = 0;
+                    while (k < count) : (k += 1) {
+                        const fiber = s.fiber_buf.?[k];
+                        if (fiber.panic_message != null) {
+                            s.had_error = true;
+                            s.upstream_done = true;
+                            s.error_message = fiber.panic_message;
+                            return error.RuntimeError;
+                        }
+                        s.result_buf.?[k] = fiber.result orelse Value.fromInt(0);
+                    }
+                } else {
+                    // Sequential fallback when no scheduler present.
+                    var i: u32 = 0;
+                    while (i < count) : (i += 1) {
+                        const mapped = callClosure(s.transform_fn, &[_]Value{s.input_buf.?[i]}) catch |err| {
+                            s.had_error = true;
+                            s.upstream_done = true;
+                            return err;
+                        };
+                        s.result_buf.?[i] = mapped;
+                    }
                 }
 
                 s.batch_size = count;
@@ -669,16 +731,67 @@ pub const StreamState = union(enum) {
 
                 if (count == 0) return makeNone(allocator);
 
-                // Process batch sequentially with fail-fast.
-                // In true parallel mode, completion order would differ from input order.
-                var i: u32 = 0;
-                while (i < count) : (i += 1) {
-                    const mapped = callClosure(s.transform_fn, &[_]Value{s.input_buf.?[i]}) catch |err| {
-                        s.had_error = true;
-                        s.upstream_done = true;
-                        return err;
-                    };
-                    s.result_buf.?[i] = mapped;
+                // Dispatch batch to fibers via scheduler for parallel execution.
+                if (current_scheduler) |sched_ptr| {
+                    const sched: *Scheduler = @ptrCast(@alignCast(sched_ptr));
+
+                    if (s.fiber_buf == null) {
+                        const fiber_mem = try allocator.alloc(*ObjFiber, batch_max);
+                        s.fiber_buf = fiber_mem.ptr;
+                    }
+
+                    var i: u32 = 0;
+                    while (i < count) : (i += 1) {
+                        const closure_obj = s.transform_fn.asObj();
+                        const closure: *ObjClosure = ObjClosure.fromObj(closure_obj);
+                        const fiber = ObjFiber.create(sched.allocator, closure, null, null) catch {
+                            return error.OutOfMemory;
+                        };
+                        fiber.stack[fiber.stack_top] = s.input_buf.?[i];
+                        fiber.stack_top += 1;
+                        trackObj(&fiber.obj);
+                        sched.registerFiber(fiber);
+                        sched.schedule(fiber);
+                        s.fiber_buf.?[i] = fiber;
+                    }
+
+                    var all_done = false;
+                    while (!all_done) {
+                        all_done = true;
+                        var j: u32 = 0;
+                        while (j < count) : (j += 1) {
+                            if (s.fiber_buf.?[j].state != .dead) {
+                                all_done = false;
+                                break;
+                            }
+                        }
+                        if (!all_done) {
+                            std.atomic.spinLoopHint();
+                        }
+                    }
+
+                    var k: u32 = 0;
+                    while (k < count) : (k += 1) {
+                        const fiber = s.fiber_buf.?[k];
+                        if (fiber.panic_message != null) {
+                            s.had_error = true;
+                            s.upstream_done = true;
+                            s.error_message = fiber.panic_message;
+                            return error.RuntimeError;
+                        }
+                        s.result_buf.?[k] = fiber.result orelse Value.fromInt(0);
+                    }
+                } else {
+                    // Sequential fallback when no scheduler present.
+                    var i: u32 = 0;
+                    while (i < count) : (i += 1) {
+                        const mapped = callClosure(s.transform_fn, &[_]Value{s.input_buf.?[i]}) catch |err| {
+                            s.had_error = true;
+                            s.upstream_done = true;
+                            return err;
+                        };
+                        s.result_buf.?[i] = mapped;
+                    }
                 }
 
                 s.batch_size = count;
@@ -718,28 +831,81 @@ pub const StreamState = union(enum) {
 
                 if (count == 0) return makeNone(allocator);
 
-                // Process batch with error wrapping (NO fail-fast).
-                // Errors are wrapped in Result.Err, successes in Result.Ok.
-                var i: u32 = 0;
-                while (i < count) : (i += 1) {
-                    const result = callClosure(s.transform_fn, &[_]Value{s.input_buf.?[i]}) catch |err| {
-                        switch (err) {
-                            error.RuntimeError => {
-                                const msg = popLastError() orelse "transform function error";
-                                const err_str = ObjString.create(allocator, msg, null) catch return error.OutOfMemory;
-                                trackObj(&err_str.obj);
-                                const err_adt = ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&err_str.obj)}) catch return error.OutOfMemory;
-                                trackObj(&err_adt.obj);
-                                s.result_buf.?[i] = Value.fromObj(&err_adt.obj);
-                                continue; // NOT fail-fast: continue processing
-                            },
-                            else => return err,
+                // Dispatch batch to fibers via scheduler for parallel execution (no fail-fast).
+                if (current_scheduler) |sched_ptr| {
+                    const sched: *Scheduler = @ptrCast(@alignCast(sched_ptr));
+
+                    if (s.fiber_buf == null) {
+                        const fiber_mem = try allocator.alloc(*ObjFiber, batch_max);
+                        s.fiber_buf = fiber_mem.ptr;
+                    }
+
+                    var i: u32 = 0;
+                    while (i < count) : (i += 1) {
+                        const closure_obj = s.transform_fn.asObj();
+                        const closure: *ObjClosure = ObjClosure.fromObj(closure_obj);
+                        const fiber = ObjFiber.create(sched.allocator, closure, null, null) catch return error.OutOfMemory;
+                        fiber.stack[fiber.stack_top] = s.input_buf.?[i];
+                        fiber.stack_top += 1;
+                        trackObj(&fiber.obj);
+                        sched.registerFiber(fiber);
+                        sched.schedule(fiber);
+                        s.fiber_buf.?[i] = fiber;
+                    }
+
+                    // Wait for all fibers to complete.
+                    var all_done = false;
+                    while (!all_done) {
+                        all_done = true;
+                        var j: u32 = 0;
+                        while (j < count) : (j += 1) {
+                            if (s.fiber_buf.?[j].state != .dead) {
+                                all_done = false;
+                                break;
+                            }
                         }
-                    };
-                    // Wrap success in Result.Ok.
-                    const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{result});
-                    trackObj(&ok_adt.obj);
-                    s.result_buf.?[i] = Value.fromObj(&ok_adt.obj);
+                        if (!all_done) std.atomic.spinLoopHint();
+                    }
+
+                    // Collect with error wrapping (no fail-fast).
+                    var k: u32 = 0;
+                    while (k < count) : (k += 1) {
+                        const fiber = s.fiber_buf.?[k];
+                        if (fiber.panic_message) |msg| {
+                            const err_str = ObjString.create(allocator, msg, null) catch return error.OutOfMemory;
+                            trackObj(&err_str.obj);
+                            const err_adt = ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&err_str.obj)}) catch return error.OutOfMemory;
+                            trackObj(&err_adt.obj);
+                            s.result_buf.?[k] = Value.fromObj(&err_adt.obj);
+                        } else {
+                            const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{fiber.result orelse Value.fromInt(0)});
+                            trackObj(&ok_adt.obj);
+                            s.result_buf.?[k] = Value.fromObj(&ok_adt.obj);
+                        }
+                    }
+                } else {
+                    // Sequential fallback when no scheduler present.
+                    var i: u32 = 0;
+                    while (i < count) : (i += 1) {
+                        const result = callClosure(s.transform_fn, &[_]Value{s.input_buf.?[i]}) catch |err| {
+                            switch (err) {
+                                error.RuntimeError => {
+                                    const msg = popLastError() orelse "transform function error";
+                                    const err_str = ObjString.create(allocator, msg, null) catch return error.OutOfMemory;
+                                    trackObj(&err_str.obj);
+                                    const err_adt = ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&err_str.obj)}) catch return error.OutOfMemory;
+                                    trackObj(&err_adt.obj);
+                                    s.result_buf.?[i] = Value.fromObj(&err_adt.obj);
+                                    continue; // NOT fail-fast: continue processing
+                                },
+                                else => return err,
+                            }
+                        };
+                        // Wrap success in Result.Ok.
+                        const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{result});
+                        trackObj(&ok_adt.obj);
+                        s.result_buf.?[i] = Value.fromObj(&ok_adt.obj);
+                    }
                 }
 
                 s.batch_size = count;
@@ -804,6 +970,9 @@ pub const StreamState = union(enum) {
                 if (s.input_buf) |buf| {
                     allocator.free(buf[0..s.concurrency]);
                 }
+                if (s.fiber_buf) |buf| {
+                    allocator.free(buf[0..s.concurrency]);
+                }
             },
             .par_map_unordered => |*s| {
                 if (s.result_buf) |buf| {
@@ -812,12 +981,18 @@ pub const StreamState = union(enum) {
                 if (s.input_buf) |buf| {
                     allocator.free(buf[0..s.concurrency]);
                 }
+                if (s.fiber_buf) |buf| {
+                    allocator.free(buf[0..s.concurrency]);
+                }
             },
             .par_map_result => |*s| {
                 if (s.result_buf) |buf| {
                     allocator.free(buf[0..s.concurrency]);
                 }
                 if (s.input_buf) |buf| {
+                    allocator.free(buf[0..s.concurrency]);
+                }
+                if (s.fiber_buf) |buf| {
                     allocator.free(buf[0..s.concurrency]);
                 }
             },
