@@ -12,6 +12,8 @@ const ObjTuple = obj_mod.ObjTuple;
 const ObjRecord = obj_mod.ObjRecord;
 const ObjAdt = obj_mod.ObjAdt;
 const ObjStream = obj_mod.ObjStream;
+const fiber_mod = @import("fiber");
+const ObjFiber = fiber_mod.ObjFiber;
 const value_mod = @import("value");
 const Value = value_mod.Value;
 const gc_mod = @import("gc");
@@ -198,8 +200,37 @@ pub const NurseryCollector = struct {
                 try s.state.traceGCRefs(self, gc);
             },
             .fiber => {
-                // Fiber GC scanning will be implemented in Plan 02
-                // when fibers are integrated with the VM.
+                const fiber = ObjFiber.fromObj(obj);
+                // Scan fiber's value stack.
+                for (fiber.stack[0..fiber.stack_top]) |*val| {
+                    try self.processValue(val, gc);
+                }
+                // Scan fiber's call frame closures.
+                for (fiber.frames[0..fiber.frame_count]) |*f| {
+                    if (!f.closure.obj.isOldGen()) {
+                        try self.markNurseryObj(&f.closure.obj, gc);
+                    }
+                }
+                // Scan fiber's open upvalues.
+                var uv = fiber.open_upvalues;
+                while (uv) |u| {
+                    if (!u.obj.isOldGen()) {
+                        try self.markNurseryObj(&u.obj, gc);
+                    }
+                    if (@intFromPtr(u.location) == @intFromPtr(&u.closed)) {
+                        try self.processValue(&u.closed, gc);
+                    }
+                    uv = u.next;
+                }
+                // Scan fiber fields.
+                if (fiber.result) |*r| {
+                    try self.processValue(r, gc);
+                }
+                if (fiber.waiting_on) |w| {
+                    if (!w.obj.isOldGen()) {
+                        try self.markNurseryObj(&w.obj, gc);
+                    }
+                }
             },
             .channel => {
                 // Channel GC scanning will be implemented in Plan 03.

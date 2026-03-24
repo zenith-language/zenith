@@ -147,6 +147,8 @@ pub fn build(b: *std.Build) void {
 
     // gc_nursery needs chunk for ObjFunction.chunk.constants (via obj -> chunk).
     gc_nursery_mod.addImport("chunk", chunk_mod);
+    // gc_nursery needs fiber for ObjFiber GC scanning.
+    gc_nursery_mod.addImport("fiber", fiber_mod);
 
     const gc_oldgen_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/gc_oldgen.zig"),
@@ -162,6 +164,8 @@ pub fn build(b: *std.Build) void {
 
     // gc_oldgen needs chunk for ObjFunction.chunk.constants (via obj -> chunk).
     gc_oldgen_mod.addImport("chunk", chunk_mod);
+    // gc_oldgen needs fiber for ObjFiber GC scanning.
+    gc_oldgen_mod.addImport("fiber", fiber_mod);
 
     // gc_mod needs gc_nursery, gc_oldgen, and gc_roots (added after vm_mod is created below).
     gc_mod.addImport("gc_nursery", gc_nursery_mod);
@@ -292,10 +296,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Wire gc_roots_mod to import fiber and scheduler for multi-fiber scanning.
+    gc_roots_mod.addImport("fiber", fiber_mod);
+    gc_roots_mod.addImport("scheduler", scheduler_mod);
+
     // Wire gc_mod to import gc_roots (for collectNursery orchestration).
     gc_mod.addImport("gc_roots", gc_roots_mod);
     // Wire gc_mod to import vm for VM type access.
     gc_mod.addImport("vm", vm_mod);
+    // Wire gc_mod to import scheduler for safepoint protocol.
+    gc_mod.addImport("scheduler", scheduler_mod);
 
     // Wire gc_oldgen_mod to import gc_roots (for scanRootsForOldGen in mark phase).
     gc_oldgen_mod.addImport("gc_roots", gc_roots_mod);

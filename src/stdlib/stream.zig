@@ -795,9 +795,10 @@ pub const CallClosureFn = *const fn (vm_ptr: *anyopaque, closure_val: Value, arg
 pub const TrackObjFn = *const fn (vm_ptr: *anyopaque, o: *Obj) void;
 
 /// Module-level callback state (set by builtins.zig before terminal execution).
-var current_vm: ?*anyopaque = null;
-var call_closure_fn: ?CallClosureFn = null;
-var track_obj_fn: ?TrackObjFn = null;
+/// Threadlocal so each worker thread has its own copy in multi-threaded mode.
+threadlocal var current_vm: ?*anyopaque = null;
+threadlocal var call_closure_fn: ?CallClosureFn = null;
+threadlocal var track_obj_fn: ?TrackObjFn = null;
 
 /// Set VM callbacks for stream operations.
 pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {

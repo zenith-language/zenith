@@ -63,13 +63,14 @@ pub const GCStats = struct {
 pub const GetGCStatsFn = *const fn (vm_ptr: *anyopaque) GCStats;
 
 /// Module-level state set by the VM before calling builtins.
-var current_vm: ?*anyopaque = null;
-var call_closure_fn: ?CallClosureFn = null;
-var track_obj_fn: ?TrackObjFn = null;
-var trigger_gc_fn: ?TriggerGCFn = null;
-var get_gc_stats_fn: ?GetGCStatsFn = null;
+/// Threadlocal so each worker thread has its own copy in multi-threaded mode.
+threadlocal var current_vm: ?*anyopaque = null;
+threadlocal var call_closure_fn: ?CallClosureFn = null;
+threadlocal var track_obj_fn: ?TrackObjFn = null;
+threadlocal var trigger_gc_fn: ?TriggerGCFn = null;
+threadlocal var get_gc_stats_fn: ?GetGCStatsFn = null;
 /// Atom name table, set by the VM for builtins that need atom resolution (e.g. Json.encode).
-var current_atom_names: ?[]const []const u8 = null;
+threadlocal var current_atom_names: ?[]const []const u8 = null;
 
 /// Called by the VM before dispatching a builtin function.
 pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {
@@ -121,7 +122,7 @@ pub const AdtTypeInfo = struct {
 };
 
 /// Module-level ADT type registry for formatValue.
-var adt_type_info: ?[]const AdtTypeInfo = null;
+threadlocal var adt_type_info: ?[]const AdtTypeInfo = null;
 
 /// Set ADT type info for formatting. Called once after compilation.
 pub fn setAdtTypes(info: []const AdtTypeInfo) void {

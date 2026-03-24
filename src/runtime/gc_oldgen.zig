@@ -12,6 +12,8 @@ const ObjTuple = obj_mod.ObjTuple;
 const ObjRecord = obj_mod.ObjRecord;
 const ObjAdt = obj_mod.ObjAdt;
 const ObjStream = obj_mod.ObjStream;
+const fiber_mod = @import("fiber");
+const ObjFiber = fiber_mod.ObjFiber;
 const value_mod = @import("value");
 const Value = value_mod.Value;
 const gc_mod = @import("gc");
@@ -140,7 +142,37 @@ pub const WriteBarrier = struct {
                 try s.state.traceGCRefs(nursery, gc);
             },
             .fiber => {
-                // Fiber GC scanning will be implemented in Plan 02.
+                const fiber = ObjFiber.fromObj(obj);
+                // Scan fiber's value stack.
+                for (fiber.stack[0..fiber.stack_top]) |*val| {
+                    try nursery.processValue(val, gc);
+                }
+                // Scan fiber's call frame closures.
+                for (fiber.frames[0..fiber.frame_count]) |*f| {
+                    if (!f.closure.obj.isOldGen()) {
+                        try nursery.markNurseryObj(&f.closure.obj, gc);
+                    }
+                }
+                // Scan fiber's open upvalues.
+                var uv = fiber.open_upvalues;
+                while (uv) |u| {
+                    if (!u.obj.isOldGen()) {
+                        try nursery.markNurseryObj(&u.obj, gc);
+                    }
+                    if (@intFromPtr(u.location) == @intFromPtr(&u.closed)) {
+                        try nursery.processValue(&u.closed, gc);
+                    }
+                    uv = u.next;
+                }
+                // Scan fiber fields.
+                if (fiber.result) |*r| {
+                    try nursery.processValue(r, gc);
+                }
+                if (fiber.waiting_on) |w| {
+                    if (!w.obj.isOldGen()) {
+                        try nursery.markNurseryObj(&w.obj, gc);
+                    }
+                }
             },
             .channel => {
                 // Channel GC scanning will be implemented in Plan 03.
@@ -291,7 +323,31 @@ pub const OldGenCollector = struct {
                 try s.state.traceGCRefsOldGen(self, gc);
             },
             .fiber => {
-                // Fiber GC scanning will be implemented in Plan 02.
+                const fiber = ObjFiber.fromObj(obj);
+                // Scan fiber's value stack.
+                for (fiber.stack[0..fiber.stack_top]) |*val| {
+                    try self.processValue(val, gc);
+                }
+                // Scan fiber's call frame closures.
+                for (fiber.frames[0..fiber.frame_count]) |*f| {
+                    try self.markObj(&f.closure.obj, gc);
+                }
+                // Scan fiber's open upvalues.
+                var uv = fiber.open_upvalues;
+                while (uv) |u| {
+                    try self.markObj(&u.obj, gc);
+                    if (@intFromPtr(u.location) == @intFromPtr(&u.closed)) {
+                        try self.processValue(&u.closed, gc);
+                    }
+                    uv = u.next;
+                }
+                // Scan fiber fields.
+                if (fiber.result) |*r| {
+                    try self.processValue(r, gc);
+                }
+                if (fiber.waiting_on) |w| {
+                    try self.markObj(&w.obj, gc);
+                }
             },
             .channel => {
                 // Channel GC scanning will be implemented in Plan 03.

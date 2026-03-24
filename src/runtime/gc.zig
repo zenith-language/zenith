@@ -17,6 +17,8 @@ const arena_mod = @import("arena");
 const StageArena = arena_mod.StageArena;
 const vm_mod = @import("vm");
 const VM = vm_mod.VM;
+const scheduler_mod = @import("scheduler");
+const Scheduler = scheduler_mod.Scheduler;
 
 /// Central GC state for generational garbage collection.
 ///
@@ -170,6 +172,19 @@ pub const GC = struct {
         // Need a VM to scan roots.
         const vm = self.vm orelse return;
 
+        // Safepoint coordination: if scheduler exists, pause all workers.
+        var sched: ?*Scheduler = null;
+        if (vm.scheduler) |sched_ptr| {
+            sched = @ptrCast(@alignCast(sched_ptr));
+            sched.?.requestSafepoint();
+            sched.?.waitForSafepoint();
+        }
+        defer {
+            if (sched) |s| {
+                s.releaseSafepoint();
+            }
+        }
+
         const timer_start = std.time.nanoTimestamp();
 
         // Count nursery objects before collection (for survival rate).
@@ -300,6 +315,19 @@ pub const GC = struct {
         defer self.collecting = false;
 
         const vm = self.vm orelse return;
+
+        // Safepoint coordination: if scheduler exists, pause all workers.
+        var sched: ?*Scheduler = null;
+        if (vm.scheduler) |sched_ptr| {
+            sched = @ptrCast(@alignCast(sched_ptr));
+            sched.?.requestSafepoint();
+            sched.?.waitForSafepoint();
+        }
+        defer {
+            if (sched) |s| {
+                s.releaseSafepoint();
+            }
+        }
 
         const timer_start = std.time.nanoTimestamp();
 
