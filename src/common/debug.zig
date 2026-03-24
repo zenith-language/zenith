@@ -94,6 +94,15 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, writer: anytyp
         .op_list_len => try simpleInstruction("OP_LIST_LEN", offset, writer),
         .op_list_slice => try u16Instruction("OP_LIST_SLICE", chunk, offset, writer),
         .op_dup => try simpleInstruction("OP_DUP", offset, writer),
+
+        // Phase 7: Concurrency
+        .op_spawn => try byteInstruction("OP_SPAWN", chunk, offset, writer),
+        .op_channel => try byteInstruction("OP_CHANNEL", chunk, offset, writer),
+        .op_send => try simpleInstruction("OP_SEND", offset, writer),
+        .op_recv => try simpleInstruction("OP_RECV", offset, writer),
+        .op_close_channel => try simpleInstruction("OP_CLOSE_CHANNEL", offset, writer),
+        .op_join => try simpleInstruction("OP_JOIN", offset, writer),
+        .op_try_join => try simpleInstruction("OP_TRY_JOIN", offset, writer),
     };
 }
 

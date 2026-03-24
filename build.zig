@@ -83,6 +83,21 @@ pub fn build(b: *std.Build) void {
     // Wire obj_mod to import fiber for ObjFiber destroy.
     obj_mod.addImport("fiber", fiber_mod);
 
+    // ── Channel module (Phase 7, Plan 03) ───────────────────────────────
+    const channel_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/channel.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "fiber", .module = fiber_mod },
+        },
+    });
+
+    // Wire obj_mod to import channel for ObjChannel destroy.
+    obj_mod.addImport("channel", channel_mod);
+
     const context_switch_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/context_switch.zig"),
         .target = target,
@@ -166,6 +181,9 @@ pub fn build(b: *std.Build) void {
     gc_oldgen_mod.addImport("chunk", chunk_mod);
     // gc_oldgen needs fiber for ObjFiber GC scanning.
     gc_oldgen_mod.addImport("fiber", fiber_mod);
+    // gc_nursery and gc_oldgen need channel for ObjChannel GC scanning.
+    gc_nursery_mod.addImport("channel", channel_mod);
+    gc_oldgen_mod.addImport("channel", channel_mod);
 
     // gc_mod needs gc_nursery, gc_oldgen, and gc_roots (added after vm_mod is created below).
     gc_mod.addImport("gc_nursery", gc_nursery_mod);
@@ -278,6 +296,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "builtins", .module = builtins_mod },
             .{ .name = "gc", .module = gc_mod },
             .{ .name = "fiber", .module = fiber_mod },
+            .{ .name = "channel", .module = channel_mod },
         },
     });
 
@@ -454,6 +473,7 @@ pub fn build(b: *std.Build) void {
         fiber_mod,
         context_switch_mod,
         scheduler_mod,
+        channel_mod,
     };
 
     for (test_modules) |mod| {

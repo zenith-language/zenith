@@ -143,8 +143,9 @@ pub const Obj = struct {
                 f.destroy(allocator);
             },
             .channel => {
-                // Channel stub -- will be implemented in Plan 03.
-                // For now, no-op since no ObjChannel struct exists yet.
+                const channel_mod = @import("channel");
+                const ch = channel_mod.ObjChannel.fromObj(self);
+                ch.destroy(allocator);
             },
         }
     }

@@ -575,12 +575,12 @@ test "lexer: keyword vs identifier" {
 }
 
 test "lexer: all keywords" {
-    const src = "let if else while for in and or not fn true false nil match type with return break continue import when";
+    const src = "let if else while for in and or not fn true false nil match type with return break continue import when select";
     try expectTags(src, &.{
         .kw_let, .kw_if, .kw_else, .kw_while, .kw_for, .kw_in,
         .kw_and, .kw_or, .kw_not, .kw_fn, .kw_true, .kw_false,
         .kw_nil, .kw_match, .kw_type, .kw_with, .kw_return,
-        .kw_break, .kw_continue, .kw_import, .kw_when, .eof,
+        .kw_break, .kw_continue, .kw_import, .kw_when, .kw_select, .eof,
     });
 }
 

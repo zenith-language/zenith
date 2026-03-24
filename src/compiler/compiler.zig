@@ -496,6 +496,15 @@ pub const Compiler = struct {
                 try self.emitError(node_idx, .E005, "unexpected pattern node");
             },
 
+            // Phase 7 concurrency nodes.
+            .select_expr => {
+                // Select runtime will be implemented in Plan 04.
+                try self.emitError(node_idx, .E005, "select is not yet implemented");
+            },
+            .select_arm => {
+                try self.emitError(node_idx, .E005, "unexpected select arm outside of select");
+            },
+
             .root => {}, // handled above
         }
     }

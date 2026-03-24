@@ -543,6 +543,14 @@ pub const VM = struct {
                     const start = self.readU16Legacy();
                     try self.execOpListSlice(start);
                 },
+
+                // Phase 7 concurrency opcodes (stubs in legacy mode).
+                .op_spawn, .op_channel, .op_send, .op_recv,
+                .op_close_channel, .op_join, .op_try_join,
+                => {
+                    try self.runtimeErrorAny(.E001, "concurrency opcodes not available in legacy mode");
+                    return error.RuntimeErr;
+                },
             }
         }
 
@@ -793,6 +801,21 @@ pub const VM = struct {
                     const start = self.readU16Frame();
                     try self.execOpListSlice(start);
                 },
+
+                // Phase 7 concurrency opcodes.
+                .op_spawn => {
+                    const arg_count = self.readByteFrame();
+                    try self.execOpSpawn(arg_count);
+                },
+                .op_channel => {
+                    const has_capacity = self.readByteFrame();
+                    try self.execOpChannel(has_capacity);
+                },
+                .op_send => try self.execOpSend(),
+                .op_recv => try self.execOpRecv(),
+                .op_close_channel => try self.execOpCloseChannel(),
+                .op_join => try self.execOpJoin(),
+                .op_try_join => try self.execOpTryJoin(),
             }
         }
 
@@ -1482,6 +1505,21 @@ pub const VM = struct {
                 const start = self.readU16Frame();
                 try self.execOpListSlice(start);
             },
+
+            // Phase 7 concurrency opcodes.
+            .op_spawn => {
+                const arg_count = self.readByteFrame();
+                try self.execOpSpawn(arg_count);
+            },
+            .op_channel => {
+                const has_capacity = self.readByteFrame();
+                try self.execOpChannel(has_capacity);
+            },
+            .op_send => try self.execOpSend(),
+            .op_recv => try self.execOpRecv(),
+            .op_close_channel => try self.execOpCloseChannel(),
+            .op_join => try self.execOpJoin(),
+            .op_try_join => try self.execOpTryJoin(),
         }
     }
 
@@ -2019,6 +2057,227 @@ pub const VM = struct {
     }
 
     // ── Output ────────────────────────────────────────────────────────
+
+    // ── Concurrency opcode execution (Phase 7) ──────────────────────
+
+    const channel_mod = @import("channel");
+    const ObjChannel = channel_mod.ObjChannel;
+
+    fn execOpSpawn(self: *Self, arg_count: u8) RuntimeError!void {
+        // spawn(closure) or spawn(name, closure)
+        var closure_val: Value = undefined;
+        var name_val: ?Value = null;
+
+        if (arg_count == 2) {
+            closure_val = try self.pop();
+            name_val = try self.pop();
+        } else if (arg_count == 1) {
+            closure_val = try self.pop();
+        } else {
+            try self.runtimeErrorAny(.E001, "spawn requires 1 or 2 arguments");
+            return error.RuntimeErr;
+        }
+
+        // Pop the builtin sentinel.
+        _ = try self.pop();
+
+        if (!closure_val.isObj() or closure_val.asObj().obj_type != .closure) {
+            try self.runtimeErrorAny(.E001, "spawn argument must be a closure");
+            return error.RuntimeErr;
+        }
+
+        const closure = ObjClosure.fromObj(closure_val.asObj());
+        var fiber_name: ?[]const u8 = null;
+        if (name_val) |nv| {
+            if (nv.isString()) {
+                fiber_name = ObjString.fromObj(nv.asObj()).bytes;
+            }
+        }
+
+        const fiber = try ObjFiber.create(self.allocator, closure, null, fiber_name);
+        self.trackObject(&fiber.obj);
+        try self.push(Value.fromObj(&fiber.obj));
+    }
+
+    fn execOpChannel(self: *Self, has_capacity: u8) RuntimeError!void {
+        var capacity: u32 = 0;
+        if (has_capacity == 1) {
+            const cap_val = try self.pop();
+            if (!cap_val.isInt() or cap_val.asInt() < 0) {
+                try self.runtimeErrorAny(.E001, "channel capacity must be a non-negative integer");
+                return error.RuntimeErr;
+            }
+            capacity = @intCast(cap_val.asInt());
+        }
+
+        // Pop the builtin sentinel.
+        _ = try self.pop();
+
+        const ch = try ObjChannel.create(self.allocator, capacity);
+        self.trackObject(&ch.obj);
+        try self.push(Value.fromObj(&ch.obj));
+    }
+
+    fn execOpSend(self: *Self) RuntimeError!void {
+        const val = try self.pop();
+        const ch_val = try self.pop();
+
+        // Pop the builtin sentinel.
+        _ = try self.pop();
+
+        if (!ch_val.isObjType(.channel)) {
+            try self.runtimeErrorAny(.E001, "send requires a channel as first argument");
+            return error.RuntimeErr;
+        }
+
+        const ch = ObjChannel.fromObj(ch_val.asObj());
+        const result = ch.send(val);
+
+        switch (result) {
+            .sent => {
+                try self.push(Value.nil);
+            },
+            .closed => {
+                try self.runtimeErrorAny(.E001, "cannot send on closed channel");
+                return error.RuntimeErr;
+            },
+            .would_block => {
+                // In single-threaded mode, blocking is an error.
+                // Full fiber parking will be added in Plan 04.
+                try self.runtimeErrorAny(.E001, "channel send would block (no receiver)");
+                return error.RuntimeErr;
+            },
+        }
+    }
+
+    fn execOpRecv(self: *Self) RuntimeError!void {
+        const ch_val = try self.pop();
+
+        // Pop the builtin sentinel.
+        _ = try self.pop();
+
+        if (!ch_val.isObjType(.channel)) {
+            try self.runtimeErrorAny(.E001, "recv requires a channel argument");
+            return error.RuntimeErr;
+        }
+
+        const ch = ObjChannel.fromObj(ch_val.asObj());
+        const result = ch.recv();
+
+        switch (result) {
+            .value => |val| {
+                // Return Some(val)
+                const some = try obj_mod.ObjAdt.create(self.allocator, 0, 0, &[_]Value{val});
+                self.trackObject(&some.obj);
+                try self.push(Value.fromObj(&some.obj));
+            },
+            .closed => {
+                // Return None
+                const none = try obj_mod.ObjAdt.create(self.allocator, 0, 1, &[_]Value{});
+                self.trackObject(&none.obj);
+                try self.push(Value.fromObj(&none.obj));
+            },
+            .would_block => {
+                // In single-threaded mode, blocking is an error.
+                // Full fiber parking will be added in Plan 04.
+                try self.runtimeErrorAny(.E001, "channel recv would block (empty channel)");
+                return error.RuntimeErr;
+            },
+        }
+    }
+
+    fn execOpCloseChannel(self: *Self) RuntimeError!void {
+        const ch_val = try self.pop();
+
+        // Pop the builtin sentinel.
+        _ = try self.pop();
+
+        if (!ch_val.isObjType(.channel)) {
+            try self.runtimeErrorAny(.E001, "close requires a channel argument");
+            return error.RuntimeErr;
+        }
+
+        const ch = ObjChannel.fromObj(ch_val.asObj());
+        _ = ch.close();
+        try self.push(Value.nil);
+    }
+
+    fn execOpJoin(self: *Self) RuntimeError!void {
+        const fiber_val = try self.pop();
+
+        // Pop the builtin sentinel.
+        _ = try self.pop();
+
+        if (!fiber_val.isObjType(.fiber)) {
+            try self.runtimeErrorAny(.E001, "join requires a fiber argument");
+            return error.RuntimeErr;
+        }
+
+        const target = ObjFiber.fromObj(fiber_val.asObj());
+
+        if (target.state == .dead) {
+            // Fiber already done; construct Result.
+            if (target.panic_message != null) {
+                // Result.Err(panic_message)
+                const msg_str = try ObjString.create(self.allocator, target.panic_message.?, null);
+                self.trackObject(&msg_str.obj);
+                const err_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 1, &[_]Value{Value.fromObj(&msg_str.obj)});
+                self.trackObject(&err_adt.obj);
+                try self.push(Value.fromObj(&err_adt.obj));
+            } else {
+                // Result.Ok(result)
+                const result_val = target.result orelse Value.nil;
+                const ok_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 0, &[_]Value{result_val});
+                self.trackObject(&ok_adt.obj);
+                try self.push(Value.fromObj(&ok_adt.obj));
+            }
+        } else {
+            // Fiber still running; in single-threaded mode, this is an error.
+            // Full fiber parking will be added in Plan 04.
+            try self.runtimeErrorAny(.E001, "join: fiber is still running (blocking join requires scheduler)");
+            return error.RuntimeErr;
+        }
+    }
+
+    fn execOpTryJoin(self: *Self) RuntimeError!void {
+        const fiber_val = try self.pop();
+
+        // Pop the builtin sentinel.
+        _ = try self.pop();
+
+        if (!fiber_val.isObjType(.fiber)) {
+            try self.runtimeErrorAny(.E001, "try_join requires a fiber argument");
+            return error.RuntimeErr;
+        }
+
+        const target = ObjFiber.fromObj(fiber_val.asObj());
+
+        if (target.state == .dead) {
+            // Fiber done; return Some(Result).
+            var inner_result: Value = undefined;
+            if (target.panic_message != null) {
+                const msg_str = try ObjString.create(self.allocator, target.panic_message.?, null);
+                self.trackObject(&msg_str.obj);
+                const err_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 1, &[_]Value{Value.fromObj(&msg_str.obj)});
+                self.trackObject(&err_adt.obj);
+                inner_result = Value.fromObj(&err_adt.obj);
+            } else {
+                const result_val = target.result orelse Value.nil;
+                const ok_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 0, &[_]Value{result_val});
+                self.trackObject(&ok_adt.obj);
+                inner_result = Value.fromObj(&ok_adt.obj);
+            }
+            // Wrap in Some.
+            const some = try obj_mod.ObjAdt.create(self.allocator, 0, 0, &[_]Value{inner_result});
+            self.trackObject(&some.obj);
+            try self.push(Value.fromObj(&some.obj));
+        } else {
+            // Fiber still running; return None (non-blocking).
+            const none = try obj_mod.ObjAdt.create(self.allocator, 0, 1, &[_]Value{});
+            self.trackObject(&none.obj);
+            try self.push(Value.fromObj(&none.obj));
+        }
+    }
 
     fn printValue(self: *Self, val: Value) !void {
         const text = try builtins_mod.formatValue(val, self.infra_allocator, if (self.atom_names.items.len > 0) self.atom_names.items else null);

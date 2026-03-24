@@ -110,6 +110,10 @@ pub const Ast = struct {
             pattern_record, // data.lhs = extra_start, data.rhs = extra_end (name_token/pattern pairs)
             pattern_rest, // data.lhs = binding name token (for ..rest patterns)
 
+            // ── Concurrency (Phase 7) ──────────────────────────────────
+            select_expr, // data.lhs = extra_start (arm indices), data.rhs = extra_end
+            select_arm, // data.lhs = kind (0=recv, 1=send), data.rhs = extra_idx (arm details)
+
             // ── Root ────────────────────────────────────────────────────
             root, // data.lhs = extra_data start, data.rhs = extra_data end
         };
@@ -232,6 +236,8 @@ test "Ast: all Tag variants exist" {
         .pattern_wildcard, .pattern_literal, .pattern_binding,
         .pattern_adt,  .pattern_list,  .pattern_tuple,
         .pattern_record, .pattern_rest,
+        // Phase 7: Concurrency
+        .select_expr, .select_arm,
         .root,
     };
     try std.testing.expect(tags.len > 0);

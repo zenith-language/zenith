@@ -64,6 +64,7 @@ pub const Tag = enum(u8) {
     kw_continue,
     kw_import,
     kw_when,
+    kw_select,
 
     // ── Comments ───────────────────────────────────────────────────────
     line_comment, // -- ...
@@ -116,6 +117,7 @@ pub fn keyword(text: []const u8) ?Tag {
         .{ "continue", .kw_continue },
         .{ "import", .kw_import },
         .{ "when", .kw_when },
+        .{ "select", .kw_select },
     });
     return map.get(text);
 }
@@ -145,6 +147,7 @@ test "keyword lookup resolves all keywords" {
         .{ "continue", Tag.kw_continue },
         .{ "import", Tag.kw_import },
         .{ "when", Tag.kw_when },
+        .{ "select", Tag.kw_select },
     };
 
     inline for (cases) |case| {
@@ -245,6 +248,7 @@ test "Tag enum has all required token types" {
         .kw_continue,
         .kw_import,
         .kw_when,
+        .kw_select,
         .line_comment,
         .block_comment,
         .eof,

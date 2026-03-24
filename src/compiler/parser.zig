@@ -78,6 +78,7 @@ pub const Parser = struct {
             .kw_fn => self.parseFnDecl(),
             .kw_return => self.parseReturnStmt(),
             .kw_type => self.parseTypeDecl(),
+            .kw_select => self.parseSelectExpr(),
             else => self.parseExprStmt(),
         };
     }
@@ -739,6 +740,58 @@ pub const Parser = struct {
             .tag = .field_access,
             .main_token = dot_tok,
             .data = .{ .lhs = left, .rhs = field_tok },
+        }, self.allocator);
+    }
+
+    // ── Select expression parsing (Phase 7) ────────────────────────────
+
+    /// Parse `select { | recv(ch) -> |val| body | send(ch, v) -> body | ... }`
+    /// NOTE: Full select runtime is in Plan 04. This adds AST representation only.
+    fn parseSelectExpr(self: *Parser) Error!Node.Index {
+        const select_tok = self.pos;
+        self.advance(); // consume 'select'
+
+        if (self.peekTag() != .left_brace) {
+            try self.emitError("expected '{' after 'select'");
+            return error.ParseError;
+        }
+        self.advance(); // consume '{'
+
+        var arms: std.ArrayListUnmanaged(u32) = .empty;
+        defer arms.deinit(self.allocator);
+
+        // Parse arms: | recv(ch) -> |val| body or | send(ch, v) -> body
+        while (self.peekTag() == .pipe) {
+            self.advance(); // consume '|'
+
+            // For now, parse the arm as an expression (simplified).
+            // Full arm parsing will be expanded in Plan 04.
+            const arm_body = try self.parseExpression();
+            const arm_node = try self.ast.addNode(.{
+                .tag = .select_arm,
+                .main_token = select_tok,
+                .data = .{ .lhs = 0, .rhs = arm_body },
+            }, self.allocator);
+            try arms.append(self.allocator, arm_node);
+        }
+
+        if (self.peekTag() != .right_brace) {
+            try self.emitError("expected '}' after select arms");
+            return error.ParseError;
+        }
+        self.advance(); // consume '}'
+
+        // Store arm indices in extra_data.
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (arms.items) |arm_idx| {
+            _ = try self.ast.addExtra(arm_idx, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .select_expr,
+            .main_token = select_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
         }, self.allocator);
     }
 

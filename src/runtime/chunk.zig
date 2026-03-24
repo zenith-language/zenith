@@ -95,6 +95,15 @@ pub const OpCode = enum(u8) {
     op_list_len, // pops list, pushes its length as int
     op_list_slice, // [start: u16] pops list, pushes new list from start to end (for ..rest)
     op_dup, // duplicates top of stack (needed for pattern matching to keep scrutinee)
+
+    // -- Concurrency (Phase 7) ---------------------------------------------------
+    op_spawn, // [arg_count: u8] pops closure (+ optional name string), pushes ObjFiber handle
+    op_channel, // [has_capacity: u8] if 1, pops capacity int; if 0, unbuffered. Pushes ObjChannel
+    op_send, // pops channel and value, sends value to channel
+    op_recv, // pops channel, pushes Option (Some(val) or None)
+    op_close_channel, // pops channel, closes it
+    op_join, // pops fiber handle, pushes Result (blocks if fiber not done)
+    op_try_join, // pops fiber handle, pushes Option(Result) (non-blocking)
 };
 
 /// Bytecode container with constant pool and line information.
