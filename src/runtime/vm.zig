@@ -21,6 +21,8 @@ const gc_mod = @import("gc");
 const GC = gc_mod.GC;
 const fiber_mod = @import("fiber");
 const ObjFiber = fiber_mod.ObjFiber;
+const scheduler_mod = @import("scheduler");
+const Scheduler = scheduler_mod.Scheduler;
 
 const STACK_MAX: u32 = 65536;
 const FRAMES_MAX: u32 = 256;
@@ -201,6 +203,14 @@ pub const VM = struct {
     pub fn setAdtTypes(self: *VM, info: []const builtins_mod.AdtTypeInfo) void {
         self.adt_type_info = info;
         builtins_mod.setAdtTypes(info);
+    }
+
+    /// Connect the VM to a scheduler for M:N fiber execution.
+    /// Registers the VM's runFiberCallback with the scheduler so that
+    /// Worker.runFiber() can dispatch fiber bytecode through the VM.
+    pub fn setScheduler(self: *Self, sched: *Scheduler) void {
+        self.scheduler = @ptrCast(sched);
+        sched.setRunFiber(@ptrCast(self), &runFiberCallback);
     }
 
     /// Register a heap-allocated object for cleanup.
@@ -1329,6 +1339,50 @@ pub const VM = struct {
         return Value.nil;
     }
 
+    /// Callback for the scheduler to execute a fiber's bytecode on a VM instance.
+    /// Matches scheduler_mod.RunFiberFn signature.
+    /// Responsible ONLY for: executing bytecode, setting result/panic, marking fiber dead.
+    /// Waiter-waking is NOT done here -- it is handled by Worker.runFiber() in
+    /// scheduler.zig after this callback returns, avoiding circular dependency concerns.
+    fn runFiberCallback(vm_ptr: *anyopaque, fiber: *ObjFiber) void {
+        const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+
+        // Set this fiber as the current fiber for per-fiber state access.
+        const prev_fiber = vm.current_fiber;
+        vm.current_fiber = fiber;
+
+        // Set up threadlocal builtins state for this worker thread.
+        builtins_mod.setVM(@ptrCast(vm), &callClosureFromBuiltin, &trackObjectFromBuiltin);
+        builtins_mod.setPopLastError(&popLastErrorFromBuiltin);
+        defer {
+            builtins_mod.clearVM();
+            vm.current_fiber = prev_fiber;
+        }
+
+        // Execute the closure via callClosureFromBuiltin.
+        // The fiber was created with frame_count=1 and stack_top=1 (closure in slot 0).
+        // Get the closure from the fiber's first call frame.
+        const closure = fiber.frames[0].closure;
+        const closure_val = Value.fromObj(&closure.obj);
+        const err_count_before = vm.errors.items.len;
+        const result = callClosureFromBuiltin(@ptrCast(vm), closure_val, &[_]Value{});
+
+        if (result) |val| {
+            fiber.result = val;
+            fiber.state = .dead;
+        } else {
+            // Closure panicked -- extract the panic message from the error list.
+            if (vm.errors.items.len > err_count_before) {
+                const last_err = vm.errors.items[vm.errors.items.len - 1];
+                fiber.panic_message = last_err.message;
+                vm.errors.items.len -= 1;
+            } else {
+                fiber.panic_message = "unknown panic";
+            }
+            fiber.state = .dead;
+        }
+    }
+
     /// Execute a single opcode from the current frame (used by callClosureFromBuiltin).
     fn runSingleFrameOp(self: *Self) RuntimeError!void {
         const frame = self.currentFrame();
@@ -2194,6 +2248,13 @@ pub const VM = struct {
                 }
                 fiber.state = .dead;
             }
+        } else {
+            // Route through scheduler for M:N execution.
+            // Register the fiber with the scheduler (for GC scanning) and
+            // schedule it for execution on a worker thread.
+            const sched: *Scheduler = @ptrCast(@alignCast(self.scheduler.?));
+            sched.registerFiber(fiber);
+            sched.schedule(fiber);
         }
 
         try self.push(Value.fromObj(&fiber.obj));
@@ -2337,9 +2398,32 @@ pub const VM = struct {
                 self.trackObject(&ok_adt.obj);
                 try self.push(Value.fromObj(&ok_adt.obj));
             }
+        } else if (self.scheduler != null) {
+            // Fiber not yet dead and scheduler is present: park the calling fiber.
+            // Add the calling fiber to the target's waiter list so it gets unparked
+            // when the target completes (Worker.runFiber handles waiter-waking).
+            const sched: *Scheduler = @ptrCast(@alignCast(self.scheduler.?));
+            if (self.current_fiber) |calling_fiber| {
+                // Link the calling fiber into the target's waiter linked list.
+                calling_fiber.next_waiter = target.waiters;
+                target.waiters = calling_fiber;
+                calling_fiber.waiting_on = target;
+                // Park the calling fiber -- it will be resumed by the scheduler
+                // when the target fiber completes.
+                sched.parkFiber(calling_fiber);
+            } else {
+                // Main thread calling join on a scheduler fiber that isn't done yet.
+                // Spin-wait until the target fiber completes (simple v1 approach).
+                while (target.state != .dead) {
+                    std.Thread.yield() catch {};
+                }
+                // Now fall through to the dead branch by re-calling execOpJoin
+                // with the fiber already dead. Push fiber back and retry.
+                try self.push(fiber_val);
+                return self.execOpJoin();
+            }
         } else {
-            // Fiber still running; in single-threaded mode, this is an error.
-            // Full fiber parking will be added in Plan 04.
+            // Fiber still running; in single-threaded mode without scheduler, this is an error.
             try self.runtimeErrorAny(.E001, "join: fiber is still running (blocking join requires scheduler)");
             return error.RuntimeErr;
         }

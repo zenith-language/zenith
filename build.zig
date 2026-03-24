@@ -297,6 +297,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "gc", .module = gc_mod },
             .{ .name = "fiber", .module = fiber_mod },
             .{ .name = "channel", .module = channel_mod },
+            .{ .name = "scheduler", .module = scheduler_mod },
         },
     });
 
