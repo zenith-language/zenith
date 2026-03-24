@@ -10,7 +10,7 @@ let result2 = range(1, 4)
   |> collect()
 print(result2)
 
--- par_map_unordered collects same values (v1: sequential, order preserved)
+-- par_map_unordered collects same values (completion order = input order in cooperative mode)
 let result3 = range(1, 4)
   |> par_map_unordered(2, |x| x * 10)
   |> collect()
@@ -41,3 +41,22 @@ let ok_vals = stream
   |> map(|r| Result.unwrap_or(r, nil))
   |> collect()
 print(ok_vals)
+
+-- par_map with more items than concurrency (tests multi-batch processing)
+let result6 = range(1, 11)
+  |> par_map(3, |x| x * x)
+  |> collect()
+print(result6)
+
+-- par_map_result with all successes (no errors)
+let result7 = range(1, 4)
+  |> par_map_result(2, |x| x * 10)
+  |> collect()
+print(result7)
+
+-- chained par_map operators
+let result8 = range(1, 4)
+  |> par_map(2, |x| x + 1)
+  |> par_map(2, |x| x * 10)
+  |> collect()
+print(result8)
