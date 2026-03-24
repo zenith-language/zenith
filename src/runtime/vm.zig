@@ -19,6 +19,8 @@ const builtins_mod = @import("builtins");
 const NativeFn = builtins_mod.NativeFn;
 const gc_mod = @import("gc");
 const GC = gc_mod.GC;
+const fiber_mod = @import("fiber");
+const ObjFiber = fiber_mod.ObjFiber;
 
 const STACK_MAX: u32 = 65536;
 const FRAMES_MAX: u32 = 256;
@@ -58,8 +60,44 @@ pub const VM = struct {
     errors: std.ArrayListUnmanaged(Diagnostic),
     // Output writer for tests (captures print output instead of stdout).
     output_buf: ?*std.ArrayListUnmanaged(u8),
+    // ── Fiber-aware state (Phase 7) ─────────────────────────────────
+    /// Current fiber being executed. When non-null, stack/frames/upvalues
+    /// are accessed through this fiber. When null, legacy VM-local fields are used.
+    current_fiber: ?*ObjFiber = null,
+    /// Scheduler reference (opaque to avoid import cycle). Null in single-threaded mode.
+    scheduler: ?*anyopaque = null,
 
     const Self = @This();
+
+    // ── Fiber-aware accessors ───────────────────────────────────────
+    // These inline methods provide per-fiber state indirection.
+    // When current_fiber is set, accesses go through the fiber's fields.
+    // When null (legacy/test mode), accesses use VM's own fields.
+
+    inline fn getStack(self: *Self) *[STACK_MAX]Value {
+        if (self.current_fiber) |f| return @ptrCast(&f.stack);
+        return &self.stack;
+    }
+
+    inline fn getStackTop(self: *Self) *u32 {
+        if (self.current_fiber) |f| return &f.stack_top;
+        return &self.stack_top;
+    }
+
+    inline fn getFrames(self: *Self) *[FRAMES_MAX]CallFrame {
+        if (self.current_fiber) |f| return @ptrCast(&f.frames);
+        return &self.frames;
+    }
+
+    inline fn getFrameCount(self: *Self) *u32 {
+        if (self.current_fiber) |f| return &f.frame_count;
+        return &self.frame_count;
+    }
+
+    inline fn getOpenUpvalues(self: *Self) *?*ObjUpvalue {
+        if (self.current_fiber) |f| return &f.open_upvalues;
+        return &self.open_upvalues;
+    }
 
     /// Initialize a VM to execute a raw chunk (legacy Phase 1 mode).
     pub fn init(chunk: *const Chunk, allocator: Allocator) VM {
@@ -230,19 +268,25 @@ pub const VM = struct {
     // ── Stack operations ──────────────────────────────────────────────
 
     fn push(self: *Self, val: Value) RuntimeError!void {
-        if (self.stack_top >= STACK_MAX) return error.StackOverflow;
-        self.stack[self.stack_top] = val;
-        self.stack_top += 1;
+        const st = self.getStackTop();
+        const stack = self.getStack();
+        if (st.* >= STACK_MAX) return error.StackOverflow;
+        stack[st.*] = val;
+        st.* += 1;
     }
 
     fn pop(self: *Self) RuntimeError!Value {
-        if (self.stack_top == 0) return error.StackUnderflow;
-        self.stack_top -= 1;
-        return self.stack[self.stack_top];
+        const st = self.getStackTop();
+        const stack = self.getStack();
+        if (st.* == 0) return error.StackUnderflow;
+        st.* -= 1;
+        return stack[st.*];
     }
 
-    fn peek(self: *const Self, distance: u32) Value {
-        return self.stack[self.stack_top - 1 - distance];
+    fn peek(self: *Self, distance: u32) Value {
+        const st = self.getStackTop();
+        const stack = self.getStack();
+        return stack[st.* - 1 - distance];
     }
 
     // ── Reading from bytecode stream (legacy mode) ───────────────────
@@ -273,7 +317,9 @@ pub const VM = struct {
     // ── Reading from current frame's bytecode ────────────────────────
 
     fn currentFrame(self: *Self) *CallFrame {
-        return &self.frames[self.frame_count - 1];
+        const frames = self.getFrames();
+        const fc = self.getFrameCount();
+        return &frames[fc.* - 1];
     }
 
     fn frameChunk(self: *Self) *const Chunk {
@@ -311,7 +357,7 @@ pub const VM = struct {
     /// Execute the loaded chunk/closure. Returns the final value on the stack.
     pub fn run(self: *Self) RuntimeError!Value {
         // If we have frames (closure mode), use frame-based dispatch.
-        if (self.frame_count > 0) {
+        if (self.getFrameCount().* > 0) {
             return self.runFrames();
         }
         // Legacy mode: run from raw chunk.
@@ -376,11 +422,11 @@ pub const VM = struct {
 
                 .op_get_local => {
                     const slot = self.readByteLegacy();
-                    try self.push(self.stack[slot]);
+                    try self.push(self.getStack()[slot]);
                 },
                 .op_set_local => {
                     const slot = self.readByteLegacy();
-                    self.stack[slot] = self.peek(0);
+                    self.getStack()[slot] = self.peek(0);
                 },
                 .op_get_global, .op_set_global, .op_define_global => {
                     try self.runtimeErrorLegacy(.E002, "globals not supported");
@@ -418,7 +464,7 @@ pub const VM = struct {
                 },
 
                 .op_return => {
-                    if (self.stack_top > 0) {
+                    if (self.getStackTop().* > 0) {
                         return try self.pop();
                     }
                     return Value.nil;
@@ -505,7 +551,7 @@ pub const VM = struct {
 
     /// Frame-based dispatch loop for closure execution (Phase 2).
     fn runFrames(self: *Self) RuntimeError!Value {
-        while (self.frame_count > 0) {
+        while (self.getFrameCount().* > 0) {
             const frame = self.currentFrame();
             const code = frame.closure.function.chunk.code.items;
 
@@ -566,11 +612,11 @@ pub const VM = struct {
 
                 .op_get_local => {
                     const slot = self.readByteFrame();
-                    try self.push(self.stack[frame.base_slot + slot]);
+                    try self.push(self.getStack()[frame.base_slot + slot]);
                 },
                 .op_set_local => {
                     const slot = self.readByteFrame();
-                    self.stack[frame.base_slot + slot] = self.peek(0);
+                    self.getStack()[frame.base_slot + slot] = self.peek(0);
                 },
                 .op_get_global, .op_set_global, .op_define_global => {
                     try self.runtimeErrorFrame(.E002, "globals not supported");
@@ -650,7 +696,7 @@ pub const VM = struct {
                 },
 
                 .op_close_upvalue => {
-                    self.closeUpvalues(self.stack_top - 1);
+                    self.closeUpvalues(self.getStackTop().* - 1);
                     _ = try self.pop();
                 },
 
@@ -663,13 +709,14 @@ pub const VM = struct {
                     const result = try self.pop();
                     // Close upvalues in the returning frame.
                     self.closeUpvalues(frame.base_slot);
-                    self.frame_count -= 1;
-                    if (self.frame_count == 0) {
+                    const fc = self.getFrameCount();
+                    fc.* -= 1;
+                    if (fc.* == 0) {
                         // Top-level script returning.
                         return result;
                     }
                     // Discard the frame's slots.
-                    self.stack_top = frame.base_slot;
+                    self.getStackTop().* = frame.base_slot;
                     try self.push(result);
                 },
 
@@ -961,7 +1008,9 @@ pub const VM = struct {
     // ── Function calls ────────────────────────────────────────────────
 
     fn callValue(self: *Self, arg_count: u8) RuntimeError!void {
-        const callee = self.stack[self.stack_top - 1 - @as(u32, arg_count)];
+        const stack = self.getStack();
+        const st = self.getStackTop();
+        const callee = stack[st.* - 1 - @as(u32, arg_count)];
 
         // Check if it's a closure (user-defined function).
         if (callee.isObj() and callee.asObj().obj_type == .closure) {
@@ -1000,7 +1049,8 @@ pub const VM = struct {
             }
         }
 
-        if (self.frame_count >= FRAMES_MAX) {
+        const fc = self.getFrameCount();
+        if (fc.* >= FRAMES_MAX) {
             try self.runtimeErrorAny(.E001, "stack overflow: too many nested calls");
             return error.StackOverflow;
         }
@@ -1010,12 +1060,14 @@ pub const VM = struct {
         else
             arg_count;
 
-        self.frames[self.frame_count] = .{
+        const frames = self.getFrames();
+        const st = self.getStackTop();
+        frames[fc.*] = .{
             .closure = closure,
             .ip = 0,
-            .base_slot = self.stack_top - @as(u32, total_args) - 1,
+            .base_slot = st.* - @as(u32, total_args) - 1,
         };
-        self.frame_count += 1;
+        fc.* += 1;
     }
 
     fn callBuiltin(self: *Self, builtin_idx: u32, arg_count: u8) RuntimeError!void {
@@ -1026,13 +1078,15 @@ pub const VM = struct {
             return error.RuntimeErr;
         }
 
-        const args_start = self.stack_top - @as(u32, arg_count);
-        const args = self.stack[args_start..self.stack_top];
+        const st = self.getStackTop();
+        const stack = self.getStack();
+        const args_start = st.* - @as(u32, arg_count);
+        const args = stack[args_start..st.*];
 
         // Special-case print builtin for atom name formatting.
         if (builtin_idx == 0) {
             try self.printValue(args[0]);
-            self.stack_top -= (@as(u32, arg_count) + 1);
+            st.* -= (@as(u32, arg_count) + 1);
             try self.push(Value.nil);
             return;
         }
@@ -1087,7 +1141,7 @@ pub const VM = struct {
             if (!already_tracked) self.trackObject(obj_ptr);
         }
 
-        self.stack_top -= (@as(u32, arg_count) + 1);
+        self.getStackTop().* -= (@as(u32, arg_count) + 1);
         try self.push(result);
     }
 
@@ -1163,7 +1217,7 @@ pub const VM = struct {
         const closure = ObjClosure.fromObj(closure_val.asObj());
 
         // Save current frame count to detect when the closure returns.
-        const saved_frame_count = vm.frame_count;
+        const saved_frame_count = vm.getFrameCount().*;
 
         // Push closure (callee slot) + arguments onto the stack.
         vm.push(closure_val) catch return null;
@@ -1175,22 +1229,23 @@ pub const VM = struct {
         vm.callClosure(closure, @intCast(cb_args.len)) catch return null;
 
         // Run the VM until this frame returns.
-        while (vm.frame_count > saved_frame_count) {
+        while (vm.getFrameCount().* > saved_frame_count) {
             const frame = vm.currentFrame();
             const code = frame.closure.function.chunk.code.items;
 
             if (frame.ip >= code.len) {
                 // End of function code: implicit nil return.
-                vm.frame_count -= 1;
-                if (vm.frame_count > saved_frame_count) {
+                const fc = vm.getFrameCount();
+                fc.* -= 1;
+                if (fc.* > saved_frame_count) {
                     // Inner frame returned; push nil and continue.
                     const base = frame.base_slot;
-                    vm.stack_top = base;
+                    vm.getStackTop().* = base;
                     vm.push(Value.nil) catch return null;
                     continue;
                 }
                 // Our target frame returned.
-                vm.stack_top = frame.base_slot;
+                vm.getStackTop().* = frame.base_slot;
                 return Value.nil;
             }
 
@@ -1202,14 +1257,15 @@ pub const VM = struct {
             if (opcode == .op_return) {
                 const ret = vm.pop() catch return null;
                 vm.closeUpvalues(frame.base_slot);
-                vm.frame_count -= 1;
-                if (vm.frame_count <= saved_frame_count) {
+                const fc = vm.getFrameCount();
+                fc.* -= 1;
+                if (fc.* <= saved_frame_count) {
                     // Our closure has returned. Restore stack.
-                    vm.stack_top = frame.base_slot;
+                    vm.getStackTop().* = frame.base_slot;
                     return ret;
                 }
                 // Nested function returned.
-                vm.stack_top = frame.base_slot;
+                vm.getStackTop().* = frame.base_slot;
                 vm.push(ret) catch return null;
                 continue;
             }
@@ -1271,11 +1327,11 @@ pub const VM = struct {
             },
             .op_get_local => {
                 const slot = self.readByteFrame();
-                try self.push(self.stack[frame.base_slot + slot]);
+                try self.push(self.getStack()[frame.base_slot + slot]);
             },
             .op_set_local => {
                 const slot = self.readByteFrame();
-                self.stack[frame.base_slot + slot] = self.peek(0);
+                self.getStack()[frame.base_slot + slot] = self.peek(0);
             },
             .op_get_global, .op_set_global, .op_define_global => {
                 try self.runtimeErrorAny(.E002, "globals not supported");
@@ -1344,7 +1400,7 @@ pub const VM = struct {
                 }
             },
             .op_close_upvalue => {
-                self.closeUpvalues(self.stack_top - 1);
+                self.closeUpvalues(self.getStackTop().* - 1);
                 _ = try self.pop();
             },
             .op_close_upvalue_at => {
@@ -1355,8 +1411,8 @@ pub const VM = struct {
                 // This should be handled by callClosureFromBuiltin, but just in case:
                 const ret = try self.pop();
                 self.closeUpvalues(frame.base_slot);
-                self.frame_count -= 1;
-                self.stack_top = frame.base_slot;
+                self.getFrameCount().* -= 1;
+                self.getStackTop().* = frame.base_slot;
                 try self.push(ret);
             },
             .op_tail_call => {
@@ -1432,7 +1488,9 @@ pub const VM = struct {
     // ── Tail call dispatch ────────────────────────────────────────────
 
     fn execTailCall(self: *Self, arg_count: u8) RuntimeError!void {
-        const callee = self.stack[self.stack_top - 1 - @as(u32, arg_count)];
+        const stack = self.getStack();
+        const st = self.getStackTop();
+        const callee = stack[st.* - 1 - @as(u32, arg_count)];
 
         // If it's a closure, reuse the current frame.
         if (callee.isObj() and callee.asObj().obj_type == .closure) {
@@ -1450,13 +1508,13 @@ pub const VM = struct {
             self.closeUpvalues(frame.base_slot);
 
             // Slide the callee + arguments over the current frame's slots.
-            const src_start = self.stack_top - @as(u32, arg_count) - 1;
+            const src_start = st.* - @as(u32, arg_count) - 1;
             var j: u32 = 0;
             while (j <= arg_count) : (j += 1) {
-                self.stack[frame.base_slot + j] = self.stack[src_start + j];
+                stack[frame.base_slot + j] = stack[src_start + j];
             }
 
-            self.stack_top = frame.base_slot + @as(u32, arg_count) + 1;
+            st.* = frame.base_slot + @as(u32, arg_count) + 1;
             frame.closure = closure;
             frame.ip = 0;
             // frame_count unchanged -- frame is reused.
@@ -1478,11 +1536,13 @@ pub const VM = struct {
     // ── Upvalue management ────────────────────────────────────────────
 
     fn captureUpvalue(self: *Self, stack_slot: u32) !*ObjUpvalue {
-        const slot_ptr: *Value = &self.stack[stack_slot];
+        const stack = self.getStack();
+        const open_uv = self.getOpenUpvalues();
+        const slot_ptr: *Value = &stack[stack_slot];
 
         // Walk the open upvalues list to find an existing one for this slot.
         var prev: ?*ObjUpvalue = null;
-        var current = self.open_upvalues;
+        var current = open_uv.*;
         while (current) |uv| {
             // Open upvalues are sorted by stack position (highest first).
             if (@intFromPtr(uv.location) == @intFromPtr(slot_ptr)) {
@@ -1502,14 +1562,16 @@ pub const VM = struct {
         if (prev) |p| {
             p.next = new_uv;
         } else {
-            self.open_upvalues = new_uv;
+            open_uv.* = new_uv;
         }
         return new_uv;
     }
 
     fn closeUpvalues(self: *Self, last_slot: u32) void {
-        const threshold: usize = @intFromPtr(&self.stack[last_slot]);
-        while (self.open_upvalues) |uv| {
+        const stack = self.getStack();
+        const open_uv = self.getOpenUpvalues();
+        const threshold: usize = @intFromPtr(&stack[last_slot]);
+        while (open_uv.*) |uv| {
             if (@intFromPtr(uv.location) < threshold) break;
             // Close: copy value from stack to closed field.
             uv.closed = uv.location.*;
@@ -1519,25 +1581,27 @@ pub const VM = struct {
             if (self.gc) |g| {
                 g.writeBarrier(&uv.obj, uv.closed);
             }
-            self.open_upvalues = uv.next;
+            open_uv.* = uv.next;
         }
     }
 
     // ── For-in iteration ──────────────────────────────────────────────
 
     fn execForIterFrame(self: *Self, jump_offset: u16) RuntimeError!void {
-        const iterable = self.stack[self.stack_top - 3];
+        const stack = self.getStack();
+        const st = self.getStackTop();
+        const iterable = stack[st.* - 3];
         if (iterable.isObjType(.range)) {
             const ObjRange = obj_mod.ObjRange;
             const r = ObjRange.fromObj(iterable.asObj());
-            const idx = self.stack[self.stack_top - 2].asInt();
+            const idx = stack[st.* - 2].asInt();
             const current = r.start + idx * r.step;
             const done = if (r.step > 0) current >= r.end else current <= r.end;
             if (done) {
                 self.currentFrame().ip += jump_offset;
             } else {
-                self.stack[self.stack_top - 1] = Value.fromInt(current);
-                self.stack[self.stack_top - 2] = Value.fromInt(idx + 1);
+                stack[st.* - 1] = Value.fromInt(current);
+                stack[st.* - 2] = Value.fromInt(idx + 1);
             }
         } else {
             try self.runtimeErrorAny(.E001, "value is not iterable");
@@ -1546,18 +1610,20 @@ pub const VM = struct {
     }
 
     fn execForIter(self: *Self, jump_offset: u16, ip_ptr: *u32) RuntimeError!void {
-        const iterable = self.stack[self.stack_top - 3];
+        const stack = self.getStack();
+        const st = self.getStackTop();
+        const iterable = stack[st.* - 3];
         if (iterable.isObjType(.range)) {
             const ObjRange = obj_mod.ObjRange;
             const r = ObjRange.fromObj(iterable.asObj());
-            const idx = self.stack[self.stack_top - 2].asInt();
+            const idx = stack[st.* - 2].asInt();
             const current = r.start + idx * r.step;
             const done = if (r.step > 0) current >= r.end else current <= r.end;
             if (done) {
                 ip_ptr.* += jump_offset;
             } else {
-                self.stack[self.stack_top - 1] = Value.fromInt(current);
-                self.stack[self.stack_top - 2] = Value.fromInt(idx + 1);
+                stack[st.* - 1] = Value.fromInt(current);
+                stack[st.* - 2] = Value.fromInt(idx + 1);
             }
         } else {
             try self.runtimeErrorAny(.E001, "value is not iterable");
@@ -1576,14 +1642,16 @@ pub const VM = struct {
         const lst = try ObjList.create(self.allocator);
         self.trackObject(&lst.obj);
 
+        const stack = self.getStack();
+        const st = self.getStackTop();
         // Reserve capacity and fill from stack in order (first pushed = index 0).
         try lst.items.ensureTotalCapacity(self.allocator, count);
-        const base = self.stack_top - count;
+        const base = st.* - count;
         var i: u16 = 0;
         while (i < count) : (i += 1) {
-            lst.items.appendAssumeCapacity(self.stack[base + i]);
+            lst.items.appendAssumeCapacity(stack[base + i]);
         }
-        self.stack_top -= count;
+        st.* -= count;
 
         try self.push(Value.fromObj(&lst.obj));
     }
@@ -1592,28 +1660,32 @@ pub const VM = struct {
         const m = try ObjMap.create(self.allocator);
         self.trackObject(&m.obj);
 
+        const stack = self.getStack();
+        const st = self.getStackTop();
         // Stack has: key0, val0, key1, val1, ... (2*pair_count values).
         const total: u16 = pair_count * 2;
-        const base = self.stack_top - total;
+        const base = st.* - total;
         var i: u16 = 0;
         while (i < pair_count) : (i += 1) {
-            const key = self.stack[base + i * 2];
-            const val = self.stack[base + i * 2 + 1];
+            const key = stack[base + i * 2];
+            const val = stack[base + i * 2 + 1];
             try m.entries.put(self.allocator, key, val);
         }
-        self.stack_top -= total;
+        st.* -= total;
 
         try self.push(Value.fromObj(&m.obj));
     }
 
     fn execOpTuple(self: *Self, count: u16) RuntimeError!void {
         // Collect values from stack.
+        const stack = self.getStack();
+        const st = self.getStackTop();
         const values = try self.allocator.alloc(Value, count);
         var i: u16 = 0;
         while (i < count) : (i += 1) {
-            values[i] = self.stack[self.stack_top - count + i];
+            values[i] = stack[st.* - count + i];
         }
-        self.stack_top -= count;
+        st.* -= count;
 
         const t = try ObjTuple.create(self.allocator, values);
         self.allocator.free(values); // ObjTuple.create copies the slice
@@ -1664,14 +1736,16 @@ pub const VM = struct {
     /// Shared record creation helper.
     fn createRecord(self: *Self, count: u16, names: []const []const u8) RuntimeError!void {
         // Pop field values from stack (in order).
+        const stack = self.getStack();
+        const st = self.getStackTop();
         const values = try self.allocator.alloc(Value, count);
         defer self.allocator.free(values);
 
         var i: u16 = 0;
         while (i < count) : (i += 1) {
-            values[i] = self.stack[self.stack_top - count + i];
+            values[i] = stack[st.* - count + i];
         }
-        self.stack_top -= count;
+        st.* -= count;
 
         const rec = try ObjRecord.create(self.allocator, names, values);
         self.trackObject(&rec.obj);

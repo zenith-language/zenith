@@ -273,6 +273,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "error", .module = error_mod },
             .{ .name = "builtins", .module = builtins_mod },
             .{ .name = "gc", .module = gc_mod },
+            .{ .name = "fiber", .module = fiber_mod },
         },
     });
 
