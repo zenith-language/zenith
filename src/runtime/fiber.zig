@@ -155,6 +155,8 @@ pub const ObjFiber = struct {
     context: PlatformContext,
     /// Guard-page-protected native stack (null for main fiber which uses OS stack).
     native_stack: ?FiberStack,
+    /// Back-pointer to the scheduler that owns this fiber (null in legacy mode).
+    scheduler: ?*anyopaque,
 
     /// Allocate and initialize a new fiber for the given closure.
     ///
@@ -185,6 +187,7 @@ pub const ObjFiber = struct {
             .next_waiter = null,
             .context = .{},
             .native_stack = null,
+            .scheduler = null,
         };
 
         // Initialize the first call frame with the closure.

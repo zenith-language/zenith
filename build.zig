@@ -99,6 +99,20 @@ pub fn build(b: *std.Build) void {
     // Wire context_switch into fiber_mod for future use.
     fiber_mod.addImport("context_switch", context_switch_mod);
 
+    // ── Scheduler module (Phase 7, Plan 02) ──────────────────────────────
+    const scheduler_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/scheduler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "fiber", .module = fiber_mod },
+            .{ .name = "deque", .module = deque_mod },
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "chunk", .module = chunk_mod },
+        },
+    });
+
     const arena_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/arena.zig"),
         .target = target,
@@ -428,6 +442,7 @@ pub fn build(b: *std.Build) void {
         deque_mod,
         fiber_mod,
         context_switch_mod,
+        scheduler_mod,
     };
 
     for (test_modules) |mod| {
