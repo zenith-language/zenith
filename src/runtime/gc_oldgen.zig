@@ -173,9 +173,49 @@ pub const WriteBarrier = struct {
                         try nursery.markNurseryObj(&w.obj, gc);
                     }
                 }
+                // Scan waiters linked list.
+                var waiter = fiber.waiters;
+                while (waiter) |w| {
+                    if (!w.obj.isOldGen()) {
+                        try nursery.markNurseryObj(&w.obj, gc);
+                    }
+                    waiter = w.next_waiter;
+                }
             },
             .channel => {
-                // Channel GC scanning will be implemented in Plan 03.
+                const channel_mod_gc = @import("channel");
+                const ch = channel_mod_gc.ObjChannel.fromObj(obj);
+                // Scan buffered values in ring buffer.
+                if (ch.buffer) |buf| {
+                    var i: u32 = 0;
+                    while (i < ch.count) : (i += 1) {
+                        const idx = (ch.head + i) % ch.capacity;
+                        var val = buf[idx];
+                        try nursery.processValue(&val, gc);
+                        buf[idx] = val;
+                    }
+                }
+                // Scan handoff slot.
+                if (ch.handoff) |_| {
+                    var handoff_val = ch.handoff.?;
+                    try nursery.processValue(&handoff_val, gc);
+                    ch.handoff = handoff_val;
+                }
+                // Scan parked sender/receiver fibers.
+                var sender = ch.senders.head;
+                while (sender) |s| {
+                    if (!s.obj.isOldGen()) {
+                        try nursery.markNurseryObj(&s.obj, gc);
+                    }
+                    sender = s.next_waiter;
+                }
+                var receiver = ch.receivers.head;
+                while (receiver) |r| {
+                    if (!r.obj.isOldGen()) {
+                        try nursery.markNurseryObj(&r.obj, gc);
+                    }
+                    receiver = r.next_waiter;
+                }
             },
         }
     }
@@ -348,9 +388,43 @@ pub const OldGenCollector = struct {
                 if (fiber.waiting_on) |w| {
                     try self.markObj(&w.obj, gc);
                 }
+                // Scan waiters linked list.
+                var waiter = fiber.waiters;
+                while (waiter) |w| {
+                    try self.markObj(&w.obj, gc);
+                    waiter = w.next_waiter;
+                }
             },
             .channel => {
-                // Channel GC scanning will be implemented in Plan 03.
+                const channel_mod_gc = @import("channel");
+                const ch = channel_mod_gc.ObjChannel.fromObj(obj);
+                // Scan buffered values in ring buffer.
+                if (ch.buffer) |buf| {
+                    var i: u32 = 0;
+                    while (i < ch.count) : (i += 1) {
+                        const idx = (ch.head + i) % ch.capacity;
+                        var val = buf[idx];
+                        try self.processValue(&val, gc);
+                        buf[idx] = val;
+                    }
+                }
+                // Scan handoff slot.
+                if (ch.handoff) |_| {
+                    var handoff_val = ch.handoff.?;
+                    try self.processValue(&handoff_val, gc);
+                    ch.handoff = handoff_val;
+                }
+                // Scan parked sender/receiver fibers.
+                var sender = ch.senders.head;
+                while (sender) |s| {
+                    try self.markObj(&s.obj, gc);
+                    sender = s.next_waiter;
+                }
+                var receiver = ch.receivers.head;
+                while (receiver) |r| {
+                    try self.markObj(&r.obj, gc);
+                    receiver = r.next_waiter;
+                }
             },
         }
     }
