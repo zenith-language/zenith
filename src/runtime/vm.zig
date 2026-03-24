@@ -1132,6 +1132,7 @@ pub const VM = struct {
         // and track intermediate heap objects.
         builtins_mod.setVM(@ptrCast(self), &callClosureFromBuiltin, &trackObjectFromBuiltin);
         builtins_mod.setPopLastError(&popLastErrorFromBuiltin);
+        builtins_mod.setSchedulerPtr(self.scheduler);
         if (self.gc != null) {
             builtins_mod.setGCCallbacks(&triggerGCFromBuiltin, &getGCStatsFromBuiltin);
         }
@@ -1354,6 +1355,7 @@ pub const VM = struct {
         // Set up threadlocal builtins state for this worker thread.
         builtins_mod.setVM(@ptrCast(vm), &callClosureFromBuiltin, &trackObjectFromBuiltin);
         builtins_mod.setPopLastError(&popLastErrorFromBuiltin);
+        builtins_mod.setSchedulerPtr(vm.scheduler);
         defer {
             builtins_mod.clearVM();
             vm.current_fiber = prev_fiber;

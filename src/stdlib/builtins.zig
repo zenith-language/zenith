@@ -75,6 +75,8 @@ threadlocal var get_gc_stats_fn: ?GetGCStatsFn = null;
 threadlocal var pop_last_error_fn: ?PopLastErrorFn = null;
 /// Atom name table, set by the VM for builtins that need atom resolution (e.g. Json.encode).
 threadlocal var current_atom_names: ?[]const []const u8 = null;
+/// Scheduler pointer for par_map fiber dispatch (null in single-threaded mode).
+threadlocal var current_scheduler_ptr: ?*anyopaque = null;
 
 /// Called by the VM before dispatching a builtin function.
 pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {
@@ -99,6 +101,11 @@ pub fn setAtomNames(names: []const []const u8) void {
     current_atom_names = names;
 }
 
+/// Set scheduler pointer for par_map fiber dispatch.
+pub fn setSchedulerPtr(sched: ?*anyopaque) void {
+    current_scheduler_ptr = sched;
+}
+
 /// Called by the VM after a builtin returns.
 pub fn clearVM() void {
     current_vm = null;
@@ -108,6 +115,7 @@ pub fn clearVM() void {
     get_gc_stats_fn = null;
     pop_last_error_fn = null;
     current_atom_names = null;
+    current_scheduler_ptr = null;
 }
 
 /// Track an intermediate heap object with the VM (called by builtins that
@@ -1489,6 +1497,7 @@ fn setStreamCallbacks() void {
         if (pop_last_error_fn) |f| {
             stream_mod.setPopLastError(f);
         }
+        stream_mod.setScheduler(current_scheduler_ptr);
     }
 }
 
@@ -2484,7 +2493,8 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
 // ── Concurrency stream operators ─────────────────────────────────────
 
 /// par_map(stream, fn) or par_map(stream, N, fn)
-/// Parallel map with order preservation. In v1 (single-threaded), processes sequentially.
+/// Parallel map with order preservation and fail-fast error propagation.
+/// Dispatches batch items to fibers via scheduler when available.
 fn builtinParMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
     // Auto-wrap range to stream if needed.
     var first = args[0];
@@ -2523,12 +2533,19 @@ fn builtinParMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8
         .upstream = first,
         .transform_fn = fn_val,
         .concurrency = concurrency,
+        .result_buf = null,
+        .input_buf = null,
+        .batch_size = 0,
+        .next_emit = 0,
+        .upstream_done = false,
+        .had_error = false,
+        .error_message = null,
     } };
     return createStream(state, allocator);
 }
 
 /// par_map_unordered(stream, fn) or par_map_unordered(stream, N, fn)
-/// Parallel map emitting results in completion order.
+/// Parallel map emitting results in completion order with fail-fast.
 fn builtinParMapUnordered(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
     var first = args[0];
     if (first.isObjType(.range)) {
@@ -2564,12 +2581,19 @@ fn builtinParMapUnordered(args: []const Value, allocator: Allocator, err_msg: *[
         .upstream = first,
         .transform_fn = fn_val,
         .concurrency = concurrency,
+        .result_buf = null,
+        .input_buf = null,
+        .batch_size = 0,
+        .next_emit = 0,
+        .upstream_done = false,
+        .had_error = false,
+        .error_message = null,
     } };
     return createStream(state, allocator);
 }
 
 /// par_map_result(stream, fn) or par_map_result(stream, N, fn)
-/// Parallel map wrapping outputs in Result. Errors wrapped in Result.Err.
+/// Parallel map wrapping outputs in Result (no fail-fast). Errors wrapped in Result.Err.
 fn builtinParMapResult(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
     var first = args[0];
     if (first.isObjType(.range)) {
@@ -2605,6 +2629,11 @@ fn builtinParMapResult(args: []const Value, allocator: Allocator, err_msg: *[]co
         .upstream = first,
         .transform_fn = fn_val,
         .concurrency = concurrency,
+        .result_buf = null,
+        .input_buf = null,
+        .batch_size = 0,
+        .next_emit = 0,
+        .upstream_done = false,
     } };
     return createStream(state, allocator);
 }
