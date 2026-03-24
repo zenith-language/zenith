@@ -1,0 +1,55 @@
+-- Select with one recv arm
+let ch = chan(1)
+send(ch, "ready")
+select {
+  | recv(ch) -> |val| print(val)
+}
+
+-- Select with multiple channels, first ready wins
+let ch1 = chan(1)
+let ch2 = chan(1)
+send(ch1, "first")
+select {
+  | recv(ch1) -> |val| print("ch1: " ++ str(val))
+  | recv(ch2) -> |val| print("ch2: " ++ str(val))
+}
+
+-- Select with send arm (send to buffered channel, then recv afterward)
+let ch3 = chan(1)
+select {
+  | send(ch3, "sent_via_select") -> print("sent")
+}
+let receiver = spawn(|| {
+  let v = recv(ch3)
+  print(v)
+})
+join(receiver)
+
+-- Select with after timeout
+let ch4 = chan()
+-- No one sends to ch4, so after arm fires
+select {
+  | recv(ch4) -> |val| print("got: " ++ str(val))
+  | after(10) -> print("timeout")
+}
+
+-- Select in a loop (common pattern)
+let input = chan(3)
+let done_ch = chan(1)
+let worker = spawn(|| {
+  send(input, 1)
+  send(input, 2)
+  send(input, 3)
+  send(done_ch, :done)
+})
+let running = true
+while running {
+  select {
+    | recv(input) -> |val| print("item: " ++ str(val))
+    | recv(done_ch) -> |_| {
+      running = false
+      print("done")
+    }
+  }
+}
+join(worker)

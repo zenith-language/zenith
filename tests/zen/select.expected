@@ -1,0 +1,9 @@
+ready
+ch1: first
+sent
+Option.Some(sent_via_select)
+timeout
+item: 1
+item: 2
+item: 3
+done

@@ -1,0 +1,43 @@
+-- par_map preserves order
+let result = range(1, 6)
+  |> par_map(2, |x| x * x)
+  |> collect()
+print(result)
+
+-- par_map with default concurrency (CPU count)
+let result2 = range(1, 4)
+  |> par_map(|x| x + 10)
+  |> collect()
+print(result2)
+
+-- par_map_unordered collects same values (v1: sequential, order preserved)
+let result3 = range(1, 4)
+  |> par_map_unordered(2, |x| x * 10)
+  |> collect()
+print(result3)
+
+-- par_map_result wraps in Result
+let result4 = range(1, 4)
+  |> par_map_result(2, |x| {
+    if x == 2 { panic("bad") } else { x * 100 }
+  })
+  |> collect()
+print(result4)
+
+-- par_map with stream operators (chaining)
+let result5 = range(1, 11)
+  |> par_map(2, |x| x * 2)
+  |> filter(|x| x > 10)
+  |> collect()
+print(result5)
+
+-- par_map_result pairs with filter/unwrap for extracting ok values
+let stream = range(1, 4)
+  |> par_map_result(2, |x| {
+    if x == 2 { panic("skip") } else { x }
+  })
+let ok_vals = stream
+  |> filter(|r| Result.is_ok(r))
+  |> map(|r| Result.unwrap_or(r, nil))
+  |> collect()
+print(ok_vals)

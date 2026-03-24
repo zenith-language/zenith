@@ -71,6 +71,8 @@ const normal_tests = [_]TestCase{
     .{ .name = "fibers_error", .zen_path = "tests/zen/fibers_error.zen", .expected_path = "tests/zen/fibers_error.expected", .is_error_test = false },
     .{ .name = "channels", .zen_path = "tests/zen/channels.zen", .expected_path = "tests/zen/channels.expected", .is_error_test = false },
     .{ .name = "fiber_closures", .zen_path = "tests/zen/fiber_closures.zen", .expected_path = "tests/zen/fiber_closures.expected", .is_error_test = false },
+    .{ .name = "select", .zen_path = "tests/zen/select.zen", .expected_path = "tests/zen/select.expected", .is_error_test = false },
+    .{ .name = "par_map", .zen_path = "tests/zen/par_map.zen", .expected_path = "tests/zen/par_map.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
@@ -498,6 +500,14 @@ test "e2e: channels" {
 
 test "e2e: fiber_closures" {
     try runNormalTest(normal_tests[35]);
+}
+
+test "e2e: select" {
+    try runNormalTest(normal_tests[36]);
+}
+
+test "e2e: par_map" {
+    try runNormalTest(normal_tests[37]);
 }
 
 // ── Phase 3 error tests ──────────────────────────────────────────────────
