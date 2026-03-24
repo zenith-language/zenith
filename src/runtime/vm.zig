@@ -1641,6 +1641,27 @@ pub const VM = struct {
                 stack[st.* - 1] = Value.fromInt(current);
                 stack[st.* - 2] = Value.fromInt(idx + 1);
             }
+        } else if (iterable.isObjType(.channel)) {
+            // Channel iteration: recv() each iteration.
+            const ch = ObjChannel.fromObj(iterable.asObj());
+            const result = ch.recv();
+            switch (result) {
+                .value => |val| {
+                    stack[st.* - 1] = val;
+                    const idx = stack[st.* - 2].asInt();
+                    stack[st.* - 2] = Value.fromInt(idx + 1);
+                },
+                .closed => {
+                    // Channel closed and empty: exit loop.
+                    self.currentFrame().ip += jump_offset;
+                },
+                .would_block => {
+                    // In single-threaded mode, blocking channel recv is an error.
+                    // Full fiber parking will be added in Plan 04.
+                    try self.runtimeErrorAny(.E001, "for-in over channel: recv would block (empty channel)");
+                    return error.RuntimeErr;
+                },
+            }
         } else {
             try self.runtimeErrorAny(.E001, "value is not iterable");
             return error.RuntimeErr;
@@ -1662,6 +1683,23 @@ pub const VM = struct {
             } else {
                 stack[st.* - 1] = Value.fromInt(current);
                 stack[st.* - 2] = Value.fromInt(idx + 1);
+            }
+        } else if (iterable.isObjType(.channel)) {
+            const ch = ObjChannel.fromObj(iterable.asObj());
+            const result = ch.recv();
+            switch (result) {
+                .value => |val| {
+                    stack[st.* - 1] = val;
+                    const idx = stack[st.* - 2].asInt();
+                    stack[st.* - 2] = Value.fromInt(idx + 1);
+                },
+                .closed => {
+                    ip_ptr.* += jump_offset;
+                },
+                .would_block => {
+                    try self.runtimeErrorAny(.E001, "for-in over channel: recv would block");
+                    return error.RuntimeErr;
+                },
             }
         } else {
             try self.runtimeErrorAny(.E001, "value is not iterable");
@@ -2065,6 +2103,9 @@ pub const VM = struct {
 
     fn execOpSpawn(self: *Self, arg_count: u8) RuntimeError!void {
         // spawn(closure) or spawn(name, closure)
+        // Stack layout: [arg1] [arg2] <- top
+        // For spawn(closure): closure is on top
+        // For spawn(name, closure): name then closure on top
         var closure_val: Value = undefined;
         var name_val: ?Value = null;
 
@@ -2077,9 +2118,6 @@ pub const VM = struct {
             try self.runtimeErrorAny(.E001, "spawn requires 1 or 2 arguments");
             return error.RuntimeErr;
         }
-
-        // Pop the builtin sentinel.
-        _ = try self.pop();
 
         if (!closure_val.isObj() or closure_val.asObj().obj_type != .closure) {
             try self.runtimeErrorAny(.E001, "spawn argument must be a closure");
@@ -2110,20 +2148,15 @@ pub const VM = struct {
             capacity = @intCast(cap_val.asInt());
         }
 
-        // Pop the builtin sentinel.
-        _ = try self.pop();
-
         const ch = try ObjChannel.create(self.allocator, capacity);
         self.trackObject(&ch.obj);
         try self.push(Value.fromObj(&ch.obj));
     }
 
     fn execOpSend(self: *Self) RuntimeError!void {
+        // Stack: [channel, value] <- top
         const val = try self.pop();
         const ch_val = try self.pop();
-
-        // Pop the builtin sentinel.
-        _ = try self.pop();
 
         if (!ch_val.isObjType(.channel)) {
             try self.runtimeErrorAny(.E001, "send requires a channel as first argument");
@@ -2151,10 +2184,8 @@ pub const VM = struct {
     }
 
     fn execOpRecv(self: *Self) RuntimeError!void {
+        // Stack: [channel] <- top
         const ch_val = try self.pop();
-
-        // Pop the builtin sentinel.
-        _ = try self.pop();
 
         if (!ch_val.isObjType(.channel)) {
             try self.runtimeErrorAny(.E001, "recv requires a channel argument");
@@ -2187,10 +2218,8 @@ pub const VM = struct {
     }
 
     fn execOpCloseChannel(self: *Self) RuntimeError!void {
+        // Stack: [channel] <- top
         const ch_val = try self.pop();
-
-        // Pop the builtin sentinel.
-        _ = try self.pop();
 
         if (!ch_val.isObjType(.channel)) {
             try self.runtimeErrorAny(.E001, "close requires a channel argument");
@@ -2203,10 +2232,8 @@ pub const VM = struct {
     }
 
     fn execOpJoin(self: *Self) RuntimeError!void {
+        // Stack: [fiber] <- top
         const fiber_val = try self.pop();
-
-        // Pop the builtin sentinel.
-        _ = try self.pop();
 
         if (!fiber_val.isObjType(.fiber)) {
             try self.runtimeErrorAny(.E001, "join requires a fiber argument");
@@ -2240,10 +2267,8 @@ pub const VM = struct {
     }
 
     fn execOpTryJoin(self: *Self) RuntimeError!void {
+        // Stack: [fiber] <- top
         const fiber_val = try self.pop();
-
-        // Pop the builtin sentinel.
-        _ = try self.pop();
 
         if (!fiber_val.isObjType(.fiber)) {
             try self.runtimeErrorAny(.E001, "try_join requires a fiber argument");

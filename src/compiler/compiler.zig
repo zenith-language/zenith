@@ -203,7 +203,7 @@ pub const Compiler = struct {
     const type_atom_names = [_][]const u8{
         "int", "float", "bool", "nil", "string", "bytes", "atom",
         "range", "function", "list", "map", "tuple", "record", "adt",
-        "stream",
+        "stream", "fiber", "channel",
     };
 
     /// Compile an AST into bytecodes wrapped in an ObjClosure.
@@ -2201,10 +2201,42 @@ pub const Compiler = struct {
 
     // ── Call expression ───────────────────────────────────────────────
 
+    /// Concurrency builtin names that emit dedicated opcodes.
+    const concurrency_builtins = [_]struct { name: []const u8, opcode: OpCode }{
+        .{ .name = "spawn", .opcode = .op_spawn },
+        .{ .name = "join", .opcode = .op_join },
+        .{ .name = "try_join", .opcode = .op_try_join },
+        .{ .name = "chan", .opcode = .op_channel },
+        .{ .name = "send", .opcode = .op_send },
+        .{ .name = "recv", .opcode = .op_recv },
+        .{ .name = "close", .opcode = .op_close_channel },
+    };
+
+    fn resolveConcurrencyBuiltin(name: []const u8) ?OpCode {
+        for (concurrency_builtins) |cb| {
+            if (std.mem.eql(u8, cb.name, name)) return cb.opcode;
+        }
+        return null;
+    }
+
     fn compileCallExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         // Save tail position -- arguments are never in tail position.
         const saved_tail = self.is_tail_position;
         self.is_tail_position = false;
+
+        // Check if callee is a concurrency builtin that needs a dedicated opcode.
+        const callee_tag = self.ast.nodes.items(.tag)[node_data.lhs];
+        if (callee_tag == .identifier) {
+            const callee_name = self.getTokenText(node_data.lhs);
+            // Only use concurrency opcode if identifier is not shadowed by a local or upvalue.
+            if (self.resolveLocal(callee_name) == null and self.resolveUpvalue(callee_name) == null) {
+                if (resolveConcurrencyBuiltin(callee_name)) |opcode| {
+                    try self.compileConcurrencyCall(opcode, node_data, node_idx, callee_name);
+                    self.is_tail_position = saved_tail;
+                    return;
+                }
+            }
+        }
 
         // Compile callee.
         try self.compileNode(node_data.lhs);
@@ -2282,6 +2314,45 @@ pub const Compiler = struct {
 
     /// Compile a call with named arguments. We need to reorder arguments
     /// into positional slots, filling defaults for missing optional params.
+    /// Compile a call to a concurrency builtin (spawn, join, chan, etc.)
+    /// that emits a dedicated opcode instead of op_get_builtin + op_call.
+    fn compileConcurrencyCall(self: *Self, opcode: OpCode, node_data: Node.Data, node_idx: u32, name: []const u8) Error!void {
+        // Get argument range from extra_data.
+        const extra_idx = node_data.rhs;
+        const arg_start = self.ast.extra_data.items[extra_idx];
+        const arg_end = self.ast.extra_data.items[extra_idx + 1];
+        const arg_indices = self.ast.extra_data.items[arg_start..arg_end];
+        const arg_count: u8 = @intCast(arg_indices.len);
+        const line = self.getLine(node_idx);
+
+        // Compile arguments.
+        for (arg_indices) |arg_idx| {
+            try self.compileNode(arg_idx);
+        }
+
+        // Emit the dedicated opcode with appropriate operand.
+        switch (opcode) {
+            .op_spawn => {
+                // op_spawn takes arg_count as operand.
+                try self.emitOp(.op_spawn, line);
+                try self.emitByte(arg_count, line);
+            },
+            .op_channel => {
+                // chan() -> has_capacity=0, chan(N) -> has_capacity=1
+                const has_capacity: u8 = if (arg_count > 0) 1 else 0;
+                try self.emitOp(.op_channel, line);
+                try self.emitByte(has_capacity, line);
+            },
+            .op_send, .op_recv, .op_close_channel, .op_join, .op_try_join => {
+                try self.emitOp(opcode, line);
+            },
+            else => {
+                _ = name;
+                try self.emitError(node_idx, .E005, "unknown concurrency builtin");
+            },
+        }
+    }
+
     fn compileCallWithNamedArgs(self: *Self, node_data: Node.Data, node_idx: u32, arg_indices: []const u32) Error!void {
         _ = node_data;
         // We compile arguments as-is and let the VM handle the reordering
@@ -2437,6 +2508,13 @@ pub const Compiler = struct {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────
+
+    /// Get the source text of a node's main token.
+    fn getTokenText(self: *const Self, node_idx: u32) []const u8 {
+        const main_tokens = self.ast.nodes.items(.main_token);
+        const tok_idx = main_tokens[node_idx];
+        return self.ast.tokenSlice(tok_idx);
+    }
 
     fn getLine(self: *const Self, node_idx: u32) u32 {
         const main_tokens = self.ast.nodes.items(.main_token);
@@ -2800,7 +2878,7 @@ test "compile: atom literal" {
     defer tc.deinit(allocator);
 
     try std.testing.expect(!tc.result.hasErrors());
-    try std.testing.expectEqual(@as(u32, 16), tc.result.atom_count);
+    try std.testing.expectEqual(@as(u32, 18), tc.result.atom_count);
     try std.testing.expect(tc.result.atom_table.contains("ok"));
 }
 

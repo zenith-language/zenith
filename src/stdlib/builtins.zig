@@ -544,6 +544,8 @@ fn builtinTypeOf(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     if (val.isObjType(.record)) return Value.fromAtom(12); // :record
     if (val.isObjType(.adt)) return Value.fromAtom(13); // :adt
     if (val.isObjType(.stream)) return Value.fromAtom(14); // :stream
+    if (val.isObjType(.fiber)) return Value.fromAtom(15); // :fiber
+    if (val.isObjType(.channel)) return Value.fromAtom(16); // :channel
     return Value.fromAtom(3); // fallback: nil
 }
 
