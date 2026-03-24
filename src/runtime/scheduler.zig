@@ -16,6 +16,15 @@ const ChaseLevDeque = deque_mod.ChaseLevDeque;
 const fiber_mod = @import("fiber");
 const ObjFiber = fiber_mod.ObjFiber;
 
+// ── VM dispatch callback ────────────────────────────────────────────
+
+/// Callback type: execute a fiber's closure bytecode on a VM instance.
+/// The VM registers this callback before starting the scheduler.
+/// The callback is responsible ONLY for: executing the fiber's bytecode,
+/// setting fiber.result or fiber.panic_message, and marking fiber.state = .dead.
+/// Waiter-waking is handled by Worker.runFiber after the callback returns.
+pub const RunFiberFn = *const fn (vm_ptr: *anyopaque, fiber: *ObjFiber) void;
+
 // ── Global Queue ────────────────────────────────────────────────────
 
 /// Mutex-protected FIFO queue for overflow and cross-thread scheduling.
@@ -173,11 +182,27 @@ pub const Worker = struct {
     }
 
     /// Run a fiber until it yields, completes, or parks.
-    /// Placeholder for Plan 04 (VM integration).
+    /// Dispatches through the scheduler's run_fiber_fn callback to execute
+    /// the fiber's closure bytecode on the VM. After the callback returns
+    /// (fiber is dead), wakes all fibers waiting to join this one.
     fn runFiber(self: *Worker, fiber: *ObjFiber) void {
-        _ = self;
-        // Currently a no-op: fiber goes to dead state.
-        // Plan 04 will integrate VM dispatch here.
+        if (self.scheduler.run_fiber_fn) |rfn| {
+            if (self.scheduler.run_fiber_vm) |vm_ptr| {
+                rfn(vm_ptr, fiber);
+                // After callback returns, the fiber is dead (completed or panicked).
+                // Wake any fibers waiting on this one (join waiters).
+                // Waiters are stored as an intrusive linked list via next_waiter.
+                var waiter = fiber.waiters;
+                while (waiter) |w| {
+                    const next = w.next_waiter;
+                    w.next_waiter = null;
+                    self.scheduler.unparkFiber(w);
+                    waiter = next;
+                }
+                return;
+            }
+        }
+        // Fallback: no VM wired, mark dead (preserves test behavior).
         fiber.state = .dead;
     }
 };
@@ -200,6 +225,10 @@ pub const Scheduler = struct {
     num_workers: u32,
     fiber_id_counter: std.atomic.Value(u64),
     allocator: Allocator,
+    /// VM callback for executing fiber bytecode. Set via setRunFiber().
+    run_fiber_fn: ?RunFiberFn,
+    /// Opaque VM pointer passed to run_fiber_fn. Set via setRunFiber().
+    run_fiber_vm: ?*anyopaque,
 
     /// Initialize the scheduler with the given number of workers.
     /// Default num_workers = CPU count (clamped to 1 minimum).
@@ -230,6 +259,8 @@ pub const Scheduler = struct {
             .num_workers = actual,
             .fiber_id_counter = std.atomic.Value(u64).init(1),
             .allocator = allocator,
+            .run_fiber_fn = null,
+            .run_fiber_vm = null,
         };
 
         // NOTE: Back-pointers are NOT set here because `sched` is a local
@@ -385,6 +416,13 @@ pub const Scheduler = struct {
     pub fn releaseSafepoint(self: *Scheduler) void {
         self.safepoint_requested.store(false, .release);
         self.safepoint_cond.broadcast();
+    }
+
+    /// Register the VM callback for executing fiber bytecode on worker threads.
+    /// Must be called before scheduling any fibers.
+    pub fn setRunFiber(self: *Scheduler, vm_ptr: *anyopaque, f: RunFiberFn) void {
+        self.run_fiber_fn = f;
+        self.run_fiber_vm = vm_ptr;
     }
 
     /// OS thread entry point for worker threads.
