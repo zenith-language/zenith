@@ -139,6 +139,12 @@ pub const WriteBarrier = struct {
                 const s = ObjStream.fromObj(obj);
                 try s.state.traceGCRefs(nursery, gc);
             },
+            .fiber => {
+                // Fiber GC scanning will be implemented in Plan 02.
+            },
+            .channel => {
+                // Channel GC scanning will be implemented in Plan 03.
+            },
         }
     }
 };
@@ -283,6 +289,12 @@ pub const OldGenCollector = struct {
             .stream => {
                 const s = ObjStream.fromObj(obj);
                 try s.state.traceGCRefsOldGen(self, gc);
+            },
+            .fiber => {
+                // Fiber GC scanning will be implemented in Plan 02.
+            },
+            .channel => {
+                // Channel GC scanning will be implemented in Plan 03.
             },
         }
     }

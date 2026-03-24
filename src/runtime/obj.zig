@@ -23,6 +23,8 @@ pub const ObjType = enum(u8) {
     record,
     adt,
     stream,
+    fiber,
+    channel,
 };
 
 /// Common header for all heap-allocated objects.
@@ -132,6 +134,17 @@ pub const Obj = struct {
                 s.state.deinit(allocator);
                 allocator.destroy(s.state);
                 allocator.destroy(s);
+            },
+            .fiber => {
+                // Fiber destroy is handled by ObjFiber.destroy which frees
+                // the native stack. Use the fiber module's destroy method.
+                const fiber_mod = @import("fiber");
+                const f = fiber_mod.ObjFiber.fromObj(self);
+                f.destroy(allocator);
+            },
+            .channel => {
+                // Channel stub -- will be implemented in Plan 03.
+                // For now, no-op since no ObjChannel struct exists yet.
             },
         }
     }

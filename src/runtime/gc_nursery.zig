@@ -197,6 +197,13 @@ pub const NurseryCollector = struct {
                 const s = ObjStream.fromObj(obj);
                 try s.state.traceGCRefs(self, gc);
             },
+            .fiber => {
+                // Fiber GC scanning will be implemented in Plan 02
+                // when fibers are integrated with the VM.
+            },
+            .channel => {
+                // Channel GC scanning will be implemented in Plan 03.
+            },
         }
     }
 

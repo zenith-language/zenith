@@ -717,6 +717,14 @@ fn emitValue(value: Value, allocator: Allocator, buf: *std.ArrayListUnmanaged(u8
                 emit_error_msg = "cannot encode upvalue to JSON";
                 return error.OutOfMemory;
             },
+            .fiber => {
+                emit_error_msg = "cannot encode fiber to JSON";
+                return error.OutOfMemory;
+            },
+            .channel => {
+                emit_error_msg = "cannot encode channel to JSON";
+                return error.OutOfMemory;
+            },
         }
         return;
     }

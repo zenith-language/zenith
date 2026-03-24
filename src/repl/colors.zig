@@ -45,6 +45,7 @@ fn getColorForValue(val: Value) []const u8 {
             .range => Color.cyan,
             .stream => Color.blue,
             .list, .map, .tuple, .record, .adt => Color.reset,
+            .fiber, .channel => Color.blue,
             .bytes, .upvalue => Color.dim,
         };
     }

@@ -372,6 +372,12 @@ pub const Value = struct {
                 .stream => {
                     try writer.writeAll("<stream>");
                 },
+                .fiber => {
+                    try writer.writeAll("<fiber>");
+                },
+                .channel => {
+                    try writer.writeAll("<channel>");
+                },
             }
         } else {
             try writer.writeAll("<unknown>");

@@ -62,6 +62,27 @@ pub fn build(b: *std.Build) void {
     obj_mod.addImport("value", value_mod);
     obj_mod.addImport("chunk", chunk_mod);
 
+    // ── Fiber scheduler primitives (Phase 7) ─────────────────────────────
+    const deque_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/deque.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const fiber_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/fiber.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "obj", .module = obj_mod },
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "chunk", .module = chunk_mod },
+        },
+    });
+
+    // Wire obj_mod to import fiber for ObjFiber destroy.
+    obj_mod.addImport("fiber", fiber_mod);
+
     const arena_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/arena.zig"),
         .target = target,
@@ -388,6 +409,8 @@ pub fn build(b: *std.Build) void {
         colors_mod,
         line_editor_mod,
         repl_mod,
+        deque_mod,
+        fiber_mod,
     };
 
     for (test_modules) |mod| {

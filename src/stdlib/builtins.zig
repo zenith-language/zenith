@@ -457,6 +457,12 @@ pub fn formatValue(val: Value, allocator: Allocator, atom_names: ?[]const []cons
             .stream => {
                 try writer.writeAll("<stream>");
             },
+            .fiber => {
+                try writer.writeAll("<fiber>");
+            },
+            .channel => {
+                try writer.writeAll("<channel>");
+            },
         }
     } else {
         try writer.writeAll("<unknown>");
