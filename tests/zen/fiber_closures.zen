@@ -1,0 +1,27 @@
+-- Closure captures variable, fiber reads it
+let x = 42
+let f = spawn(|| x)
+let result = join(f)
+print(result)
+
+-- Closure captures from nested scope
+let make_worker = |n| {
+  || n * 2
+}
+let f2 = spawn(make_worker(21))
+print(join(f2))
+
+-- Multiple fibers sharing a closure (read-only)
+let shared = "shared_value"
+let f3 = spawn(|| shared)
+let f4 = spawn(|| shared)
+print(join(f3))
+print(join(f4))
+
+-- Upvalue closed over (function returns, upvalue moves to heap)
+let make_counter_fiber = || {
+  let count = 10
+  spawn(|| count + 5)
+}
+let f5 = make_counter_fiber()
+print(join(f5))

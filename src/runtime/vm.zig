@@ -1121,6 +1121,7 @@ pub const VM = struct {
         // Set VM pointer for higher-order builtins that need to invoke closures
         // and track intermediate heap objects.
         builtins_mod.setVM(@ptrCast(self), &callClosureFromBuiltin, &trackObjectFromBuiltin);
+        builtins_mod.setPopLastError(&popLastErrorFromBuiltin);
         if (self.gc != null) {
             builtins_mod.setGCCallbacks(&triggerGCFromBuiltin, &getGCStatsFromBuiltin);
         }
@@ -1230,6 +1231,18 @@ pub const VM = struct {
         };
     }
 
+    /// Callback function for stream operators to retrieve the last error message.
+    /// Pops the last error from the VM's error list and returns its message.
+    fn popLastErrorFromBuiltin(vm_ptr: *anyopaque) ?[]const u8 {
+        const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+        if (vm.errors.items.len > 0) {
+            const last = vm.errors.items[vm.errors.items.len - 1];
+            vm.errors.items.len -= 1;
+            return last.message;
+        }
+        return null;
+    }
+
     /// Callback function for builtins to invoke user closures through the VM.
     /// This is passed to builtins via setVM() and called when List.map, etc.
     /// need to apply a user-provided function to values.
@@ -1243,8 +1256,10 @@ pub const VM = struct {
         }
         const closure = ObjClosure.fromObj(closure_val.asObj());
 
-        // Save current frame count to detect when the closure returns.
+        // Save current frame count and stack top to detect when the closure
+        // returns and to restore on error.
         const saved_frame_count = vm.getFrameCount().*;
+        const saved_stack_top = vm.getStackTop().*;
 
         // Push closure (callee slot) + arguments onto the stack.
         vm.push(closure_val) catch return null;
@@ -1253,7 +1268,10 @@ pub const VM = struct {
         }
 
         // Set up the call frame.
-        vm.callClosure(closure, @intCast(cb_args.len)) catch return null;
+        vm.callClosure(closure, @intCast(cb_args.len)) catch {
+            vm.getStackTop().* = saved_stack_top;
+            return null;
+        };
 
         // Run the VM until this frame returns.
         while (vm.getFrameCount().* > saved_frame_count) {
@@ -1299,7 +1317,13 @@ pub const VM = struct {
 
             // For all other opcodes, rewind ip and dispatch via runSingleOp.
             frame.ip -= 1;
-            vm.runSingleFrameOp() catch return null;
+            vm.runSingleFrameOp() catch {
+                // Error during closure execution (e.g., panic). Clean up
+                // by restoring frame count and stack top.
+                vm.getFrameCount().* = saved_frame_count;
+                vm.getStackTop().* = saved_stack_top;
+                return null;
+            };
         }
 
         return Value.nil;
@@ -2142,6 +2166,36 @@ pub const VM = struct {
 
         const fiber = try ObjFiber.create(self.allocator, closure, null, fiber_name);
         self.trackObject(&fiber.obj);
+
+        // In single-threaded mode (no scheduler), execute the fiber's closure
+        // inline immediately. This makes spawn/join work correctly without a
+        // multi-threaded scheduler by running the closure synchronously.
+        if (self.scheduler == null) {
+            // Record error count before execution so we can detect panics.
+            const err_count_before = self.errors.items.len;
+
+            // Execute the closure inline using callClosureFromBuiltin.
+            const result = callClosureFromBuiltin(@ptrCast(self), closure_val, &[_]Value{});
+
+            if (result) |val| {
+                // Closure completed successfully.
+                fiber.result = val;
+                fiber.state = .dead;
+            } else {
+                // Closure panicked (returned null from callClosureFromBuiltin).
+                // Extract the panic message from the last error added.
+                if (self.errors.items.len > err_count_before) {
+                    const last_err = self.errors.items[self.errors.items.len - 1];
+                    fiber.panic_message = last_err.message;
+                    // Remove the error so the main VM can continue.
+                    self.errors.items.len -= 1;
+                } else {
+                    fiber.panic_message = "unknown panic";
+                }
+                fiber.state = .dead;
+            }
+        }
+
         try self.push(Value.fromObj(&fiber.obj));
     }
 
@@ -2183,10 +2237,17 @@ pub const VM = struct {
                 return error.RuntimeErr;
             },
             .would_block => {
-                // In single-threaded mode, blocking is an error.
-                // Full fiber parking will be added in Plan 04.
-                try self.runtimeErrorAny(.E001, "channel send would block (no receiver)");
-                return error.RuntimeErr;
+                // In single-threaded mode with unbuffered channels, the value
+                // is stored in the handoff slot. Treat as success since the
+                // receiver will pick it up synchronously.
+                if (ch.capacity == 0) {
+                    // Unbuffered channel: value is in handoff slot.
+                    try self.push(Value.nil);
+                } else {
+                    // Buffered channel full: true blocking, error in single-threaded mode.
+                    try self.runtimeErrorAny(.E001, "channel send would block (buffer full)");
+                    return error.RuntimeErr;
+                }
             },
         }
     }
@@ -2217,10 +2278,20 @@ pub const VM = struct {
                 try self.push(Value.fromObj(&none.obj));
             },
             .would_block => {
-                // In single-threaded mode, blocking is an error.
-                // Full fiber parking will be added in Plan 04.
-                try self.runtimeErrorAny(.E001, "channel recv would block (empty channel)");
-                return error.RuntimeErr;
+                // In single-threaded mode, check if an unbuffered channel has
+                // a handoff value available (set by a prior send).
+                if (ch.capacity == 0 and ch.handoff != null) {
+                    const val = ch.handoff.?;
+                    ch.mutex.lock();
+                    ch.handoff = null;
+                    ch.mutex.unlock();
+                    const some = try obj_mod.ObjAdt.create(self.allocator, 0, 0, &[_]Value{val});
+                    self.trackObject(&some.obj);
+                    try self.push(Value.fromObj(&some.obj));
+                } else {
+                    try self.runtimeErrorAny(.E001, "channel recv would block (empty channel)");
+                    return error.RuntimeErr;
+                }
             },
         }
     }

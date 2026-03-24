@@ -62,6 +62,9 @@ pub const GCStats = struct {
 /// Callback type: get GC statistics from the VM.
 pub const GetGCStatsFn = *const fn (vm_ptr: *anyopaque) GCStats;
 
+/// Callback type: pop last error message from the VM (for par_map_result).
+pub const PopLastErrorFn = *const fn (vm_ptr: *anyopaque) ?[]const u8;
+
 /// Module-level state set by the VM before calling builtins.
 /// Threadlocal so each worker thread has its own copy in multi-threaded mode.
 threadlocal var current_vm: ?*anyopaque = null;
@@ -69,6 +72,7 @@ threadlocal var call_closure_fn: ?CallClosureFn = null;
 threadlocal var track_obj_fn: ?TrackObjFn = null;
 threadlocal var trigger_gc_fn: ?TriggerGCFn = null;
 threadlocal var get_gc_stats_fn: ?GetGCStatsFn = null;
+threadlocal var pop_last_error_fn: ?PopLastErrorFn = null;
 /// Atom name table, set by the VM for builtins that need atom resolution (e.g. Json.encode).
 threadlocal var current_atom_names: ?[]const []const u8 = null;
 
@@ -85,6 +89,11 @@ pub fn setGCCallbacks(gc_fn: TriggerGCFn, stats_fn: GetGCStatsFn) void {
     get_gc_stats_fn = stats_fn;
 }
 
+/// Set pop-last-error callback (for stream par_map_result error capture).
+pub fn setPopLastError(f: PopLastErrorFn) void {
+    pop_last_error_fn = f;
+}
+
 /// Set atom names for builtins that need atom resolution (Json.encode).
 pub fn setAtomNames(names: []const []const u8) void {
     current_atom_names = names;
@@ -97,6 +106,7 @@ pub fn clearVM() void {
     track_obj_fn = null;
     trigger_gc_fn = null;
     get_gc_stats_fn = null;
+    pop_last_error_fn = null;
     current_atom_names = null;
 }
 
@@ -1476,6 +1486,9 @@ fn setStreamCallbacks() void {
         const closure_fn = call_closure_fn orelse return;
         const tfn = track_obj_fn orelse return;
         stream_mod.setVM(vm_ptr, closure_fn, tfn);
+        if (pop_last_error_fn) |f| {
+            stream_mod.setPopLastError(f);
+        }
     }
 }
 

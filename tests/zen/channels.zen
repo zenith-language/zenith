@@ -1,0 +1,52 @@
+-- Buffered channel
+let ch = chan(2)
+print(type_of(ch))
+
+-- Send and receive
+send(ch, 42)
+send(ch, 43)
+let v1 = recv(ch)
+let v2 = recv(ch)
+print(v1)
+print(v2)
+
+-- Channel with fibers (producer runs inline via spawn)
+let ch2 = chan(3)
+let producer = spawn(|| {
+  send(ch2, "hello")
+  send(ch2, "world")
+  close(ch2)
+})
+
+-- Receive all values
+let r1 = recv(ch2)
+let r2 = recv(ch2)
+let r3 = recv(ch2)
+print(r1)
+print(r2)
+print(r3)
+
+join(producer)
+
+-- Unbuffered channel (rendezvous)
+let ch3 = chan()
+let sender = spawn(|| {
+  send(ch3, "sync")
+  close(ch3)
+})
+let rv = recv(ch3)
+print(rv)
+join(sender)
+
+-- Channel for-in iteration
+let ch4 = chan(3)
+let writer = spawn(|| {
+  send(ch4, 10)
+  send(ch4, 20)
+  send(ch4, 30)
+  close(ch4)
+})
+for v in ch4 {
+  print(v)
+}
+join(writer)

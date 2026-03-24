@@ -1,0 +1,9 @@
+Result.Ok(42)
+Result.Ok(hello from fiber)
+:fiber
+Result.Ok(100)
+Result.Ok(200)
+Result.Ok(1000)
+Result.Ok(1)
+Result.Ok(2)
+Result.Ok(3)

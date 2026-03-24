@@ -1,0 +1,5 @@
+Result.Ok(42)
+Result.Ok(42)
+Result.Ok(shared_value)
+Result.Ok(shared_value)
+Result.Ok(15)

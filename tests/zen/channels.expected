@@ -1,0 +1,10 @@
+:channel
+Option.Some(42)
+Option.Some(43)
+Option.Some(hello)
+Option.Some(world)
+Option.None
+Option.Some(sync)
+10
+20
+30

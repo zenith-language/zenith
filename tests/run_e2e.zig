@@ -66,6 +66,11 @@ const normal_tests = [_]TestCase{
     .{ .name = "streams", .zen_path = "tests/zen/streams.zen", .expected_path = "tests/zen/streams.expected", .is_error_test = false },
     .{ .name = "streams_lazy", .zen_path = "tests/zen/streams_lazy.zen", .expected_path = "tests/zen/streams_lazy.expected", .is_error_test = false },
     .{ .name = "jsonl", .zen_path = "tests/zen/jsonl.zen", .expected_path = "tests/zen/jsonl.expected", .is_error_test = false },
+    // Phase 7 tests
+    .{ .name = "fibers", .zen_path = "tests/zen/fibers.zen", .expected_path = "tests/zen/fibers.expected", .is_error_test = false },
+    .{ .name = "fibers_error", .zen_path = "tests/zen/fibers_error.zen", .expected_path = "tests/zen/fibers_error.expected", .is_error_test = false },
+    .{ .name = "channels", .zen_path = "tests/zen/channels.zen", .expected_path = "tests/zen/channels.expected", .is_error_test = false },
+    .{ .name = "fiber_closures", .zen_path = "tests/zen/fiber_closures.zen", .expected_path = "tests/zen/fiber_closures.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
@@ -475,6 +480,24 @@ test "e2e: streams_lazy" {
 
 test "e2e: jsonl" {
     try runNormalTest(normal_tests[31]);
+}
+
+// ── Phase 7 normal tests ──────────────────────────────────────────────────
+
+test "e2e: fibers" {
+    try runNormalTest(normal_tests[32]);
+}
+
+test "e2e: fibers_error" {
+    try runNormalTest(normal_tests[33]);
+}
+
+test "e2e: channels" {
+    try runNormalTest(normal_tests[34]);
+}
+
+test "e2e: fiber_closures" {
+    try runNormalTest(normal_tests[35]);
 }
 
 // ── Phase 3 error tests ──────────────────────────────────────────────────

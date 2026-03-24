@@ -1,0 +1,43 @@
+-- Basic fiber spawn and join
+let f = spawn(|| 42)
+let result = join(f)
+print(result)
+
+-- Fiber with named spawn
+let f2 = spawn("worker", || "hello from fiber")
+let r2 = join(f2)
+print(r2)
+
+-- type_of fiber handle
+let f3 = spawn(|| nil)
+print(type_of(f3))
+
+-- try_join on completed fiber (fiber runs inline in single-threaded mode)
+let f4 = spawn(|| 100)
+let r4 = join(f4)
+print(r4)
+let f5 = spawn(|| 200)
+let r5 = join(f5)
+print(r5)
+
+-- try_join non-blocking check
+let f6 = spawn(|| {
+  let x = 0
+  let i = 0
+  while i < 1000 {
+    x = x + 1
+    i = i + 1
+  }
+  x
+})
+-- Fiber runs inline, so it's already done. join returns Ok.
+let final = join(f6)
+print(final)
+
+-- Multiple fibers
+let a = spawn(|| 1)
+let b = spawn(|| 2)
+let c = spawn(|| 3)
+print(join(a))
+print(join(b))
+print(join(c))

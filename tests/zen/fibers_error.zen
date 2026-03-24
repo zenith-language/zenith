@@ -1,0 +1,7 @@
+-- Fiber panic is isolated; join returns Err
+let f = spawn(|| panic("oops"))
+let result = join(f)
+print(result)
+
+-- Main fiber continues after child panic
+print("still running")

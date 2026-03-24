@@ -581,8 +581,9 @@ pub const StreamState = union(enum) {
                 const result = callClosure(s.transform_fn, &[_]Value{inner}) catch |err| {
                     switch (err) {
                         error.RuntimeError => {
-                            // Wrap error in Result.Err with a message.
-                            const err_str = try ObjString.create(allocator, "transform function error", null);
+                            // Wrap error in Result.Err with the actual error message.
+                            const msg = popLastError() orelse "transform function error";
+                            const err_str = try ObjString.create(allocator, msg, null);
                             trackObj(&err_str.obj);
                             const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&err_str.obj)});
                             trackObj(&err_adt.obj);
@@ -929,11 +930,16 @@ pub const CallClosureFn = *const fn (vm_ptr: *anyopaque, closure_val: Value, arg
 /// Callback type: register a heap object with the VM for cleanup.
 pub const TrackObjFn = *const fn (vm_ptr: *anyopaque, o: *Obj) void;
 
+/// Callback type: retrieve and remove the last error message from the VM.
+/// Returns the message string if one exists, null otherwise.
+pub const PopLastErrorFn = *const fn (vm_ptr: *anyopaque) ?[]const u8;
+
 /// Module-level callback state (set by builtins.zig before terminal execution).
 /// Threadlocal so each worker thread has its own copy in multi-threaded mode.
 threadlocal var current_vm: ?*anyopaque = null;
 threadlocal var call_closure_fn: ?CallClosureFn = null;
 threadlocal var track_obj_fn: ?TrackObjFn = null;
+threadlocal var pop_last_error_fn: ?PopLastErrorFn = null;
 
 /// Set VM callbacks for stream operations.
 pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn) void {
@@ -942,11 +948,24 @@ pub fn setVM(vm_ptr: *anyopaque, closure_fn: CallClosureFn, track_fn: TrackObjFn
     track_obj_fn = track_fn;
 }
 
+/// Set the pop-last-error callback (called separately since not all callers need it).
+pub fn setPopLastError(f: PopLastErrorFn) void {
+    pop_last_error_fn = f;
+}
+
 /// Clear VM callbacks.
 pub fn clearVM() void {
     current_vm = null;
     call_closure_fn = null;
     track_obj_fn = null;
+    pop_last_error_fn = null;
+}
+
+/// Retrieve and remove the last error message from the VM.
+fn popLastError() ?[]const u8 {
+    const vm_ptr = current_vm orelse return null;
+    const f = pop_last_error_fn orelse return null;
+    return f(vm_ptr);
 }
 
 /// Track an intermediate heap object with the VM.
