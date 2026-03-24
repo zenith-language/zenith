@@ -104,6 +104,7 @@ pub const OpCode = enum(u8) {
     op_close_channel, // pops channel, closes it
     op_join, // pops fiber handle, pushes Result (blocks if fiber not done)
     op_try_join, // pops fiber handle, pushes Option(Result) (non-blocking)
+    op_select, // [arm_count: u8] followed by arm descriptors: [type: u8, body_offset: u16] each
 };
 
 /// Bytecode container with constant pool and line information.

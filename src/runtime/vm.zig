@@ -546,7 +546,7 @@ pub const VM = struct {
 
                 // Phase 7 concurrency opcodes (stubs in legacy mode).
                 .op_spawn, .op_channel, .op_send, .op_recv,
-                .op_close_channel, .op_join, .op_try_join,
+                .op_close_channel, .op_join, .op_try_join, .op_select,
                 => {
                     try self.runtimeErrorAny(.E001, "concurrency opcodes not available in legacy mode");
                     return error.RuntimeErr;
@@ -816,6 +816,10 @@ pub const VM = struct {
                 .op_close_channel => try self.execOpCloseChannel(),
                 .op_join => try self.execOpJoin(),
                 .op_try_join => try self.execOpTryJoin(),
+                .op_select => {
+                    const arm_count = self.readByteFrame();
+                    try self.execOpSelect(arm_count);
+                },
             }
         }
 
@@ -1520,6 +1524,10 @@ pub const VM = struct {
             .op_close_channel => try self.execOpCloseChannel(),
             .op_join => try self.execOpJoin(),
             .op_try_join => try self.execOpTryJoin(),
+            .op_select => {
+                const arm_count = self.readByteFrame();
+                try self.execOpSelect(arm_count);
+            },
         }
     }
 
@@ -2302,6 +2310,123 @@ pub const VM = struct {
             self.trackObject(&none.obj);
             try self.push(Value.fromObj(&none.obj));
         }
+    }
+
+    fn execOpSelect(self: *Self, arm_count: u8) RuntimeError!void {
+        // Read arm descriptors: [type: u8, body_offset_hi: u8, body_offset_lo: u8] per arm.
+        const MAX_SELECT_ARMS = 16;
+        var arm_types: [MAX_SELECT_ARMS]u8 = undefined;
+        // Store absolute code positions for each arm body.
+        var arm_body_ips: [MAX_SELECT_ARMS]u32 = undefined;
+
+        const frame = self.currentFrame();
+        for (0..arm_count) |i| {
+            arm_types[i] = self.readByteFrame();
+            const hi: u16 = self.readByteFrame();
+            const lo: u16 = self.readByteFrame();
+            const body_offset: u16 = (hi << 8) | lo;
+            // body_offset is relative to the position just after this descriptor.
+            // frame.ip now points past this descriptor (readByteFrame advanced it).
+            arm_body_ips[i] = frame.ip + body_offset;
+        }
+
+        // frame.ip now points to the op_jump that skips over arm bodies.
+        // (The compiler emitted: op_select [arms] op_jump [skip_offset] [arm bodies...])
+        const after_descriptors_ip = frame.ip;
+
+        // Calculate total stack args pushed before op_select.
+        var total_args: u32 = 0;
+        for (0..arm_count) |i| {
+            total_args += switch (arm_types[i]) {
+                0 => 1, // recv: channel
+                1 => 2, // send: channel + value
+                2 => 1, // after: timeout_ms
+                else => 0,
+            };
+        }
+
+        const stack = self.getStack();
+        const st = self.getStackTop();
+        const args_base = st.* - total_args;
+
+        // Try each arm top-to-bottom (non-blocking check).
+        var stack_offset: u32 = 0;
+        for (0..arm_count) |i| {
+            switch (arm_types[i]) {
+                0 => {
+                    // recv arm.
+                    const ch_val = stack[args_base + stack_offset];
+                    stack_offset += 1;
+                    if (ch_val.isObjType(.channel)) {
+                        const ch = ObjChannel.fromObj(ch_val.asObj());
+                        if (ch.tryRecv()) |val| {
+                            // Success! Clean up stack args, push received value.
+                            st.* = args_base;
+                            try self.push(val);
+                            // Jump to arm body.
+                            self.currentFrame().ip = arm_body_ips[i];
+                            return;
+                        }
+                    }
+                },
+                1 => {
+                    // send arm.
+                    const ch_val = stack[args_base + stack_offset];
+                    const send_val = stack[args_base + stack_offset + 1];
+                    stack_offset += 2;
+                    if (ch_val.isObjType(.channel)) {
+                        const ch = ObjChannel.fromObj(ch_val.asObj());
+                        if (ch.trySend(send_val)) {
+                            // Success! Clean up stack args, jump to arm body.
+                            st.* = args_base;
+                            self.currentFrame().ip = arm_body_ips[i];
+                            return;
+                        }
+                    }
+                },
+                2 => {
+                    // after arm: check timeout.
+                    const timeout_val = stack[args_base + stack_offset];
+                    stack_offset += 1;
+                    if (timeout_val.isInt()) {
+                        const timeout_ms = timeout_val.asInt();
+                        if (timeout_ms <= 0) {
+                            // after(0) always fires immediately.
+                            st.* = args_base;
+                            self.currentFrame().ip = arm_body_ips[i];
+                            return;
+                        }
+                        // Non-zero timeout: treated as default arm (fires when
+                        // no other arm is ready). Full timer support requires
+                        // scheduler integration.
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // No arm was ready. Check if any after arm exists as fallback.
+        stack_offset = 0;
+        for (0..arm_count) |i| {
+            switch (arm_types[i]) {
+                0 => stack_offset += 1,
+                1 => stack_offset += 2,
+                2 => {
+                    // After arm fires as default when no channel arm is ready.
+                    st.* = args_base;
+                    self.currentFrame().ip = arm_body_ips[i];
+                    return;
+                },
+                else => stack_offset += 1,
+            }
+        }
+
+        // No arm ready and no after arm. In single-threaded mode, pop args
+        // and fall through to the op_jump that skips over arm bodies.
+        // This will produce nil via the compiler's fallback path.
+        st.* = args_base;
+        // IP already points to after_descriptors_ip (the op_jump).
+        self.currentFrame().ip = after_descriptors_ip;
     }
 
     fn printValue(self: *Self, val: Value) !void {

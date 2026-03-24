@@ -103,7 +103,30 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, writer: anytyp
         .op_close_channel => try simpleInstruction("OP_CLOSE_CHANNEL", offset, writer),
         .op_join => try simpleInstruction("OP_JOIN", offset, writer),
         .op_try_join => try simpleInstruction("OP_TRY_JOIN", offset, writer),
+        .op_select => try selectInstruction("OP_SELECT", chunk, offset, writer),
     };
+}
+
+fn selectInstruction(name: []const u8, chunk: *const Chunk, offset: usize, writer: anytype) !usize {
+    const arm_count = chunk.code.items[offset + 1];
+    try writer.print("{s:<24} {d} arms\n", .{ name, arm_count });
+    // Each arm descriptor: [type: u8, body_offset_hi: u8, body_offset_lo: u8]
+    var off = offset + 2;
+    for (0..arm_count) |_| {
+        const arm_type = chunk.code.items[off];
+        const body_hi = chunk.code.items[off + 1];
+        const body_lo = chunk.code.items[off + 2];
+        const body_offset = (@as(u16, body_hi) << 8) | body_lo;
+        const type_name: []const u8 = switch (arm_type) {
+            0 => "recv",
+            1 => "send",
+            2 => "after",
+            else => "???",
+        };
+        try writer.print("                           | {s} -> +{d}\n", .{ type_name, body_offset });
+        off += 3;
+    }
+    return off;
 }
 
 // ── Instruction format helpers ─────────────────────────────────────────

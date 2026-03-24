@@ -745,8 +745,14 @@ pub const Parser = struct {
 
     // ── Select expression parsing (Phase 7) ────────────────────────────
 
-    /// Parse `select { | recv(ch) -> |val| body | send(ch, v) -> body | ... }`
-    /// NOTE: Full select runtime is in Plan 04. This adds AST representation only.
+    /// Parse `select { | recv(ch) -> |val| body | send(ch, v) -> body | after(ms) -> body }`
+    ///
+    /// Each arm is stored as a select_arm node:
+    ///   data.lhs = kind (0=recv, 1=send, 2=after)
+    ///   data.rhs = extra_idx into extra_data:
+    ///     For recv: [channel_expr, body_expr, binding_token (0 if none)]
+    ///     For send: [channel_expr, value_expr, body_expr]
+    ///     For after: [timeout_expr, body_expr]
     fn parseSelectExpr(self: *Parser) Error!Node.Index {
         const select_tok = self.pos;
         self.advance(); // consume 'select'
@@ -760,19 +766,148 @@ pub const Parser = struct {
         var arms: std.ArrayListUnmanaged(u32) = .empty;
         defer arms.deinit(self.allocator);
 
-        // Parse arms: | recv(ch) -> |val| body or | send(ch, v) -> body
+        // Parse arms: | recv(ch) -> |val| body or | send(ch, v) -> body or | after(ms) -> body
         while (self.peekTag() == .pipe) {
             self.advance(); // consume '|'
 
-            // For now, parse the arm as an expression (simplified).
-            // Full arm parsing will be expanded in Plan 04.
-            const arm_body = try self.parseExpression();
-            const arm_node = try self.ast.addNode(.{
-                .tag = .select_arm,
-                .main_token = select_tok,
-                .data = .{ .lhs = 0, .rhs = arm_body },
-            }, self.allocator);
-            try arms.append(self.allocator, arm_node);
+            // Determine arm kind from identifier.
+            if (self.peekTag() != .identifier) {
+                try self.emitError("expected 'recv', 'send', or 'after' in select arm");
+                return error.ParseError;
+            }
+            const kind_name = self.tokenSlice(self.pos);
+
+            if (std.mem.eql(u8, kind_name, "recv")) {
+                self.advance(); // consume 'recv'
+                // recv(ch) -> |val| body
+                if (self.peekTag() != .left_paren) {
+                    try self.emitError("expected '(' after 'recv'");
+                    return error.ParseError;
+                }
+                self.advance(); // consume '('
+                const ch_expr = try self.parseExpression();
+                if (self.peekTag() != .right_paren) {
+                    try self.emitError("expected ')' after channel expression");
+                    return error.ParseError;
+                }
+                self.advance(); // consume ')'
+
+                if (self.peekTag() != .arrow) {
+                    try self.emitError("expected '->' after recv(ch)");
+                    return error.ParseError;
+                }
+                self.advance(); // consume '->'
+
+                // Optional binding: |val|
+                var binding_token: u32 = 0;
+                if (self.peekTag() == .pipe) {
+                    self.advance(); // consume '|'
+                    if (self.peekTag() != .identifier) {
+                        try self.emitError("expected binding name after '|'");
+                        return error.ParseError;
+                    }
+                    binding_token = self.pos;
+                    self.advance(); // consume identifier
+                    if (self.peekTag() != .pipe) {
+                        try self.emitError("expected '|' after binding name");
+                        return error.ParseError;
+                    }
+                    self.advance(); // consume '|'
+                }
+
+                const body_expr = try self.parseExpression();
+
+                // Store in extra_data: [channel_expr, body_expr, binding_token]
+                const extra_idx: u32 = @intCast(self.ast.extra_data.items.len);
+                _ = try self.ast.addExtra(ch_expr, self.allocator);
+                _ = try self.ast.addExtra(body_expr, self.allocator);
+                _ = try self.ast.addExtra(binding_token, self.allocator);
+
+                const arm_node = try self.ast.addNode(.{
+                    .tag = .select_arm,
+                    .main_token = select_tok,
+                    .data = .{ .lhs = 0, .rhs = extra_idx },
+                }, self.allocator);
+                try arms.append(self.allocator, arm_node);
+            } else if (std.mem.eql(u8, kind_name, "send")) {
+                self.advance(); // consume 'send'
+                // send(ch, value) -> body
+                if (self.peekTag() != .left_paren) {
+                    try self.emitError("expected '(' after 'send'");
+                    return error.ParseError;
+                }
+                self.advance(); // consume '('
+                const ch_expr = try self.parseExpression();
+                if (self.peekTag() != .comma) {
+                    try self.emitError("expected ',' after channel in send");
+                    return error.ParseError;
+                }
+                self.advance(); // consume ','
+                const val_expr = try self.parseExpression();
+                if (self.peekTag() != .right_paren) {
+                    try self.emitError("expected ')' after send arguments");
+                    return error.ParseError;
+                }
+                self.advance(); // consume ')'
+
+                if (self.peekTag() != .arrow) {
+                    try self.emitError("expected '->' after send(ch, v)");
+                    return error.ParseError;
+                }
+                self.advance(); // consume '->'
+
+                const body_expr = try self.parseExpression();
+
+                // Store in extra_data: [channel_expr, value_expr, body_expr]
+                const extra_idx: u32 = @intCast(self.ast.extra_data.items.len);
+                _ = try self.ast.addExtra(ch_expr, self.allocator);
+                _ = try self.ast.addExtra(val_expr, self.allocator);
+                _ = try self.ast.addExtra(body_expr, self.allocator);
+
+                const arm_node = try self.ast.addNode(.{
+                    .tag = .select_arm,
+                    .main_token = select_tok,
+                    .data = .{ .lhs = 1, .rhs = extra_idx },
+                }, self.allocator);
+                try arms.append(self.allocator, arm_node);
+            } else if (std.mem.eql(u8, kind_name, "after")) {
+                self.advance(); // consume 'after'
+                // after(ms) -> body
+                if (self.peekTag() != .left_paren) {
+                    try self.emitError("expected '(' after 'after'");
+                    return error.ParseError;
+                }
+                self.advance(); // consume '('
+                const timeout_expr = try self.parseExpression();
+                if (self.peekTag() != .right_paren) {
+                    try self.emitError("expected ')' after timeout expression");
+                    return error.ParseError;
+                }
+                self.advance(); // consume ')'
+
+                if (self.peekTag() != .arrow) {
+                    try self.emitError("expected '->' after after(ms)");
+                    return error.ParseError;
+                }
+                self.advance(); // consume '->'
+
+                const body_expr = try self.parseExpression();
+
+                // Store in extra_data: [timeout_expr, body_expr]
+                const extra_idx: u32 = @intCast(self.ast.extra_data.items.len);
+                _ = try self.ast.addExtra(timeout_expr, self.allocator);
+                _ = try self.ast.addExtra(body_expr, self.allocator);
+
+                const arm_node = try self.ast.addNode(.{
+                    .tag = .select_arm,
+                    .main_token = select_tok,
+                    .data = .{ .lhs = 2, .rhs = extra_idx },
+                }, self.allocator);
+                try arms.append(self.allocator, arm_node);
+            } else {
+                try self.emitError("expected 'recv', 'send', or 'after' in select arm");
+                return error.ParseError;
+            }
         }
 
         if (self.peekTag() != .right_brace) {

@@ -498,8 +498,7 @@ pub const Compiler = struct {
 
             // Phase 7 concurrency nodes.
             .select_expr => {
-                // Select runtime will be implemented in Plan 04.
-                try self.emitError(node_idx, .E005, "select is not yet implemented");
+                try self.compileSelect(node_data, node_idx);
             },
             .select_arm => {
                 try self.emitError(node_idx, .E005, "unexpected select arm outside of select");
@@ -2197,6 +2196,163 @@ pub const Compiler = struct {
             self.endScopeWithPops(pop_count, self.getLine(node_idx));
             try self.emitOp(.op_nil, self.getLine(node_idx));
         }
+    }
+
+    // ── Select compilation ────────────────────────────────────────────
+
+    /// Compile a select expression.
+    ///
+    /// Compilation strategy: emit op_select with arm count and inline descriptors.
+    /// Before op_select, push all channel/value/timeout expressions onto the stack.
+    /// After op_select, emit arm bodies as jump targets.
+    ///
+    /// Stack layout before op_select:
+    ///   For each arm (in order):
+    ///     recv arm: [channel]
+    ///     send arm: [channel, value]
+    ///     after arm: [timeout_ms]
+    ///
+    /// op_select [arm_count] followed by arm descriptors:
+    ///   [type: u8, body_offset: u16] per arm
+    ///
+    /// The VM tries each arm top-to-bottom. First ready arm: jump to its body.
+    /// If none ready: yield and retry (polling loop).
+    fn compileSelect(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const line = self.getLine(node_idx);
+        const arm_indices = self.ast.extra_data.items[node_data.lhs..node_data.rhs];
+        const arm_count: u8 = @intCast(arm_indices.len);
+
+        if (arm_count == 0) {
+            try self.emitOp(.op_nil, line);
+            return;
+        }
+
+        // Collect arm kinds and extra data indices for later body compilation.
+        const MAX_ARMS = 16;
+        var arm_kinds: [MAX_ARMS]u8 = undefined;
+        var arm_extras: [MAX_ARMS]u32 = undefined;
+
+        // Phase 1: Push channel/value/timeout expressions onto stack.
+        for (arm_indices, 0..) |arm_idx, i| {
+            const arm_data = self.ast.nodes.items(.data)[arm_idx];
+            const kind: u8 = @intCast(arm_data.lhs);
+            const extra_idx = arm_data.rhs;
+            arm_kinds[i] = kind;
+            arm_extras[i] = extra_idx;
+
+            switch (kind) {
+                0 => {
+                    // recv: extra = [channel_expr, body_expr, binding_token]
+                    const ch_expr = self.ast.extra_data.items[extra_idx];
+                    try self.compileNode(ch_expr);
+                },
+                1 => {
+                    // send: extra = [channel_expr, value_expr, body_expr]
+                    const ch_expr = self.ast.extra_data.items[extra_idx];
+                    const val_expr = self.ast.extra_data.items[extra_idx + 1];
+                    try self.compileNode(ch_expr);
+                    try self.compileNode(val_expr);
+                },
+                2 => {
+                    // after: extra = [timeout_expr, body_expr]
+                    const timeout_expr = self.ast.extra_data.items[extra_idx];
+                    try self.compileNode(timeout_expr);
+                },
+                else => {
+                    try self.emitError(node_idx, .E005, "invalid select arm kind");
+                    return;
+                },
+            }
+        }
+
+        // Phase 2: Emit op_select with arm count.
+        try self.emitOp(.op_select, line);
+        try self.emitByte(arm_count, line);
+
+        // Phase 3: Emit arm descriptors with placeholder body offsets.
+        // Each descriptor: [type: u8, body_offset_hi: u8, body_offset_lo: u8]
+        var descriptor_offsets: [MAX_ARMS]u32 = undefined;
+        for (0..arm_count) |i| {
+            try self.emitByte(arm_kinds[i], line);
+            // Placeholder for body_offset (2 bytes).
+            descriptor_offsets[i] = @intCast(self.currentChunk().code.items.len);
+            try self.emitByte(0xFF, line);
+            try self.emitByte(0xFF, line);
+        }
+
+        // Phase 4: Emit jump over all arm bodies (for when VM needs to yield/retry).
+        const jump_over_bodies = try self.emitJump(.op_jump, line);
+
+        // Phase 5: Emit arm bodies and collect merge-point jump patches.
+        var merge_jumps: [MAX_ARMS]u32 = undefined;
+
+        for (0..arm_count) |i| {
+            // Patch this arm's body_offset to point here.
+            const body_start: u32 = @intCast(self.currentChunk().code.items.len);
+            const offset_from_descriptor = body_start - descriptor_offsets[i] - 2;
+            self.currentChunk().code.items[descriptor_offsets[i]] = @intCast((offset_from_descriptor >> 8) & 0xFF);
+            self.currentChunk().code.items[descriptor_offsets[i] + 1] = @intCast(offset_from_descriptor & 0xFF);
+
+            switch (arm_kinds[i]) {
+                0 => {
+                    // recv arm: received value is on top of stack from VM.
+                    // Check if there's a binding.
+                    const binding_token = self.ast.extra_data.items[arm_extras[i] + 2];
+                    const body_expr = self.ast.extra_data.items[arm_extras[i] + 1];
+                    if (binding_token != 0) {
+                        // Create a scope for the binding.
+                        self.beginScope();
+                        const binding_name = self.ast.tokenSlice(binding_token);
+                        // Add local: the received value is already on the stack.
+                        self.locals[self.local_count] = .{
+                            .name = binding_name,
+                            .depth = self.scope_depth,
+                            .is_captured = false,
+                        };
+                        self.local_count += 1;
+                        try self.compileNode(body_expr);
+                        // Body result is on top of stack, binding local below.
+                        // We need to keep the result. Swap and pop binding.
+                        self.endScopeForMatch(line);
+                    } else {
+                        // No binding: pop the received value (discard).
+                        try self.emitOp(.op_pop, line);
+                        try self.compileNode(body_expr);
+                    }
+                },
+                1 => {
+                    // send arm: no received value, just run body.
+                    const body_expr = self.ast.extra_data.items[arm_extras[i] + 2];
+                    try self.compileNode(body_expr);
+                },
+                2 => {
+                    // after arm: no received value, just run body.
+                    const body_expr = self.ast.extra_data.items[arm_extras[i] + 1];
+                    try self.compileNode(body_expr);
+                },
+                else => {},
+            }
+
+            // Jump to merge point.
+            merge_jumps[i] = try self.emitJump(.op_jump, line);
+        }
+
+        // Phase 6: Patch jump_over_bodies to point here (after all arm bodies).
+        try self.patchJump(jump_over_bodies);
+        // If VM yields (no arm ready), it will re-execute op_select.
+        // But since we jumped over the bodies, we land here with no result.
+        // The VM will handle retry internally.
+        // Actually: the simpler approach is the VM handles the polling loop entirely.
+        // If no arm is ready, the VM pushes nil and jumps past the bodies.
+        try self.emitOp(.op_nil, line);
+        const final_jump = try self.emitJump(.op_jump, line);
+
+        // Phase 7: Merge point -- all arm bodies jump here.
+        // Patch merge jumps.
+        for (0..arm_count) |i| {
+            try self.patchJump(merge_jumps[i]);
+        }
+        try self.patchJump(final_jump);
     }
 
     // ── Call expression ───────────────────────────────────────────────

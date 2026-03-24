@@ -236,6 +236,60 @@ pub const ObjChannel = struct {
         };
     }
 
+    /// Non-blocking receive attempt for select statement.
+    /// Returns the received value if available, null otherwise.
+    /// Does not park the caller -- just checks and returns immediately.
+    pub fn tryRecv(self: *ObjChannel) ?Value {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.capacity > 0) {
+            // Buffered mode.
+            if (self.count > 0) {
+                const val = self.buffer.?[self.head];
+                self.head = (self.head + 1) % self.capacity;
+                self.count -= 1;
+                return val;
+            }
+            return null;
+        } else {
+            // Unbuffered mode.
+            if (self.handoff) |val| {
+                self.handoff = null;
+                return val;
+            }
+            return null;
+        }
+    }
+
+    /// Non-blocking send attempt for select statement.
+    /// Returns true if the value was sent, false otherwise.
+    /// Does not park the caller -- just checks and returns immediately.
+    pub fn trySend(self: *ObjChannel, val: Value) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.closed) return false;
+
+        if (self.capacity > 0) {
+            // Buffered mode.
+            if (self.count < self.capacity) {
+                self.buffer.?[self.tail] = val;
+                self.tail = (self.tail + 1) % self.capacity;
+                self.count += 1;
+                return true;
+            }
+            return false;
+        } else {
+            // Unbuffered mode.
+            if (!self.receivers.isEmpty()) {
+                self.handoff = val;
+                return true;
+            }
+            return false;
+        }
+    }
+
     /// Recover the containing ObjChannel from an *Obj pointer.
     pub fn fromObj(obj_ptr: *Obj) *ObjChannel {
         return @fieldParentPtr("obj", obj_ptr);
