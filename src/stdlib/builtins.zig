@@ -299,6 +299,12 @@ pub const builtins = [_]BuiltinDesc{
     // ── File I/O (indices 84-85) ────────────────────────────────
     .{ .name = "source", .func = &builtinSource, .arity_min = 1, .arity_max = 2 },
     .{ .name = "sink", .func = &builtinSink, .arity_min = 2, .arity_max = 3 },
+
+    // ── Concurrency stream operators (indices 86-89) ─────────
+    .{ .name = "par_map", .func = &builtinParMap, .arity_min = 2, .arity_max = 3 },
+    .{ .name = "par_map_unordered", .func = &builtinParMapUnordered, .arity_min = 2, .arity_max = 3 },
+    .{ .name = "par_map_result", .func = &builtinParMapResult, .arity_min = 2, .arity_max = 3 },
+    .{ .name = "tick", .func = &builtinTick, .arity_min = 1, .arity_max = 1 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -2460,6 +2466,156 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     };
 
     return Value.nil;
+}
+
+// ── Concurrency stream operators ─────────────────────────────────────
+
+/// par_map(stream, fn) or par_map(stream, N, fn)
+/// Parallel map with order preservation. In v1 (single-threaded), processes sequentially.
+fn builtinParMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // Auto-wrap range to stream if needed.
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "par_map() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    var concurrency: u32 = getCpuCount();
+    var fn_val: Value = undefined;
+
+    if (args.len == 3) {
+        // par_map(stream, N, fn)
+        if (!args[1].isInt() or args[1].asInt() <= 0) {
+            err_msg.* = "par_map() concurrency argument must be a positive integer";
+            return error.RuntimeError;
+        }
+        concurrency = @intCast(args[1].asInt());
+        fn_val = args[2];
+    } else {
+        // par_map(stream, fn)
+        fn_val = args[1];
+    }
+
+    if (!fn_val.isObjType(.closure)) {
+        err_msg.* = "par_map() expects a function argument";
+        return error.RuntimeError;
+    }
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .par_map = .{
+        .upstream = first,
+        .transform_fn = fn_val,
+        .concurrency = concurrency,
+    } };
+    return createStream(state, allocator);
+}
+
+/// par_map_unordered(stream, fn) or par_map_unordered(stream, N, fn)
+/// Parallel map emitting results in completion order.
+fn builtinParMapUnordered(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "par_map_unordered() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    var concurrency: u32 = getCpuCount();
+    var fn_val: Value = undefined;
+
+    if (args.len == 3) {
+        if (!args[1].isInt() or args[1].asInt() <= 0) {
+            err_msg.* = "par_map_unordered() concurrency argument must be a positive integer";
+            return error.RuntimeError;
+        }
+        concurrency = @intCast(args[1].asInt());
+        fn_val = args[2];
+    } else {
+        fn_val = args[1];
+    }
+
+    if (!fn_val.isObjType(.closure)) {
+        err_msg.* = "par_map_unordered() expects a function argument";
+        return error.RuntimeError;
+    }
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .par_map_unordered = .{
+        .upstream = first,
+        .transform_fn = fn_val,
+        .concurrency = concurrency,
+    } };
+    return createStream(state, allocator);
+}
+
+/// par_map_result(stream, fn) or par_map_result(stream, N, fn)
+/// Parallel map wrapping outputs in Result. Errors wrapped in Result.Err.
+fn builtinParMapResult(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "par_map_result() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    var concurrency: u32 = getCpuCount();
+    var fn_val: Value = undefined;
+
+    if (args.len == 3) {
+        if (!args[1].isInt() or args[1].asInt() <= 0) {
+            err_msg.* = "par_map_result() concurrency argument must be a positive integer";
+            return error.RuntimeError;
+        }
+        concurrency = @intCast(args[1].asInt());
+        fn_val = args[2];
+    } else {
+        fn_val = args[1];
+    }
+
+    if (!fn_val.isObjType(.closure)) {
+        err_msg.* = "par_map_result() expects a function argument";
+        return error.RuntimeError;
+    }
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .par_map_result = .{
+        .upstream = first,
+        .transform_fn = fn_val,
+        .concurrency = concurrency,
+    } };
+    return createStream(state, allocator);
+}
+
+/// tick(interval_ms) -> Stream: generates incrementing integers at regular intervals.
+fn builtinTick(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isInt() or args[0].asInt() <= 0) {
+        err_msg.* = "tick() expects a positive integer interval in milliseconds";
+        return error.RuntimeError;
+    }
+    const interval_ms: u64 = @intCast(args[0].asInt());
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .tick = .{
+        .interval_ms = interval_ms,
+        .counter = 0,
+        .last_emit = 0,
+    } };
+    return createStream(state, allocator);
+}
+
+/// Get the CPU core count, defaulting to 4 if unavailable.
+fn getCpuCount() u32 {
+    return @intCast(std.Thread.getCpuCount() catch 4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

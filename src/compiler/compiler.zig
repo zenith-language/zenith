@@ -196,6 +196,8 @@ pub const Compiler = struct {
         "Json.decode", "Json.encode",
         // File I/O (84-85)
         "source", "sink",
+        // Concurrency stream operators (86-89)
+        "par_map", "par_map_unordered", "par_map_result", "tick",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-14 to match
@@ -982,7 +984,7 @@ pub const Compiler = struct {
 
     /// Known module names for compile-time dot access resolution.
     const module_names = [_][]const u8{
-        "List", "Map", "String", "Result", "Option", "Tuple", "Json",
+        "List", "Map", "String", "Result", "Option", "Tuple", "Json", "Fiber",
     };
 
     fn isKnownModule(name: []const u8) bool {

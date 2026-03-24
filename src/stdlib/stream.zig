@@ -43,6 +43,10 @@ pub const StreamState = union(enum) {
     file_reader: FileReaderOp,
     jsonl_reader: JsonlReaderOp,
     stdin_reader: StdinReaderOp,
+    par_map: ParMapOp,
+    par_map_unordered: ParMapUnorderedOp,
+    par_map_result: ParMapResultOp,
+    tick: TickOp,
 
     pub const RangeIter = struct {
         current: i32,
@@ -248,6 +252,38 @@ pub const StreamState = union(enum) {
 
     pub const StdinReaderOp = struct {
         frs: *FileReaderState,
+    };
+
+    /// Par_map: parallel map with order preservation.
+    /// In v1 (single-threaded), processes sequentially but provides the
+    /// correct API contract. Full parallelism comes with scheduler integration.
+    pub const ParMapOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        transform_fn: Value, // User closure to apply
+        concurrency: u32, // Number of worker fibers (informational in v1)
+    };
+
+    /// Par_map_unordered: parallel map emitting results in completion order.
+    /// In v1, equivalent to par_map (sequential processing).
+    pub const ParMapUnorderedOp = struct {
+        upstream: Value,
+        transform_fn: Value,
+        concurrency: u32,
+    };
+
+    /// Par_map_result: parallel map wrapping outputs in Result, never fail-fast.
+    /// Errors from transform_fn are wrapped in Result.Err.
+    pub const ParMapResultOp = struct {
+        upstream: Value,
+        transform_fn: Value,
+        concurrency: u32,
+    };
+
+    /// Tick: generates incrementing integers at regular intervals.
+    pub const TickOp = struct {
+        interval_ms: u64,
+        counter: u64,
+        last_emit: i64, // timestamp of last emission (std.time.milliTimestamp)
     };
 
     /// Pull the next element from this stream.
@@ -514,6 +550,77 @@ pub const StreamState = union(enum) {
             .jsonl_reader => |s| {
                 return jsonlReaderNext(s.frs, allocator);
             },
+            .par_map => |s| {
+                // v1: sequential processing with order preservation.
+                // Each upstream element is transformed synchronously.
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const upstream_val = try upstream_stream.state.next(allocator);
+                if (isNone(upstream_val)) return upstream_val;
+                const inner = adtPayload(upstream_val, 0);
+                const mapped = try callClosure(s.transform_fn, &[_]Value{inner});
+                return makeSome(mapped, allocator);
+            },
+            .par_map_unordered => |s| {
+                // v1: same as par_map (sequential = completion order matches input order).
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const upstream_val = try upstream_stream.state.next(allocator);
+                if (isNone(upstream_val)) return upstream_val;
+                const inner = adtPayload(upstream_val, 0);
+                const mapped = try callClosure(s.transform_fn, &[_]Value{inner});
+                return makeSome(mapped, allocator);
+            },
+            .par_map_result => |s| {
+                // v1: sequential processing, wrapping each result in Result.
+                // Errors from transform_fn are wrapped in Result.Err.
+                // No fail-fast -- all items processed.
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const upstream_val = try upstream_stream.state.next(allocator);
+                if (isNone(upstream_val)) return upstream_val;
+                const inner = adtPayload(upstream_val, 0);
+                // Try to apply the transform; catch errors.
+                const result = callClosure(s.transform_fn, &[_]Value{inner}) catch |err| {
+                    switch (err) {
+                        error.RuntimeError => {
+                            // Wrap error in Result.Err with a message.
+                            const err_str = try ObjString.create(allocator, "transform function error", null);
+                            trackObj(&err_str.obj);
+                            const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&err_str.obj)});
+                            trackObj(&err_adt.obj);
+                            return makeSome(Value.fromObj(&err_adt.obj), allocator);
+                        },
+                        else => return err,
+                    }
+                };
+                // Wrap success in Result.Ok.
+                const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{result});
+                trackObj(&ok_adt.obj);
+                return makeSome(Value.fromObj(&ok_adt.obj), allocator);
+            },
+            .tick => |*s| {
+                // Generate incrementing integers at regular intervals.
+                const now = std.time.milliTimestamp();
+                if (s.last_emit == 0) {
+                    // First call: emit immediately.
+                    s.last_emit = now;
+                    const val = Value.fromInt(@intCast(s.counter));
+                    s.counter += 1;
+                    return makeSome(val, allocator);
+                }
+                const elapsed: u64 = @intCast(@max(0, now - s.last_emit));
+                if (elapsed >= s.interval_ms) {
+                    s.last_emit = now;
+                    const val = Value.fromInt(@intCast(s.counter));
+                    s.counter += 1;
+                    return makeSome(val, allocator);
+                }
+                // Not enough time has elapsed. In single-threaded mode,
+                // use a brief sleep and retry.
+                std.Thread.sleep((s.interval_ms - elapsed) * std.time.ns_per_ms);
+                s.last_emit = std.time.milliTimestamp();
+                const val = Value.fromInt(@intCast(s.counter));
+                s.counter += 1;
+                return makeSome(val, allocator);
+            },
         }
     }
 
@@ -540,6 +647,8 @@ pub const StreamState = union(enum) {
             .stdin_reader => |*s| {
                 s.frs.deinit(allocator);
             },
+            // par_map variants and tick have no owned memory to free.
+            .par_map, .par_map_unordered, .par_map_result, .tick => {},
             else => {},
         }
     }
@@ -612,6 +721,19 @@ pub const StreamState = union(enum) {
                     try nursery.processValue(v, gc);
                 }
             },
+            .par_map => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.transform_fn, gc);
+            },
+            .par_map_unordered => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.transform_fn, gc);
+            },
+            .par_map_result => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.transform_fn, gc);
+            },
+            .tick => {},
         }
     }
 
@@ -682,6 +804,19 @@ pub const StreamState = union(enum) {
                     try oldgen.processValue(v, gc);
                 }
             },
+            .par_map => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.transform_fn, gc);
+            },
+            .par_map_unordered => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.transform_fn, gc);
+            },
+            .par_map_result => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.transform_fn, gc);
+            },
+            .tick => {},
         }
     }
 };
