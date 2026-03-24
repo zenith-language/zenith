@@ -83,6 +83,22 @@ pub fn build(b: *std.Build) void {
     // Wire obj_mod to import fiber for ObjFiber destroy.
     obj_mod.addImport("fiber", fiber_mod);
 
+    const context_switch_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/context_switch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add platform-specific assembly file to context_switch module.
+    if (target.result.cpu.arch == .x86_64) {
+        context_switch_mod.addAssemblyFile(b.path("src/runtime/arch/x86_64.s"));
+    } else if (target.result.cpu.arch == .aarch64) {
+        context_switch_mod.addAssemblyFile(b.path("src/runtime/arch/aarch64.s"));
+    }
+
+    // Wire context_switch into fiber_mod for future use.
+    fiber_mod.addImport("context_switch", context_switch_mod);
+
     const arena_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/arena.zig"),
         .target = target,
@@ -411,6 +427,7 @@ pub fn build(b: *std.Build) void {
         repl_mod,
         deque_mod,
         fiber_mod,
+        context_switch_mod,
     };
 
     for (test_modules) |mod| {
