@@ -1,0 +1,5 @@
+-- Throttle (high rate = effectively no delay for test)
+print(range(1, 4) |> throttle(100000, :per_second) |> collect())
+
+-- Throttle with map
+print(range(1, 4) |> throttle(100000, :per_second) |> map(|x| x * 10) |> collect())

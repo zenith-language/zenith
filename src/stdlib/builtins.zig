@@ -208,7 +208,7 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "range", .func = &builtinRange, .arity_min = 1, .arity_max = 3 },
     .{ .name = "show", .func = &builtinShow, .arity_min = 1, .arity_max = 1 },
 
-    // ── List module (indices 8-19) ───────────────────────────────────
+    // ── List module (indices 8-20) ───────────────────────────────────
     .{ .name = "List.get", .func = &builtinListGet, .arity_min = 2, .arity_max = 2 },
     .{ .name = "List.set", .func = &builtinListSet, .arity_min = 3, .arity_max = 3 },
     .{ .name = "List.append", .func = &builtinListAppend, .arity_min = 2, .arity_max = 2 },
@@ -217,12 +217,13 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "List.filter", .func = &builtinListFilter, .arity_min = 2, .arity_max = 2 },
     .{ .name = "List.reduce", .func = &builtinListReduce, .arity_min = 3, .arity_max = 3 },
     .{ .name = "List.sort", .func = &builtinListSort, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "List.sort_by", .func = &builtinListSortBy, .arity_min = 2, .arity_max = 2 },
     .{ .name = "List.reverse", .func = &builtinListReverse, .arity_min = 1, .arity_max = 1 },
     .{ .name = "List.zip", .func = &builtinListZip, .arity_min = 2, .arity_max = 2 },
     .{ .name = "List.flatten", .func = &builtinListFlatten, .arity_min = 1, .arity_max = 1 },
     .{ .name = "List.contains", .func = &builtinListContains, .arity_min = 2, .arity_max = 2 },
 
-    // ── Map module (indices 20-27) ───────────────────────────────────
+    // ── Map module (indices 21-28) ───────────────────────────────────
     .{ .name = "Map.get", .func = &builtinMapGet, .arity_min = 2, .arity_max = 2 },
     .{ .name = "Map.set", .func = &builtinMapSet, .arity_min = 3, .arity_max = 3 },
     .{ .name = "Map.delete", .func = &builtinMapDelete, .arity_min = 2, .arity_max = 2 },
@@ -232,11 +233,11 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "Map.contains", .func = &builtinMapContains, .arity_min = 2, .arity_max = 2 },
     .{ .name = "Map.length", .func = &builtinMapLength, .arity_min = 1, .arity_max = 1 },
 
-    // ── Tuple module (indices 28-29) ─────────────────────────────────
+    // ── Tuple module (indices 29-30) ─────────────────────────────────
     .{ .name = "Tuple.get", .func = &builtinTupleGet, .arity_min = 2, .arity_max = 2 },
     .{ .name = "Tuple.length", .func = &builtinTupleLength, .arity_min = 1, .arity_max = 1 },
 
-    // ── String module (indices 30-39) ────────────────────────────────
+    // ── String module (indices 31-40) ────────────────────────────────
     .{ .name = "String.split", .func = &builtinStringSplit, .arity_min = 2, .arity_max = 2 },
     .{ .name = "String.trim", .func = &builtinStringTrim, .arity_min = 1, .arity_max = 1 },
     .{ .name = "String.join", .func = &builtinStringJoin, .arity_min = 2, .arity_max = 2 },
@@ -248,7 +249,7 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "String.to_upper", .func = &builtinStringToUpper, .arity_min = 1, .arity_max = 1 },
     .{ .name = "String.length", .func = &builtinStringLength, .arity_min = 1, .arity_max = 1 },
 
-    // ── Result module (indices 40-47) ────────────────────────────────
+    // ── Result module (indices 41-48) ────────────────────────────────
     .{ .name = "Result.Ok", .func = &builtinResultOk, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Result.Err", .func = &builtinResultErr, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Result.map_ok", .func = &builtinResultMapOk, .arity_min = 2, .arity_max = 2 },
@@ -258,7 +259,7 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "Result.is_ok", .func = &builtinResultIsOk, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Result.is_err", .func = &builtinResultIsErr, .arity_min = 1, .arity_max = 1 },
 
-    // ── Option module (indices 48-54) ────────────────────────────────
+    // ── Option module (indices 49-55) ────────────────────────────────
     .{ .name = "Option.Some", .func = &builtinOptionSome, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Option.None", .func = &builtinOptionNone, .arity_min = 0, .arity_max = 0 },
     .{ .name = "Option.map", .func = &builtinOptionMap, .arity_min = 2, .arity_max = 2 },
@@ -267,28 +268,28 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "Option.is_none", .func = &builtinOptionIsNone, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Option.to_result", .func = &builtinOptionToResult, .arity_min = 2, .arity_max = 2 },
 
-    // ── List.filter_map (index 55) ──────────────────────────────────
+    // ── List.filter_map (index 56) ──────────────────────────────────
     .{ .name = "List.filter_map", .func = &builtinListFilterMap, .arity_min = 2, .arity_max = 2 },
 
-    // ── GC (indices 56-57) ──────────────────────────────────────────
+    // ── GC (indices 57-58) ──────────────────────────────────────────
     .{ .name = "gc", .func = &builtinGC, .arity_min = 0, .arity_max = 0 },
     .{ .name = "gc_stats", .func = &builtinGCStats, .arity_min = 0, .arity_max = 0 },
 
-    // ── Stream sources (indices 58-59) ────────────────────────────
+    // ── Stream sources (indices 59-60) ────────────────────────────
     .{ .name = "repeat", .func = &builtinRepeat, .arity_min = 1, .arity_max = 1 },
     .{ .name = "iterate", .func = &builtinIterate, .arity_min = 2, .arity_max = 2 },
 
-    // ── Stream transforms (indices 60-63) ─────────────────────────
+    // ── Stream transforms (indices 61-64) ─────────────────────────
     .{ .name = "map", .func = &builtinMap, .arity_min = 2, .arity_max = 2 },
     .{ .name = "filter", .func = &builtinFilter, .arity_min = 2, .arity_max = 2 },
     .{ .name = "take", .func = &builtinTake, .arity_min = 2, .arity_max = 2 },
     .{ .name = "drop", .func = &builtinDrop, .arity_min = 2, .arity_max = 2 },
 
-    // ── Stream terminals (indices 64-65) ──────────────────────────
+    // ── Stream terminals (indices 65-66) ──────────────────────────
     .{ .name = "collect", .func = &builtinCollect, .arity_min = 1, .arity_max = 1 },
     .{ .name = "count", .func = &builtinCount, .arity_min = 1, .arity_max = 1 },
 
-    // ── Stream transforms continued (indices 66-73) ─────────────
+    // ── Stream transforms continued (indices 67-75) ─────────────
     .{ .name = "flat_map", .func = &builtinFlatMap, .arity_min = 2, .arity_max = 2 },
     .{ .name = "filter_map", .func = &builtinFilterMap, .arity_min = 2, .arity_max = 2 },
     .{ .name = "scan", .func = &builtinScan, .arity_min = 3, .arity_max = 3 },
@@ -297,8 +298,9 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "flatten", .func = &builtinFlatten, .arity_min = 1, .arity_max = 1 },
     .{ .name = "tap", .func = &builtinTap, .arity_min = 2, .arity_max = 2 },
     .{ .name = "batch", .func = &builtinBatch, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "sort_by", .func = &builtinStreamSortBy, .arity_min = 2, .arity_max = 3 },
 
-    // ── Stream terminals continued (indices 74-80) ──────────────
+    // ── Stream terminals continued (indices 76-82) ──────────────
     .{ .name = "sum", .func = &builtinSum, .arity_min = 1, .arity_max = 1 },
     .{ .name = "reduce", .func = &builtinReduce, .arity_min = 3, .arity_max = 3 },
     .{ .name = "first", .func = &builtinFirst, .arity_min = 1, .arity_max = 1 },
@@ -307,22 +309,26 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "min", .func = &builtinMin, .arity_min = 1, .arity_max = 1 },
     .{ .name = "max", .func = &builtinMax, .arity_min = 1, .arity_max = 1 },
 
-    // ── Stream error handling (index 81) ────────────────────────
+    // ── Stream error handling (index 83) ────────────────────────
     .{ .name = "partition_result", .func = &builtinPartitionResult, .arity_min = 1, .arity_max = 1 },
 
-    // ── Json module (indices 82-83) ──────────────────────────────
+    // ── Json module (indices 84-85) ──────────────────────────────
     .{ .name = "Json.decode", .func = &builtinJsonDecode, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Json.encode", .func = &builtinJsonEncode, .arity_min = 1, .arity_max = 1 },
 
-    // ── File I/O (indices 84-85) ────────────────────────────────
+    // ── File I/O (indices 86-87) ────────────────────────────────
     .{ .name = "source", .func = &builtinSource, .arity_min = 1, .arity_max = 2 },
     .{ .name = "sink", .func = &builtinSink, .arity_min = 2, .arity_max = 3 },
 
-    // ── Concurrency stream operators (indices 86-89) ─────────
+    // ── Concurrency stream operators (indices 88-91) ─────────
     .{ .name = "par_map", .func = &builtinParMap, .arity_min = 2, .arity_max = 3 },
     .{ .name = "par_map_unordered", .func = &builtinParMapUnordered, .arity_min = 2, .arity_max = 3 },
     .{ .name = "par_map_result", .func = &builtinParMapResult, .arity_min = 2, .arity_max = 3 },
     .{ .name = "tick", .func = &builtinTick, .arity_min = 1, .arity_max = 1 },
+
+    // ── Rate limiting / buffering (indices 92-93) ───────────
+    .{ .name = "throttle", .func = &builtinThrottle, .arity_min = 3, .arity_max = 3 },
+    .{ .name = "buffer", .func = &builtinBuffer, .arity_min = 2, .arity_max = 2 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -775,6 +781,48 @@ fn builtinListSort(args: []const Value, allocator: Allocator, err_msg: *[]const 
     const new_list = try ObjList.create(allocator);
     try new_list.items.appendSlice(allocator, src.items.items);
     std.mem.sort(Value, new_list.items.items, {}, valueCompare);
+    return Value.fromObj(&new_list.obj);
+}
+
+/// List.sort_by(list, fn) -> List: sort using a key function.
+/// fn(element) -> comparable value. Elements are sorted by the extracted key.
+fn builtinListSortBy(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "List.sort_by expects a list as first argument";
+        return error.RuntimeError;
+    }
+    const src = ObjList.fromObj(args[0].asObj());
+    const key_fn = args[1];
+
+    // Pre-compute keys for each element to avoid calling the closure inside sort.
+    const len = src.items.items.len;
+    const keys = allocator.alloc(Value, len) catch return error.OutOfMemory;
+    defer allocator.free(keys);
+
+    for (src.items.items, 0..) |item, i| {
+        keys[i] = callClosure(key_fn, &[_]Value{item}) catch {
+            err_msg.* = "List.sort_by: key function failed";
+            return error.RuntimeError;
+        };
+    }
+
+    // Build index array and sort by keys (Schwartzian transform).
+    const indices = allocator.alloc(usize, len) catch return error.OutOfMemory;
+    defer allocator.free(indices);
+    for (0..len) |i| indices[i] = i;
+
+    std.mem.sort(usize, indices, keys, struct {
+        fn lessThan(k: []Value, a: usize, b: usize) bool {
+            return valueCompare({}, k[a], k[b]);
+        }
+    }.lessThan);
+
+    // Build result list in sorted order.
+    const new_list = try ObjList.create(allocator);
+    try new_list.items.ensureTotalCapacity(allocator, len);
+    for (indices) |idx| {
+        new_list.items.appendAssumeCapacity(src.items.items[idx]);
+    }
     return Value.fromObj(&new_list.obj);
 }
 
@@ -1911,6 +1959,41 @@ fn builtinBatch(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     return createStream(state, allocator);
 }
 
+/// sort_by(stream, key_fn) -> Stream: collect, sort by key, re-emit as stream.
+/// sort_by(stream, key_fn) or sort_by(stream, key_fn, :desc)
+fn builtinStreamSortBy(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    const descending = if (args.len > 2) blk: {
+        if (atomName(args[2])) |name| {
+            if (std.mem.eql(u8, name, "desc")) break :blk true;
+            if (std.mem.eql(u8, name, "asc")) break :blk false;
+        }
+        err_msg.* = "sort_by() direction must be :asc or :desc";
+        return error.RuntimeError;
+    } else false;
+    return streamSortByImpl(args, allocator, err_msg, descending);
+}
+
+fn streamSortByImpl(args: []const Value, allocator: Allocator, err_msg: *[]const u8, descending: bool) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "sort_by() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    const key_fn = args[1];
+    const state = try allocator.create(StreamState);
+    state.* = .{ .sort_by_op = .{
+        .upstream = first,
+        .key_fn = key_fn,
+        .sorted = null,
+        .idx = 0,
+        .descending = descending,
+    } };
+    return createStream(state, allocator);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // ── Stream terminals (continued) ───────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════
@@ -2436,30 +2519,15 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
         const elem = adtPayload(val, 0);
 
         if (is_jsonl) {
-            // JSON encode each element.
-            if (current_vm) |vm_ptr| {
-                if (track_obj_fn) |tfn| {
-                    json_mod.setVM(vm_ptr, tfn);
+            // JSONL: if the element is a list (e.g. from batch()), flatten it
+            // so each sub-element is written as a separate JSON line.
+            if (elem.isObjType(.list)) {
+                const lst = ObjList.fromObj(elem.asObj());
+                for (lst.items.items) |item| {
+                    try sinkWriteJsonlLine(item, &bw, allocator, err_msg);
                 }
-            }
-            if (current_atom_names) |names| {
-                json_mod.setAtomNames(names);
-            }
-            const emit_result = json_mod.emit(elem, allocator);
-            json_mod.clearVM();
-            switch (emit_result) {
-                .ok => |json_bytes| {
-                    bw.interface.writeAll(json_bytes) catch {
-                        allocator.free(json_bytes);
-                        err_msg.* = "failed to write to file";
-                        return error.RuntimeError;
-                    };
-                    allocator.free(json_bytes);
-                },
-                .err => |msg| {
-                    err_msg.* = msg;
-                    return error.RuntimeError;
-                },
+            } else {
+                try sinkWriteJsonlLine(elem, &bw, allocator, err_msg);
             }
         } else {
             // Plain text: format as string, write as line.
@@ -2472,13 +2540,11 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
                 err_msg.* = "failed to write to file";
                 return error.RuntimeError;
             };
+            bw.interface.writeByte('\n') catch {
+                err_msg.* = "failed to write newline to file";
+                return error.RuntimeError;
+            };
         }
-
-        // Write newline after each element.
-        bw.interface.writeByte('\n') catch {
-            err_msg.* = "failed to write newline to file";
-            return error.RuntimeError;
-        };
     }
 
     // CRITICAL: flush buffered writer before closing.
@@ -2488,6 +2554,43 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     };
 
     return Value.nil;
+}
+
+/// Write a single value as one JSONL line (JSON + newline).
+fn sinkWriteJsonlLine(
+    value: Value,
+    bw: anytype,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!void {
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |tfn| {
+            json_mod.setVM(vm_ptr, tfn);
+        }
+    }
+    if (current_atom_names) |names| {
+        json_mod.setAtomNames(names);
+    }
+    const emit_result = json_mod.emit(value, allocator);
+    json_mod.clearVM();
+    switch (emit_result) {
+        .ok => |json_bytes| {
+            bw.interface.writeAll(json_bytes) catch {
+                allocator.free(json_bytes);
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
+            allocator.free(json_bytes);
+        },
+        .err => |msg| {
+            err_msg.* = msg;
+            return error.RuntimeError;
+        },
+    }
+    bw.interface.writeByte('\n') catch {
+        err_msg.* = "failed to write newline to file";
+        return error.RuntimeError;
+    };
 }
 
 // ── Concurrency stream operators ─────────────────────────────────────
@@ -2651,6 +2754,82 @@ fn builtinTick(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
         .interval_ms = interval_ms,
         .counter = 0,
         .last_emit = 0,
+    } };
+    return createStream(state, allocator);
+}
+
+/// throttle(stream, rate, time_unit) -> Stream
+/// Rate-limits the stream using token bucket algorithm.
+/// time_unit: :per_second, :per_minute, :per_hour
+fn builtinThrottle(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "throttle() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    // Parse rate (int or float).
+    var rate: f64 = undefined;
+    if (args[1].isInt()) {
+        rate = @floatFromInt(args[1].asInt());
+    } else if (args[1].isFloat()) {
+        rate = args[1].asFloat();
+    } else {
+        err_msg.* = "throttle() rate must be a number";
+        return error.RuntimeError;
+    }
+    if (rate <= 0) {
+        err_msg.* = "throttle() rate must be positive";
+        return error.RuntimeError;
+    }
+    // Parse time unit atom.
+    const interval_ms: f64 = if (atomName(args[2])) |name| blk: {
+        if (std.mem.eql(u8, name, "per_second")) break :blk 1000.0;
+        if (std.mem.eql(u8, name, "per_minute")) break :blk 60000.0;
+        if (std.mem.eql(u8, name, "per_hour")) break :blk 3600000.0;
+        err_msg.* = "throttle() time unit must be :per_second, :per_minute, or :per_hour";
+        return error.RuntimeError;
+    } else {
+        err_msg.* = "throttle() third argument must be a time unit atom";
+        return error.RuntimeError;
+    };
+    const state = try allocator.create(StreamState);
+    state.* = .{ .throttle_op = .{
+        .upstream = first,
+        .rate = rate,
+        .interval_ms = interval_ms,
+        .tokens = rate,
+        .last_refill = 0,
+        .started = false,
+    } };
+    return createStream(state, allocator);
+}
+
+/// buffer(stream, capacity) -> Stream
+/// Prefetch buffer that reads ahead from upstream.
+fn builtinBuffer(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "buffer() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isInt() or args[1].asInt() <= 0) {
+        err_msg.* = "buffer() capacity must be a positive integer";
+        return error.RuntimeError;
+    }
+    const capacity: u32 = @intCast(args[1].asInt());
+    const state = try allocator.create(StreamState);
+    state.* = .{ .buffer_op = .{
+        .upstream = first,
+        .capacity = capacity,
+        .buf = .{},
+        .read_idx = 0,
+        .exhausted = false,
     } };
     return createStream(state, allocator);
 }

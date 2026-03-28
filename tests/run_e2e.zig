@@ -73,6 +73,9 @@ const normal_tests = [_]TestCase{
     .{ .name = "fiber_closures", .zen_path = "tests/zen/fiber_closures.zen", .expected_path = "tests/zen/fiber_closures.expected", .is_error_test = false },
     .{ .name = "select", .zen_path = "tests/zen/select.zen", .expected_path = "tests/zen/select.expected", .is_error_test = false },
     .{ .name = "par_map", .zen_path = "tests/zen/par_map.zen", .expected_path = "tests/zen/par_map.expected", .is_error_test = false },
+    // Stream operators: buffer and throttle
+    .{ .name = "buffer", .zen_path = "tests/zen/buffer.zen", .expected_path = "tests/zen/buffer.expected", .is_error_test = false },
+    .{ .name = "throttle", .zen_path = "tests/zen/throttle.zen", .expected_path = "tests/zen/throttle.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{

@@ -48,10 +48,13 @@ pub const StreamState = union(enum) {
     file_reader: FileReaderOp,
     jsonl_reader: JsonlReaderOp,
     stdin_reader: StdinReaderOp,
+    sort_by_op: SortByOp,
     par_map: ParMapOp,
     par_map_unordered: ParMapUnorderedOp,
     par_map_result: ParMapResultOp,
     tick: TickOp,
+    throttle_op: ThrottleOp,
+    buffer_op: BufferOp,
 
     pub const RangeIter = struct {
         current: i32,
@@ -133,6 +136,14 @@ pub const StreamState = union(enum) {
         upstream: Value, // NaN-boxed ObjStream pointer
         size: i32,
         exhausted: bool,
+    };
+
+    pub const SortByOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+        key_fn: Value,
+        sorted: ?*ObjList, // null until first next() call
+        idx: usize,
+        descending: bool,
     };
 
     pub const PartitionOp = struct {
@@ -314,6 +325,25 @@ pub const StreamState = union(enum) {
         interval_ms: u64,
         counter: u64,
         last_emit: i64, // timestamp of last emission (std.time.milliTimestamp)
+    };
+
+    /// Throttle: token-bucket rate limiter.
+    pub const ThrottleOp = struct {
+        upstream: Value,
+        rate: f64,
+        interval_ms: f64,
+        tokens: f64,
+        last_refill: i64,
+        started: bool,
+    };
+
+    /// Buffer: prefetch buffer that reads ahead from upstream.
+    pub const BufferOp = struct {
+        upstream: Value,
+        capacity: u32,
+        buf: std.ArrayListUnmanaged(Value),
+        read_idx: usize,
+        exhausted: bool,
     };
 
     /// Pull the next element from this stream.
@@ -564,6 +594,59 @@ pub const StreamState = union(enum) {
                 }
                 if (batch_list.items.items.len == 0) return makeNone(allocator);
                 return makeSome(Value.fromObj(&batch_list.obj), allocator);
+            },
+            .sort_by_op => |*s| {
+                // On first call, collect all upstream, compute keys, sort.
+                if (s.sorted == null) {
+                    const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                    // Collect all elements.
+                    var elems = std.ArrayListUnmanaged(Value){};
+                    while (true) {
+                        const upstream_val = try upstream_stream.state.next(allocator);
+                        if (isNone(upstream_val)) break;
+                        try elems.append(allocator, adtPayload(upstream_val, 0));
+                    }
+                    const len = elems.items.len;
+                    // Compute keys via key_fn.
+                    const keys = try allocator.alloc(Value, len);
+                    for (elems.items, 0..) |item, i| {
+                        keys[i] = try callClosure(s.key_fn, &[_]Value{item});
+                    }
+                    // Build index array and sort by keys (Schwartzian transform).
+                    const indices = try allocator.alloc(usize, len);
+                    for (0..len) |i| indices[i] = i;
+                    std.mem.sort(usize, indices, keys, struct {
+                        fn lessThan(k: []Value, a: usize, b: usize) bool {
+                            return valueLessThan(k[a], k[b]);
+                        }
+                    }.lessThan);
+                    // Build sorted list (reverse indices if descending).
+                    const sorted_list = try ObjList.create(allocator);
+                    trackObj(&sorted_list.obj);
+                    try sorted_list.items.ensureTotalCapacity(allocator, len);
+                    if (s.descending) {
+                        var ri: usize = len;
+                        while (ri > 0) {
+                            ri -= 1;
+                            sorted_list.items.appendAssumeCapacity(elems.items[indices[ri]]);
+                        }
+                    } else {
+                        for (indices) |idx| {
+                            sorted_list.items.appendAssumeCapacity(elems.items[idx]);
+                        }
+                    }
+                    allocator.free(keys);
+                    allocator.free(indices);
+                    elems.deinit(allocator);
+                    s.sorted = sorted_list;
+                    s.idx = 0;
+                }
+                // Emit one element at a time.
+                const lst = s.sorted.?;
+                if (s.idx >= lst.items.items.len) return makeNone(allocator);
+                const val = lst.items.items[s.idx];
+                s.idx += 1;
+                return makeSome(val, allocator);
             },
             .partition_ok => |s| {
                 return partitionNext(s.shared, true, allocator);
@@ -912,6 +995,73 @@ pub const StreamState = union(enum) {
                 s.next_emit = 1;
                 return makeSome(s.result_buf.?[0], allocator);
             },
+            .throttle_op => |*s| {
+                if (!s.started) {
+                    s.started = true;
+                    s.last_refill = std.time.milliTimestamp();
+                    s.tokens = s.rate; // full burst capacity
+                }
+                // Refill tokens based on elapsed time.
+                const now = std.time.milliTimestamp();
+                const elapsed_ms: f64 = @floatFromInt(@max(0, now - s.last_refill));
+                s.tokens = @min(s.rate, s.tokens + elapsed_ms * s.rate / s.interval_ms);
+                s.last_refill = now;
+
+                // Wait if no tokens available.
+                if (s.tokens < 1.0) {
+                    const wait_ms: u64 = @intFromFloat(@ceil((1.0 - s.tokens) * s.interval_ms / s.rate));
+                    std.Thread.sleep(wait_ms * std.time.ns_per_ms);
+                    s.tokens = 0.0;
+                    s.last_refill = std.time.milliTimestamp();
+                } else {
+                    s.tokens -= 1.0;
+                }
+
+                // Pull from upstream.
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                return upstream_stream.state.next(allocator);
+            },
+            .buffer_op => |*s| {
+                // If buffer has items, return next one.
+                if (s.read_idx < s.buf.items.len) {
+                    const val = s.buf.items[s.read_idx];
+                    s.read_idx += 1;
+                    // If we've consumed the whole buffer, reset for reuse.
+                    if (s.read_idx >= s.buf.items.len) {
+                        s.buf.clearRetainingCapacity();
+                        s.read_idx = 0;
+                    }
+                    return makeSome(val, allocator);
+                }
+
+                // Buffer empty. If upstream exhausted, we're done.
+                if (s.exhausted) return makeNone(allocator);
+
+                // Refill buffer from upstream (up to capacity items).
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                var count: u32 = 0;
+                while (count < s.capacity) : (count += 1) {
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) {
+                        s.exhausted = true;
+                        break;
+                    }
+                    const elem = adtPayload(upstream_val, 0);
+                    try s.buf.append(allocator, elem);
+                }
+
+                // If nothing was fetched, upstream was already empty.
+                if (s.buf.items.len == 0) return makeNone(allocator);
+
+                // Return first item from newly filled buffer.
+                const val = s.buf.items[0];
+                s.read_idx = 1;
+                if (s.read_idx >= s.buf.items.len) {
+                    s.buf.clearRetainingCapacity();
+                    s.read_idx = 0;
+                }
+                return makeSome(val, allocator);
+            },
             .tick => |*s| {
                 // Generate incrementing integers at regular intervals.
                 const now = std.time.milliTimestamp();
@@ -997,6 +1147,10 @@ pub const StreamState = union(enum) {
                 }
             },
             .tick => {},
+            .throttle_op => {},
+            .buffer_op => |*s| {
+                s.buf.deinit(allocator);
+            },
             else => {},
         }
     }
@@ -1060,6 +1214,15 @@ pub const StreamState = union(enum) {
             .batch_op => |*s| {
                 try nursery.processValue(&s.upstream, gc);
             },
+            .sort_by_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                try nursery.processValue(&s.key_fn, gc);
+                if (s.sorted) |lst| {
+                    for (lst.items.items) |*v| {
+                        try nursery.processValue(v, gc);
+                    }
+                }
+            },
             .partition_ok, .partition_err => |*s| {
                 try nursery.processValue(&s.shared.upstream, gc);
                 for (s.shared.ok_queue.items) |*v| {
@@ -1118,6 +1281,15 @@ pub const StreamState = union(enum) {
                 }
             },
             .tick => {},
+            .throttle_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+            },
+            .buffer_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+                for (s.buf.items) |*v| {
+                    try nursery.processValue(v, gc);
+                }
+            },
         }
     }
 
@@ -1179,6 +1351,15 @@ pub const StreamState = union(enum) {
             .batch_op => |*s| {
                 try oldgen.processValue(&s.upstream, gc);
             },
+            .sort_by_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                try oldgen.processValue(&s.key_fn, gc);
+                if (s.sorted) |lst| {
+                    for (lst.items.items) |*v| {
+                        try oldgen.processValue(v, gc);
+                    }
+                }
+            },
             .partition_ok, .partition_err => |*s| {
                 try oldgen.processValue(&s.shared.upstream, gc);
                 for (s.shared.ok_queue.items) |*v| {
@@ -1237,6 +1418,15 @@ pub const StreamState = union(enum) {
                 }
             },
             .tick => {},
+            .throttle_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+            },
+            .buffer_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+                for (s.buf.items) |*v| {
+                    try oldgen.processValue(v, gc);
+                }
+            },
         }
     }
 };
@@ -1411,6 +1601,20 @@ fn callClosure(closure_val: Value, args: []const Value) NativeError!Value {
     const vm_ptr = current_vm orelse return error.RuntimeError;
     const fn_ptr = call_closure_fn orelse return error.RuntimeError;
     return fn_ptr(vm_ptr, closure_val, args) orelse return error.RuntimeError;
+}
+
+/// Compare two Values: returns true if a < b.
+fn valueLessThan(a: Value, b: Value) bool {
+    if (a.isInt() and b.isInt()) return a.asInt() < b.asInt();
+    if (a.isFloat() and b.isFloat()) return a.asFloat() < b.asFloat();
+    if (a.isInt() and b.isFloat()) return @as(f64, @floatFromInt(a.asInt())) < b.asFloat();
+    if (a.isFloat() and b.isInt()) return a.asFloat() < @as(f64, @floatFromInt(b.asInt()));
+    if (a.isString() and b.isString()) {
+        const sa = ObjString.fromObj(a.asObj()).bytes;
+        const sb = ObjString.fromObj(b.asObj()).bytes;
+        return std.mem.order(u8, sa, sb) == .lt;
+    }
+    return a.bits < b.bits;
 }
 
 // ── ADT Helper Functions ──────────────────────────────────────────────

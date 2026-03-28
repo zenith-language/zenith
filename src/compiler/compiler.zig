@@ -156,48 +156,50 @@ pub const Compiler = struct {
         // Core (0-7)
         "print",     "str",         "len",              "type_of",
         "assert",    "panic",       "range",            "show",
-        // List (8-19)
+        // List (8-20)
         "List.get",  "List.set",    "List.append",      "List.length",
         "List.map",  "List.filter", "List.reduce",      "List.sort",
-        "List.reverse", "List.zip", "List.flatten",     "List.contains",
-        // Map (20-27)
+        "List.sort_by", "List.reverse", "List.zip", "List.flatten", "List.contains",
+        // Map (21-28)
         "Map.get",   "Map.set",     "Map.delete",       "Map.keys",
         "Map.values", "Map.merge",  "Map.contains",     "Map.length",
-        // Tuple (28-29)
+        // Tuple (29-30)
         "Tuple.get", "Tuple.length",
-        // String (30-39)
+        // String (31-40)
         "String.split", "String.trim", "String.join",   "String.contains",
         "String.replace", "String.starts_with", "String.ends_with", "String.to_lower",
         "String.to_upper", "String.length",
-        // Result (40-47)
+        // Result (41-48)
         "Result.Ok", "Result.Err",  "Result.map_ok",    "Result.map_err",
         "Result.then", "Result.unwrap_or", "Result.is_ok", "Result.is_err",
-        // Option (48-54)
+        // Option (49-55)
         "Option.Some", "Option.None", "Option.map",     "Option.unwrap_or",
         "Option.is_some", "Option.is_none", "Option.to_result",
-        // List.filter_map (55)
+        // List.filter_map (56)
         "List.filter_map",
-        // GC (56-57)
+        // GC (57-58)
         "gc", "gc_stats",
-        // Stream sources (58-59)
+        // Stream sources (59-60)
         "repeat", "iterate",
-        // Stream transforms (60-63)
+        // Stream transforms (61-64)
         "map", "filter", "take", "drop",
-        // Stream terminals (64-65)
+        // Stream terminals (65-66)
         "collect", "count",
-        // Stream transforms continued (66-73)
+        // Stream transforms continued (67-75)
         "flat_map", "filter_map", "scan", "distinct",
-        "zip", "flatten", "tap", "batch",
-        // Stream terminals continued (74-80)
+        "zip", "flatten", "tap", "batch", "sort_by",
+        // Stream terminals continued (76-82)
         "sum", "reduce", "first", "last", "each", "min", "max",
-        // Stream error handling (81)
+        // Stream error handling (83)
         "partition_result",
-        // Json module (82-83)
+        // Json module (84-85)
         "Json.decode", "Json.encode",
-        // File I/O (84-85)
+        // File I/O (86-87)
         "source", "sink",
-        // Concurrency stream operators (86-89)
+        // Concurrency stream operators (88-91)
         "par_map", "par_map_unordered", "par_map_result", "tick",
+        // Rate limiting / buffering (92-93)
+        "throttle", "buffer",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-14 to match

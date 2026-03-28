@@ -1,0 +1,11 @@
+-- Basic buffer
+print(range(1, 6) |> buffer(10) |> collect())
+
+-- Buffer smaller than stream (multiple refills)
+print(range(1, 11) |> buffer(3) |> collect())
+
+-- Buffer with downstream operators
+print(range(1, 6) |> buffer(3) |> map(|x| x * 2) |> collect())
+
+-- Buffer with filter
+print(range(1, 11) |> buffer(5) |> filter(|x| x % 2 == 0) |> collect())
