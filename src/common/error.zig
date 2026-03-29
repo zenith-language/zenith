@@ -214,8 +214,6 @@ pub const DiagnosticList = struct {
     }
 };
 
-// ── Utility functions ──────────────────────────────────────────────────
-
 const LineCol = struct {
     line: u32,
     col: u32,
@@ -291,8 +289,6 @@ fn caretWidth(source: []const u8, span: Span, loc: LineCol) u32 {
     const width = end - span.start;
     return if (width == 0) 1 else @intCast(width);
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "ErrorCode.code formats correctly" {
     try std.testing.expectEqualStrings("E001", &ErrorCode.E001.code());

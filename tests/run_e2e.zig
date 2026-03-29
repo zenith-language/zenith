@@ -62,10 +62,12 @@ const normal_tests = [_]TestCase{
     .{ .name = "streams_partition", .zen_path = "tests/zen/streams_partition.zen", .expected_path = "tests/zen/streams_partition.expected", .is_error_test = false },
     .{ .name = "json", .zen_path = "tests/zen/json.zen", .expected_path = "tests/zen/json.expected", .is_error_test = false },
     .{ .name = "file_io", .zen_path = "tests/zen/file_io.zen", .expected_path = "tests/zen/file_io.expected", .is_error_test = false },
-    // Phase 5 comprehensive e2e tests
+    // Phase 5 e2e tests
     .{ .name = "streams", .zen_path = "tests/zen/streams.zen", .expected_path = "tests/zen/streams.expected", .is_error_test = false },
     .{ .name = "streams_lazy", .zen_path = "tests/zen/streams_lazy.zen", .expected_path = "tests/zen/streams_lazy.expected", .is_error_test = false },
     .{ .name = "jsonl", .zen_path = "tests/zen/jsonl.zen", .expected_path = "tests/zen/jsonl.expected", .is_error_test = false },
+    .{ .name = "json_source", .zen_path = "tests/zen/json_source.zen", .expected_path = "tests/zen/json_source.expected", .is_error_test = false },
+    .{ .name = "sugar", .zen_path = "tests/zen/sugar.zen", .expected_path = "tests/zen/sugar.expected", .is_error_test = false },
     // Phase 7 tests
     .{ .name = "fibers", .zen_path = "tests/zen/fibers.zen", .expected_path = "tests/zen/fibers.expected", .is_error_test = false },
     .{ .name = "fibers_error", .zen_path = "tests/zen/fibers_error.zen", .expected_path = "tests/zen/fibers_error.expected", .is_error_test = false },
@@ -487,30 +489,34 @@ test "e2e: jsonl" {
     try runNormalTest(normal_tests[31]);
 }
 
-// ── Phase 7 normal tests ──────────────────────────────────────────────────
-
-test "e2e: fibers" {
-    try runNormalTest(normal_tests[32]);
-}
-
-test "e2e: fibers_error" {
+test "e2e: sugar" {
     try runNormalTest(normal_tests[33]);
 }
 
-test "e2e: channels" {
+// ── Phase 7 normal tests ──────────────────────────────────────────────────
+
+test "e2e: fibers" {
     try runNormalTest(normal_tests[34]);
 }
 
-test "e2e: fiber_closures" {
+test "e2e: fibers_error" {
     try runNormalTest(normal_tests[35]);
 }
 
-test "e2e: select" {
+test "e2e: channels" {
     try runNormalTest(normal_tests[36]);
 }
 
-test "e2e: par_map" {
+test "e2e: fiber_closures" {
     try runNormalTest(normal_tests[37]);
+}
+
+test "e2e: select" {
+    try runNormalTest(normal_tests[38]);
+}
+
+test "e2e: par_map" {
+    try runNormalTest(normal_tests[39]);
 }
 
 // ── Phase 3 error tests ──────────────────────────────────────────────────

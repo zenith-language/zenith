@@ -1,0 +1,10 @@
+{"type":"purchase","user_id":"u001","total":49.99}
+{"type":"page_view","user_id":"u002","url":"/products"}
+{"type":"purchase","user_id":"u003","total":120.00}
+not valid json
+{"type":"signup","user_id":"u004","email":"alice@example.com"}
+{"type":"purchase","user_id":"u005","total":9.95}
+{"type":"page_view","user_id":"u001","url":"/checkout"}
+{broken: json, missing quotes}
+{"type":"purchase","user_id":"u002","total":74.50}
+{"type":"purchase","user_id":"u006","total":200.00}

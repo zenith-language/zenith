@@ -1,0 +1,80 @@
+-- SUGAR-01: .field shorthand accessor
+let people = [{name: "alice", age: 30}, {name: "bob", age: 25}]
+print(List.map(people, .name))
+print(people |> List.map(.age))
+
+-- SUGAR-02: ?. optional chaining
+let r = {a: {b: {c: 42}}}
+print(r?.a?.b?.c)
+print(r?.a?.missing?.c)
+print(nil?.anything)
+
+-- SUGAR-03: method dispatch on lists
+let xs = [3, 1, 2]
+print(xs.map(|x| x * 10))
+print(xs.filter(|x| x > 1))
+print(xs.reduce(0, |a, b| a + b))
+print(xs.contains(2))
+
+-- SUGAR-04: method dispatch with .field shorthand
+let items = [{val: 10}, {val: 20}, {val: 30}]
+print(items.map(.val))
+
+-- SUGAR-05: standalone unwrap
+print(unwrap(Result.Ok(42)))
+print(unwrap(Option.Some("hello")))
+
+-- SUGAR-06: standalone unwrap_or (Result and Option)
+print(unwrap_or(Result.Ok(1), 0))
+print(unwrap_or(Result.Err("x"), 0))
+print(unwrap_or(Option.Some(1), 0))
+print(unwrap_or(Option.None, 0))
+
+-- SUGAR-07: avg function
+print(avg([10, 20, 30]))
+print(avg([]))
+print([10, 20, 30].avg() |> unwrap_or(0))
+
+-- SUGAR-08: filter_map with ?. (nil-as-skip)
+let data = [{x: 1}, {x: nil}, {x: 3}]
+let vals = data |> filter_map(|d| d.x) |> collect()
+print(vals)
+
+-- SUGAR-09: collect() on list is no-op
+print(collect([1, 2, 3]))
+
+-- SUGAR-10: full pipeline pattern
+let schema = {examples: [{desc: "a", value: {output: {msgs: [{speed: 10}]}}}, {desc: "b", value: nil}, {desc: "c", value: {output: {msgs: [{speed: 30}]}}}]}
+let descs = schema.examples.map(.desc)
+let speeds = schema.examples
+  |> filter_map(|ex| ex.value?.output?.msgs)
+  |> flatten()
+  |> map(.speed)
+  |> collect()
+print(descs)
+print(speeds)
+print(speeds.avg() |> unwrap_or(0))
+
+-- SUGAR-11: basic tee
+let t1 = [1, 2, 3] |> tee {
+  doubled: map(|x| x * 2) |> collect(),
+  total: reduce(0, |a, b| a + b)
+}
+print(t1)
+
+-- SUGAR-12: tee with field accessor and filter_map
+let t2 = [{name: "a", val: 1}, {name: "b", val: nil}, {name: "c", val: 3}]
+  |> tee {
+    names: map(.name) |> collect(),
+    vals: filter_map(|x| x.val) |> collect()
+  }
+print(t2)
+
+-- SUGAR-13: tee + record spread + avg
+let t3 = [10, 20, 30]
+  |> tee {
+    items: collect(),
+    average: avg() |> unwrap_or(0)
+  }
+  |> |r| {..r, count: len(r.items)}
+print(t3)

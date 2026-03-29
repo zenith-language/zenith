@@ -185,21 +185,26 @@ pub const Compiler = struct {
         "map", "filter", "take", "drop",
         // Stream terminals (65-66)
         "collect", "count",
-        // Stream transforms continued (67-75)
-        "flat_map", "filter_map", "scan", "distinct",
+        // Stream transforms continued (67-77)
+        "flat_map", "filter_map", "filter_ok", "filter_err",
+        "scan", "distinct",
         "zip", "flatten", "tap", "batch", "sort_by",
-        // Stream terminals continued (76-82)
+        // Stream terminals continued (78-84)
         "sum", "reduce", "first", "last", "each", "min", "max",
-        // Stream error handling (83)
+        // Stream error handling (85)
         "partition_result",
-        // Json module (84-85)
+        // Json module (86-87)
         "Json.decode", "Json.encode",
-        // File I/O (86-87)
+        // File I/O (88-89)
         "source", "sink",
-        // Concurrency stream operators (88-91)
+        // Concurrency stream operators (90-93)
         "par_map", "par_map_unordered", "par_map_result", "tick",
-        // Rate limiting / buffering (92-93)
+        // Rate limiting / buffering (94-95)
         "throttle", "buffer",
+        // Result-aware combinators (96-98)
+        "single", "ok_or", "tap_err",
+        // Standalone Result/Option helpers (99-101)
+        "unwrap", "unwrap_or", "avg",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-14 to match
@@ -388,8 +393,6 @@ pub const Compiler = struct {
         return &self.function.chunk;
     }
 
-    // ── Statement compilation ─────────────────────────────────────────
-
     fn compileStatements(self: *Self, stmts: []const u32) Error!void {
         for (stmts, 0..) |stmt_idx, i| {
             try self.compileNode(stmt_idx);
@@ -479,6 +482,9 @@ pub const Compiler = struct {
             .record_literal => try self.compileRecordLiteral(node_data, node_idx),
             .record_spread => try self.compileRecordSpread(node_data, node_idx),
             .field_access => try self.compileFieldAccess(node_data, node_idx),
+            .field_accessor => try self.compileFieldAccessor(node_data, node_idx),
+            .safe_field_access => try self.compileSafeFieldAccess(node_data, node_idx),
+            .tee_expr => try self.compileTeeExpr(node_data, node_idx),
 
             // Phase 3 ADT type declarations.
             .type_decl => try self.compileTypeDecl(node_data, node_idx),
@@ -511,8 +517,6 @@ pub const Compiler = struct {
             .root => {}, // handled above
         }
     }
-
-    // ── Function declaration compilation ──────────────────────────────
 
     fn compileFnDecl(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         const extra_idx = node_data.lhs;
@@ -632,8 +636,6 @@ pub const Compiler = struct {
         }
     }
 
-    // ── Lambda expression compilation ─────────────────────────────────
-
     fn compileLambdaExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         const extra_idx = node_data.lhs;
         const ed = self.ast.extra_data.items;
@@ -716,8 +718,6 @@ pub const Compiler = struct {
         // Lambda is an expression -- closure value is left on the stack.
     }
 
-    // ── Pipe expression compilation ───────────────────────────────────
-
     fn compilePipeExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         const lhs = node_data.lhs; // value being piped
         const rhs = node_data.rhs; // function or call_expr
@@ -773,8 +773,6 @@ pub const Compiler = struct {
         }
     }
 
-    // ── Return expression compilation ─────────────────────────────────
-
     fn compileReturnExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         if (self.fn_type == .script) {
             try self.emitError(node_idx, .E005, "'return' outside of function");
@@ -827,8 +825,6 @@ pub const Compiler = struct {
             try self.compileNode(node_idx);
         }
     }
-
-    // ── Literal compilation ───────────────────────────────────────────
 
     fn compileIntLiteral(self: *Self, node_idx: u32) Error!void {
         const main_tokens = self.ast.nodes.items(.main_token);
@@ -892,8 +888,6 @@ pub const Compiler = struct {
         const atom_id = gop.value_ptr.*;
         try self.emitConstant(Value.fromAtom(atom_id), self.getLine(node_idx));
     }
-
-    // ── Identifier resolution ─────────────────────────────────────────
 
     fn compileIdentifier(self: *Self, node_idx: u32) Error!void {
         const main_tokens = self.ast.nodes.items(.main_token);
@@ -981,8 +975,6 @@ pub const Compiler = struct {
         }
         return null;
     }
-
-    // ── Collection literal compilation (Phase 3) ──────────────────────
 
     /// Known module names for compile-time dot access resolution.
     const module_names = [_][]const u8{
@@ -1202,6 +1194,248 @@ pub const Compiler = struct {
         try self.emitByte(@intCast(const_idx & 0xFF), line);
     }
 
+    /// Compile `.field` shorthand: generates a closure `|x| x.field`.
+    fn compileFieldAccessor(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const field_tok = node_data.lhs;
+        const field_name = self.ast.tokenSlice(field_tok);
+        const line = self.getLine(node_idx);
+
+        // Create an ObjFunction for the synthetic closure (arity 1).
+        const func = try ObjFunction.create(self.allocator);
+        func.name = null;
+        func.arity = 1;
+        func.arity_max = 1;
+
+        // Create child compiler.
+        var child = Self{
+            .function = func,
+            .fn_type = .lambda,
+            .ast = self.ast,
+            .locals = undefined,
+            .local_count = 0,
+            .scope_depth = 0,
+            .upvalues = undefined,
+            .parent = self,
+            .is_tail_position = false,
+            .atom_table = self.atom_table,
+            .atom_count = self.atom_count,
+            .errors = self.errors,
+            .allocator = self.allocator,
+            .adt_types = self.adt_types,
+            .pending_adt_construct = null,
+            .repl_mode = false,
+        };
+
+        // Slot 0 = function itself, slot 1 = parameter.
+        child.locals[0] = .{ .name = "", .depth = 0, .is_captured = false };
+        child.locals[1] = .{ .name = "x", .depth = 1, .is_captured = false };
+        child.local_count = 2;
+        child.scope_depth = 1;
+
+        // Body: load param (slot 1), get field, return.
+        try child.emitOp(.op_get_local, line);
+        try child.emitByte(1, line);
+        const str_obj = try ObjString.create(self.allocator, field_name, null);
+        const const_idx = try child.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+        try child.emitOp(.op_get_field, line);
+        try child.emitByte(@intCast((const_idx >> 8) & 0xFF), line);
+        try child.emitByte(@intCast(const_idx & 0xFF), line);
+        try child.emitOp(.op_return, line);
+
+        // Copy state back.
+        self.atom_table = child.atom_table;
+        self.atom_count = child.atom_count;
+        self.errors = child.errors;
+        self.adt_types = child.adt_types;
+
+        // In parent: emit op_closure.
+        const closure_const = try self.currentChunk().addConstant(Value.fromObj(&func.obj), self.allocator);
+        try self.emitOp(.op_closure, line);
+        try self.emitByte(@intCast(closure_const), line);
+        // No upvalues for field accessor.
+    }
+
+    /// Compile `expr?.field`: safe field access — returns nil for nil, non-record/map types.
+    fn compileSafeFieldAccess(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        try self.compileNode(node_data.lhs);
+        const line = self.getLine(node_idx);
+
+        const field_tok = node_data.rhs;
+        const field_name = self.ast.tokenSlice(field_tok);
+        const str_obj = try ObjString.create(self.allocator, field_name, null);
+        const const_idx = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+        try self.emitOp(.op_safe_get_field, line);
+        try self.emitByte(@intCast((const_idx >> 8) & 0xFF), line);
+        try self.emitByte(@intCast(const_idx & 0xFF), line);
+    }
+
+    /// Compile `tee { name: expr, ... }` — generates a closure that runs each
+    /// branch with the input piped in and returns a record of results.
+    fn compileTeeExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
+        const extra_start = node_data.lhs;
+        const extra_end = node_data.rhs;
+        const pairs = self.ast.extra_data.items[extra_start..extra_end];
+        const branch_count = pairs.len / 2;
+        const line = self.getLine(node_idx);
+
+        // Create an ObjFunction for the tee closure (arity 1: the input).
+        const func = try ObjFunction.create(self.allocator);
+        func.name = null;
+        func.arity = 1;
+        func.arity_max = 1;
+
+        var child = Self{
+            .function = func,
+            .fn_type = .lambda,
+            .ast = self.ast,
+            .locals = undefined,
+            .local_count = 0,
+            .scope_depth = 0,
+            .upvalues = undefined,
+            .parent = self,
+            .is_tail_position = false,
+            .atom_table = self.atom_table,
+            .atom_count = self.atom_count,
+            .errors = self.errors,
+            .allocator = self.allocator,
+            .adt_types = self.adt_types,
+            .pending_adt_construct = null,
+            .repl_mode = false,
+        };
+
+        // Slot 0 = closure itself, slot 1 = input parameter.
+        child.locals[0] = .{ .name = "", .depth = 0, .is_captured = false };
+        child.locals[1] = .{ .name = "_tee_input", .depth = 1, .is_captured = false };
+        child.local_count = 2;
+        child.scope_depth = 1;
+
+        // Compile each branch: inject input and leave result on stack.
+        var i: usize = 0;
+        while (i < pairs.len) : (i += 2) {
+            const branch_expr = pairs[i + 1];
+            try child.compileTeebranchWithInput(branch_expr, 1, line);
+        }
+
+        // Emit op_record to build the result record from branch values.
+        const field_count: u16 = @intCast(branch_count);
+        try child.emitOp(.op_record, line);
+        try child.emitByte(@intCast((field_count >> 8) & 0xFF), line);
+        try child.emitByte(@intCast(field_count & 0xFF), line);
+        // Emit field name constant indices.
+        i = 0;
+        while (i < pairs.len) : (i += 2) {
+            const name_tok = pairs[i];
+            const field_name = self.ast.tokenSlice(name_tok);
+            const str_obj = try ObjString.create(self.allocator, field_name, null);
+            const name_const = try child.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+            try child.emitByte(@intCast((name_const >> 8) & 0xFF), line);
+            try child.emitByte(@intCast(name_const & 0xFF), line);
+        }
+        try child.emitOp(.op_return, line);
+
+        // Copy state back from child.
+        self.atom_table = child.atom_table;
+        self.atom_count = child.atom_count;
+        self.errors = child.errors;
+        self.adt_types = child.adt_types;
+
+        // In parent: emit op_closure.
+        const closure_const = try self.currentChunk().addConstant(Value.fromObj(&func.obj), self.allocator);
+        try self.emitOp(.op_closure, line);
+        try self.emitByte(@intCast(closure_const), line);
+        // Emit upvalue descriptors.
+        var uv: u8 = 0;
+        while (uv < func.upvalue_count) : (uv += 1) {
+            try self.emitByte(if (child.upvalues[uv].is_local) 1 else 0, line);
+            try self.emitByte(child.upvalues[uv].index, line);
+        }
+    }
+
+    /// Compile a tee branch expression, injecting input (at `slot`) at the leftmost
+    /// position of the pipe chain. Mirrors compilePipeExpr but uses op_get_local
+    /// instead of compiling an AST node for the pipe source.
+    fn compileTeebranchWithInput(self: *Self, expr: u32, slot: u8, line: u32) Error!void {
+        const tag = self.ast.nodes.items(.tag)[expr];
+
+        if (tag == .pipe_expr) {
+            // expr is (LHS |> RHS). We need (input |> LHS) |> RHS.
+            const data = self.ast.nodes.items(.data)[expr];
+            const rhs = data.rhs;
+            const rhs_tag = self.ast.nodes.items(.tag)[rhs];
+
+            if (rhs_tag == .call_expr) {
+                // RHS is f(args): compile as f((input |> LHS), args)
+                const call_data = self.ast.nodes.items(.data)[rhs];
+                // Check for method dispatch on the RHS callee.
+                const callee_tag = self.ast.nodes.items(.tag)[call_data.lhs];
+                if (callee_tag == .field_access) {
+                    // Method call on result of LHS — compile LHS first, then method dispatch
+                    try self.compileTeebranchWithInput(data.lhs, slot, line);
+                    // Result of LHS is on stack. Now do method call.
+                    const field_data = self.ast.nodes.items(.data)[call_data.lhs];
+                    const method_tok = field_data.rhs;
+                    const method_name = self.ast.tokenSlice(method_tok);
+                    const str_obj = try ObjString.create(self.allocator, method_name, null);
+                    const name_const = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+                    const extra = call_data.rhs;
+                    const arg_start = self.ast.extra_data.items[extra];
+                    const arg_end = self.ast.extra_data.items[extra + 1];
+                    const args = self.ast.extra_data.items[arg_start..arg_end];
+                    for (args) |arg_idx| {
+                        try self.compileNode(arg_idx);
+                    }
+                    const arg_count: u8 = @intCast(args.len);
+                    try self.emitOp(.op_method_call, line);
+                    try self.emitByte(@intCast((name_const >> 8) & 0xFF), line);
+                    try self.emitByte(@intCast(name_const & 0xFF), line);
+                    try self.emitByte(arg_count, line);
+                } else {
+                    try self.compileNode(call_data.lhs); // callee
+                    try self.compileTeebranchWithInput(data.lhs, slot, line); // (input |> LHS)
+                    const extra = call_data.rhs;
+                    const arg_start = self.ast.extra_data.items[extra];
+                    const arg_end = self.ast.extra_data.items[extra + 1];
+                    const args = self.ast.extra_data.items[arg_start..arg_end];
+                    for (args) |arg_idx| {
+                        try self.compileNode(arg_idx);
+                    }
+                    const total: u8 = @intCast(1 + args.len);
+                    try self.emitOp(.op_call, line);
+                    try self.emitByte(total, line);
+                }
+            } else {
+                // RHS is bare f: compile as f((input |> LHS))
+                try self.compileNode(rhs); // callee
+                try self.compileTeebranchWithInput(data.lhs, slot, line);
+                try self.emitOp(.op_call, line);
+                try self.emitByte(1, line);
+            }
+        } else if (tag == .call_expr) {
+            // expr is f(args): compile as f(input, args)
+            const data = self.ast.nodes.items(.data)[expr];
+            try self.compileNode(data.lhs); // callee
+            try self.emitOp(.op_get_local, line);
+            try self.emitByte(slot, line);
+            const extra = data.rhs;
+            const arg_start = self.ast.extra_data.items[extra];
+            const arg_end = self.ast.extra_data.items[extra + 1];
+            const args = self.ast.extra_data.items[arg_start..arg_end];
+            for (args) |arg_idx| {
+                try self.compileNode(arg_idx);
+            }
+            const total: u8 = @intCast(1 + args.len);
+            try self.emitOp(.op_call, line);
+            try self.emitByte(total, line);
+        } else {
+            // Bare expression (identifier, field_accessor, etc.): call(input)
+            try self.compileNode(expr);
+            try self.emitOp(.op_get_local, line);
+            try self.emitByte(slot, line);
+            try self.emitOp(.op_call, line);
+            try self.emitByte(1, line);
+        }
+    }
+
     /// Look up an ADT type by name, returning its type_id if found.
     fn resolveAdtType(self: *const Self, name: []const u8) ?u16 {
         for (self.adt_types.items, 0..) |meta, i| {
@@ -1211,8 +1445,6 @@ pub const Compiler = struct {
         }
         return null;
     }
-
-    // ── ADT type declaration compilation ────────────────────────────────
 
     fn compileTypeDecl(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         _ = node_idx;
@@ -1244,8 +1476,6 @@ pub const Compiler = struct {
 
         // type_decl is compile-time only -- no opcodes emitted.
     }
-
-    // ── Match expression compilation ──────────────────────────────────
 
     fn compileMatchExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         const line = self.getLine(node_idx);
@@ -1837,8 +2067,6 @@ pub const Compiler = struct {
         });
     }
 
-    // ── Binary operations ─────────────────────────────────────────────
-
     fn compileBinaryOp(self: *Self, node_data: Node.Data, op: OpCode, node_idx: u32) Error!void {
         try self.compileNode(node_data.lhs);
         try self.compileNode(node_data.rhs);
@@ -1866,8 +2094,6 @@ pub const Compiler = struct {
         try self.patchJump(end_jump);
     }
 
-    // ── Let declaration ───────────────────────────────────────────────
-
     fn compileLetDecl(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         // Compile the initializer -- its value stays on the stack as the local.
         try self.compileNode(node_data.rhs);
@@ -1888,8 +2114,6 @@ pub const Compiler = struct {
         };
         self.local_count += 1;
     }
-
-    // ── Assignment ────────────────────────────────────────────────────
 
     fn compileAssignStmt(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         // Compile the value expression.
@@ -1914,8 +2138,6 @@ pub const Compiler = struct {
             try self.emitError(node_idx, .E002, "undefined variable");
         }
     }
-
-    // ── If expression ─────────────────────────────────────────────────
 
     fn compileIfExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         // Compile condition.
@@ -1979,8 +2201,6 @@ pub const Compiler = struct {
         try self.patchJump(else_jump);
     }
 
-    // ── While statement ───────────────────────────────────────────────
-
     fn compileWhileStmt(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         const loop_start: u32 = @intCast(self.currentChunk().code.items.len);
 
@@ -2004,8 +2224,6 @@ pub const Compiler = struct {
         // While produces nil.
         try self.emitOp(.op_nil, self.getLine(node_idx));
     }
-
-    // ── For statement ─────────────────────────────────────────────────
 
     fn compileForStmt(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         // for i in iterable { body }
@@ -2063,8 +2281,6 @@ pub const Compiler = struct {
         // For produces nil.
         try self.emitOp(.op_nil, line);
     }
-
-    // ── Block expression ──────────────────────────────────────────────
 
     fn compileBlockExpr(self: *Self, node_data: Node.Data, node_idx: u32) Error!void {
         const stmts = self.ast.extra_data.items[node_data.lhs..node_data.rhs];
@@ -2201,8 +2417,6 @@ pub const Compiler = struct {
             try self.emitOp(.op_nil, self.getLine(node_idx));
         }
     }
-
-    // ── Select compilation ────────────────────────────────────────────
 
     /// Compile a select expression.
     ///
@@ -2359,8 +2573,6 @@ pub const Compiler = struct {
         try self.patchJump(final_jump);
     }
 
-    // ── Call expression ───────────────────────────────────────────────
-
     /// Concurrency builtin names that emit dedicated opcodes.
     const concurrency_builtins = [_]struct { name: []const u8, opcode: OpCode }{
         .{ .name = "spawn", .opcode = .op_spawn },
@@ -2384,8 +2596,58 @@ pub const Compiler = struct {
         const saved_tail = self.is_tail_position;
         self.is_tail_position = false;
 
-        // Check if callee is a concurrency builtin that needs a dedicated opcode.
+        // Check if callee is a method call on a runtime value (e.g., list.map(fn)).
         const callee_tag = self.ast.nodes.items(.tag)[node_data.lhs];
+        if (callee_tag == .field_access) {
+            const field_data = self.ast.nodes.items(.data)[node_data.lhs];
+            const left_tag = self.ast.nodes.items(.tag)[field_data.lhs];
+
+            // Check if left side is a known module or ADT — if so, use normal path.
+            var is_module_or_adt = false;
+            if (left_tag == .identifier) {
+                const left_tok = self.ast.nodes.items(.main_token)[field_data.lhs];
+                const left_name = self.ast.tokenSlice(left_tok);
+                if (isKnownModule(left_name) or self.resolveAdtType(left_name) != null) {
+                    is_module_or_adt = true;
+                }
+            }
+
+            if (!is_module_or_adt) {
+                // Method call: compile receiver, args, emit op_method_call.
+                try self.compileNode(field_data.lhs); // push receiver
+
+                const method_tok = field_data.rhs;
+                const method_name = self.ast.tokenSlice(method_tok);
+                const str_obj = try ObjString.create(self.allocator, method_name, null);
+                const name_const = try self.currentChunk().addConstant(Value.fromObj(&str_obj.obj), self.allocator);
+
+                // Compile arguments.
+                const extra_idx = node_data.rhs;
+                const arg_start = self.ast.extra_data.items[extra_idx];
+                const arg_end = self.ast.extra_data.items[extra_idx + 1];
+                const arg_indices = self.ast.extra_data.items[arg_start..arg_end];
+                for (arg_indices) |arg_idx| {
+                    const arg_tag = self.ast.nodes.items(.tag)[arg_idx];
+                    if (arg_tag == .named_arg) {
+                        const arg_data = self.ast.nodes.items(.data)[arg_idx];
+                        try self.compileNode(arg_data.rhs);
+                    } else {
+                        try self.compileNode(arg_idx);
+                    }
+                }
+
+                const line = self.getLine(node_idx);
+                const arg_count: u8 = @intCast(arg_indices.len);
+                try self.emitOp(.op_method_call, line);
+                try self.emitByte(@intCast((name_const >> 8) & 0xFF), line);
+                try self.emitByte(@intCast(name_const & 0xFF), line);
+                try self.emitByte(arg_count, line);
+                self.is_tail_position = saved_tail;
+                return;
+            }
+        }
+
+        // Check if callee is a concurrency builtin that needs a dedicated opcode.
         if (callee_tag == .identifier) {
             const callee_name = self.getTokenText(node_data.lhs);
             // Only use concurrency opcode if identifier is not shadowed by a local or upvalue.
@@ -2548,8 +2810,6 @@ pub const Compiler = struct {
         try self.emitByte(arg_count, self.getLine(node_idx));
     }
 
-    // ── Scope management ──────────────────────────────────────────────
-
     fn beginScope(self: *Self) void {
         self.scope_depth += 1;
     }
@@ -2618,8 +2878,6 @@ pub const Compiler = struct {
         }
     }
 
-    // ── Bytecode emission helpers ─────────────────────────────────────
-
     fn emitOp(self: *Self, op: OpCode, line: u32) Error!void {
         try self.currentChunk().write(@intFromEnum(op), line, self.allocator);
     }
@@ -2666,8 +2924,6 @@ pub const Compiler = struct {
         try self.emitByte(@intCast((offset >> 8) & 0xFF), line);
         try self.emitByte(@intCast(offset & 0xFF), line);
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────
 
     /// Get the source text of a node's main token.
     fn getTokenText(self: *const Self, node_idx: u32) []const u8 {
@@ -2755,10 +3011,6 @@ pub const Compiler = struct {
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════════
-// ── Test helpers ──────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════
-
 const lexer_mod = @import("lexer");
 const Lexer = lexer_mod.Lexer;
 const parser_mod = @import("parser");
@@ -2805,10 +3057,6 @@ fn opAt(chunk: *const Chunk, offset: usize) OpCode {
 fn byteAt(chunk: *const Chunk, offset: usize) u8 {
     return chunk.code.items[offset];
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// ── Tests ──────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════
 
 // Test 1: Compiling `42` emits [op_constant(42), op_pop, op_nil, op_return]
 test "compile: integer literal 42" {
@@ -3183,8 +3431,6 @@ test "compile: error on undefined variable" {
     try std.testing.expectEqual(ErrorCode.E002, tc.result.errors.items[0].error_code);
 }
 
-// ── Phase 2 function/closure tests ─────────────────────────────────
-
 // Test: Simple fn compiles to closure bytecode
 test "compile: simple fn produces op_closure" {
     const allocator = std.testing.allocator;
@@ -3365,8 +3611,6 @@ test "compile: result contains ObjClosure" {
     try std.testing.expectEqual(obj_mod.ObjType.closure, tc.result.closure.obj.obj_type);
     try std.testing.expectEqual(obj_mod.ObjType.function, tc.result.closure.function.obj.obj_type);
 }
-
-// ── Phase 3: ADT and Pattern Matching Compilation Tests ───────────────
 
 test "compile: type declaration registers ADT" {
     const allocator = std.testing.allocator;

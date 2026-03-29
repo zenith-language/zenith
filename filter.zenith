@@ -1,0 +1,13 @@
+source("https://gripmock.org/schema/stub.json", :json)
+  |> single()
+  |> unwrap
+  |> .examples
+  |> tee {
+    descriptions: map(.description) |> collect(),
+    speeds: filter_map(|ex| ex.value?.output?.stream)
+      |> flatten()
+      |> map(.speed)
+      |> collect()
+  }
+  |> |r| {..r, avg_speed: r.speeds.avg() |> unwrap_or(0)}
+  |> sink(:stdout, :json)

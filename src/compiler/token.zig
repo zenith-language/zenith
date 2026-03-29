@@ -2,16 +2,13 @@ const std = @import("std");
 
 /// All Zenith token types for Phase 1.
 pub const Tag = enum(u8) {
-    // ── Literals ───────────────────────────────────────────────────────
     int_literal,
     float_literal,
     string_literal,
     atom_literal,
 
-    // ── Identifiers ────────────────────────────────────────────────────
     identifier,
 
-    // ── Operators ──────────────────────────────────────────────────────
     plus, // +
     minus, // -
     star, // *
@@ -29,8 +26,8 @@ pub const Tag = enum(u8) {
     pipe_greater, // |>
     arrow, // ->
     dot_dot, // ..
+    question_dot, // ?.
 
-    // ── Punctuation ────────────────────────────────────────────────────
     left_paren, // (
     right_paren, // )
     left_brace, // {
@@ -42,7 +39,6 @@ pub const Tag = enum(u8) {
     dot, // .
     semicolon, // ;
 
-    // ── Keywords ───────────────────────────────────────────────────────
     kw_let,
     kw_if,
     kw_else,
@@ -65,12 +61,11 @@ pub const Tag = enum(u8) {
     kw_import,
     kw_when,
     kw_select,
+    kw_tee,
 
-    // ── Comments ───────────────────────────────────────────────────────
     line_comment, // -- ...
     block_comment, // {- ... -}
 
-    // ── Special ────────────────────────────────────────────────────────
     eof,
     @"error",
 };
@@ -118,11 +113,10 @@ pub fn keyword(text: []const u8) ?Tag {
         .{ "import", .kw_import },
         .{ "when", .kw_when },
         .{ "select", .kw_select },
+        .{ "tee", .kw_tee },
     });
     return map.get(text);
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "keyword lookup resolves all keywords" {
     const cases = .{

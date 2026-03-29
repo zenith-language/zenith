@@ -1,0 +1,112 @@
+-- JSON-01: source with :json format reads entire file as JSON array
+let results = source("tests/zen/fixtures/sample.json", :json) |> collect()
+print(len(results))
+
+-- All entries should be Result.Ok
+let first = Option.unwrap_or(List.get(results, 0), nil)
+print(Result.is_ok(first))
+
+-- Unwrap Ok values and check content
+let items = source("tests/zen/fixtures/sample.json", :json)
+  |> filter_map(|r| {
+    match r
+      | Result.Ok(v) -> Option.Some(v)
+      | Result.Err(_) -> Option.None
+  })
+  |> collect()
+print(len(items))
+
+-- Check field access on parsed records
+let alice = Option.unwrap_or(List.get(items, 0), nil)
+print(alice.name)
+print(alice.total)
+
+-- JSON-02: sort_by with :desc on parsed JSON
+let sorted = source("tests/zen/fixtures/sample.json", :json)
+  |> filter_map(|r| {
+    match r
+      | Result.Ok(v) -> Option.Some(v)
+      | Result.Err(_) -> Option.None
+  })
+  |> sort_by(|r| r.total, :desc)
+  |> collect()
+let top = Option.unwrap_or(List.get(sorted, 0), nil)
+print(top.name)
+print(top.total)
+
+-- JSON-03: source :json with single object (not array)
+let single_res = source("tests/zen/fixtures/single.json", :json) |> collect()
+print(len(single_res))
+let s = Option.unwrap_or(List.get(single_res, 0), nil)
+print(Result.is_ok(s))
+
+-- JSON-04: sink with :json format writes JSON array
+source("tests/zen/fixtures/sample.json", :json)
+  |> filter_map(|r| {
+    match r
+      | Result.Ok(v) -> Option.Some(v)
+      | Result.Err(_) -> Option.None
+  })
+  |> sort_by(|r| r.total, :desc)
+  |> sink("/tmp/zen_e2e_json_sink.json", :json)
+
+-- Read back and verify
+let written = source("/tmp/zen_e2e_json_sink.json", :json)
+  |> filter_map(|r| {
+    match r
+      | Result.Ok(v) -> Option.Some(v)
+      | Result.Err(_) -> Option.None
+  })
+  |> collect()
+print(len(written))
+let w_first = Option.unwrap_or(List.get(written, 0), nil)
+print(w_first.name)
+print(w_first.total)
+
+-- JSON-05: filter_ok() shorthand for unwrapping Result.Ok values
+let ok_items = source("tests/zen/fixtures/sample.json", :json)
+  |> filter_ok()
+  |> collect()
+print(len(ok_items))
+let ok_first = Option.unwrap_or(List.get(ok_items, 0), nil)
+print(ok_first.name)
+
+-- JSON-06: filter_err() keeps only error payloads
+let err_items = source("tests/zen/fixtures/sample.json", :json)
+  |> filter_err()
+  |> collect()
+print(len(err_items))
+
+-- JSON-07: single() extracts the one element from single-object JSON source
+let s1 = source("tests/zen/fixtures/single.json", :json) |> single()
+print(Result.is_ok(s1))
+let s1_val = ok_or(s1, nil)
+print(s1_val.name)
+
+-- JSON-08: single() returns Err on empty stream
+let s2 = range(1, 1) |> single()
+print(Result.is_err(s2))
+
+-- JSON-09: single() returns Err on multi-element stream
+let s3 = range(1, 4) |> single()
+print(Result.is_err(s3))
+
+-- JSON-10: ok_or extracts Ok payload
+let r1 = ok_or(Result.Ok(42), 0)
+print(r1)
+
+-- JSON-11: ok_or returns default for Err
+let r2 = ok_or(Result.Err("fail"), 0)
+print(r2)
+
+-- JSON-12: single() |> ok_or() pipeline
+let s4 = source("tests/zen/fixtures/single.json", :json) |> single() |> ok_or(nil)
+print(s4.name)
+print(s4.total)
+
+-- JSON-13: tap_err logs errors without removing them
+let tap_ok = source("tests/zen/fixtures/sample.jsonl", :jsonl)
+  |> tap_err(|e| print("tap_err:" ++ e.message))
+  |> filter_ok()
+  |> collect()
+print(len(tap_ok))

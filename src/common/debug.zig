@@ -89,6 +89,7 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, writer: anytyp
 
         // Phase 3: Pattern matching support
         .op_get_field => try u16Instruction("OP_GET_FIELD", chunk, offset, writer),
+        .op_safe_get_field => try u16Instruction("OP_SAFE_GET_FIELD", chunk, offset, writer),
         .op_get_index => try u16Instruction("OP_GET_INDEX", chunk, offset, writer),
         .op_check_tag => try checkTagInstruction("OP_CHECK_TAG", chunk, offset, writer),
         .op_list_len => try simpleInstruction("OP_LIST_LEN", offset, writer),
@@ -104,6 +105,13 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize, writer: anytyp
         .op_join => try simpleInstruction("OP_JOIN", offset, writer),
         .op_try_join => try simpleInstruction("OP_TRY_JOIN", offset, writer),
         .op_select => try selectInstruction("OP_SELECT", chunk, offset, writer),
+        .op_method_call => {
+            try writer.print("OP_METHOD_CALL const={d} args={d}\n", .{
+                (@as(u16, chunk.code.items[offset + 1]) << 8) | @as(u16, chunk.code.items[offset + 2]),
+                chunk.code.items[offset + 3],
+            });
+            return offset + 4;
+        },
     };
 }
 
@@ -128,8 +136,6 @@ fn selectInstruction(name: []const u8, chunk: *const Chunk, offset: usize, write
     }
     return off;
 }
-
-// ── Instruction format helpers ─────────────────────────────────────────
 
 fn simpleInstruction(name: []const u8, offset: usize, writer: anytype) !usize {
     try writer.print("{s}\n", .{name});
@@ -212,8 +218,6 @@ fn jumpInstruction(name: []const u8, sign: i32, chunk: *const Chunk, offset: usi
     try writer.print("{s:<20} {d:>4} -> {d}\n", .{ name, offset, target });
     return offset + 3;
 }
-
-// ── Recursive disassembly with verbose mode ────────────────────────────
 
 /// Disassemble a chunk and all nested function bodies found in the constant pool.
 /// If `verbose` is true, also prints the constant pool, atom table, and debug info.
@@ -304,8 +308,6 @@ fn printDebugInfo(chunk: *const Chunk, writer: anytype) !void {
     try writer.print("  Code size: {d} bytes\n", .{chunk.code.items.len});
     try writer.print("  Constants: {d}\n", .{chunk.constants.items.len});
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "disassembleChunk prints header and instructions" {
     const allocator = std.testing.allocator;

@@ -24,7 +24,6 @@ pub const Ast = struct {
         data: Data,
 
         pub const Tag = enum(u8) {
-            // ── Literals ────────────────────────────────────────────────
             int_literal,
             float_literal,
             string_literal,
@@ -33,11 +32,9 @@ pub const Ast = struct {
             atom_literal,
             identifier,
 
-            // ── Unary ───────────────────────────────────────────────────
             negate, // data.lhs = operand
             logical_not, // data.lhs = operand
 
-            // ── Binary ──────────────────────────────────────────────────
             add,
             subtract,
             multiply,
@@ -53,13 +50,11 @@ pub const Ast = struct {
             logical_or,
             concat, // ++ string concatenation
 
-            // ── Expressions ─────────────────────────────────────────────
             grouped_expr, // data.lhs = inner expression
             block_expr, // data.lhs = extra_data start, data.rhs = extra_data end
             if_expr, // data.lhs = condition, data.rhs = extra_data index -> {then, else}
             call_expr, // data.lhs = callee, data.rhs = extra_data index -> {arg_start, arg_end}
 
-            // ── Functions / Closures ────────────────────────────────────
             // fn_decl: data.lhs = extra_data index -> {name_token, param_start, param_end,
             //   body_node, defaults_start, defaults_end}, data.rhs = unused (0).
             //   Parameters stored as token indices in extra_data[param_start..param_end].
@@ -78,26 +73,22 @@ pub const Ast = struct {
             //   Used as children of call_expr argument lists.
             named_arg,
 
-            // ── Statements ──────────────────────────────────────────────
             let_decl, // data.lhs = name token index, data.rhs = initializer expression node
             assign_stmt, // data.lhs = target, data.rhs = value expression
             while_stmt, // data.lhs = condition, data.rhs = body
             for_stmt, // data.lhs = iterable, data.rhs = extra_data index -> {var_token, body}
             expr_stmt, // data.lhs = expression
 
-            // ── Collections (Phase 3) ──────────────────────────────────
             list_literal, // data.lhs = extra_start, data.rhs = extra_end (element node indices)
             map_literal, // data.lhs = extra_start, data.rhs = extra_end (alternating key/value node indices)
             tuple_literal, // data.lhs = extra_start, data.rhs = extra_end (element node indices)
             record_literal, // data.lhs = extra_start, data.rhs = extra_end (alternating name_token/value_node)
             record_spread, // data.lhs = base_record node, data.rhs = extra_idx (override name/value pairs)
 
-            // ── ADTs (Phase 3) ─────────────────────────────────────────
             type_decl, // data.lhs = extra_idx (type metadata), data.rhs = unused
             adt_constructor, // data.lhs = extra_idx (type_name, variant_name), data.rhs = extra_idx for args
             field_access, // data.lhs = object node, data.rhs = field name token index
 
-            // ── Pattern matching (Phase 3) ─────────────────────────────
             match_expr, // data.lhs = scrutinee node, data.rhs = extra_idx (start of arms metadata)
             match_arm, // data.lhs = pattern node, data.rhs = body node
             match_arm_guarded, // data.lhs = extra_idx (pattern, guard, body), data.rhs = unused
@@ -110,11 +101,13 @@ pub const Ast = struct {
             pattern_record, // data.lhs = extra_start, data.rhs = extra_end (name_token/pattern pairs)
             pattern_rest, // data.lhs = binding name token (for ..rest patterns)
 
-            // ── Concurrency (Phase 7) ──────────────────────────────────
+            field_accessor, // .field shorthand: data.lhs = field name token index
+            safe_field_access, // expr?.field: data.lhs = object node, data.rhs = field name token index
+            tee_expr, // tee { name: expr, ... }: data.lhs = extra_start, data.rhs = extra_end
+
             select_expr, // data.lhs = extra_start (arm indices), data.rhs = extra_end
             select_arm, // data.lhs = kind (0=recv, 1=send), data.rhs = extra_idx (arm details)
 
-            // ── Root ────────────────────────────────────────────────────
             root, // data.lhs = extra_data start, data.rhs = extra_data end
         };
 
@@ -167,10 +160,6 @@ pub const Ast = struct {
         self.errors.deinit(allocator);
     }
 };
-
-// ═══════════════════════════════════════════════════════════════════════
-// ── Tests ──────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════
 
 test "Ast: addNode and index" {
     const allocator = std.testing.allocator;

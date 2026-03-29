@@ -18,8 +18,6 @@ const Value = value_mod.Value;
 const fiber_mod = @import("fiber");
 const ObjFiber = fiber_mod.ObjFiber;
 
-// ── Fiber Queue ────────────────────────────────────────────────────────
-
 /// Intrusive linked list of parked fibers.
 /// Used for senders/receivers waiting on a channel.
 /// Links through ObjFiber.next_waiter field.
@@ -55,8 +53,6 @@ pub const FiberQueue = struct {
     }
 };
 
-// ── Channel Result Types ───────────────────────────────────────────────
-
 /// Result of a send operation.
 pub const SendResult = enum {
     /// Value was sent successfully (buffered: space available, unbuffered: receiver took it).
@@ -76,8 +72,6 @@ pub const RecvResult = union(enum) {
     /// Channel is empty and open; caller should park.
     would_block,
 };
-
-// ── ObjChannel ─────────────────────────────────────────────────────────
 
 /// Heap-allocated channel object for inter-fiber communication.
 ///
@@ -303,8 +297,6 @@ pub const ObjChannel = struct {
         allocator.destroy(self);
     }
 };
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "FiberQueue push and pop" {
     const allocator = std.testing.allocator;

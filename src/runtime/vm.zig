@@ -521,6 +521,11 @@ pub const VM = struct {
                     const field_val = self.chunk.?.constants.items[const_idx];
                     try self.execOpGetField(field_val);
                 },
+                .op_safe_get_field => {
+                    const const_idx = self.readU16Legacy();
+                    const field_val = self.chunk.?.constants.items[const_idx];
+                    try self.execSafeGetField(field_val);
+                },
                 .op_dup => {
                     const top = self.peek(0);
                     try self.push(top);
@@ -557,6 +562,7 @@ pub const VM = struct {
                 // Phase 7 concurrency opcodes (stubs in legacy mode).
                 .op_spawn, .op_channel, .op_send, .op_recv,
                 .op_close_channel, .op_join, .op_try_join, .op_select,
+                .op_method_call,
                 => {
                     try self.runtimeErrorAny(.E001, "concurrency opcodes not available in legacy mode");
                     return error.RuntimeErr;
@@ -779,6 +785,11 @@ pub const VM = struct {
                     const field_val = self.frameChunk().constants.items[const_idx];
                     try self.execOpGetField(field_val);
                 },
+                .op_safe_get_field => {
+                    const const_idx = self.readU16Frame();
+                    const field_val = self.frameChunk().constants.items[const_idx];
+                    try self.execSafeGetField(field_val);
+                },
                 .op_dup => {
                     const top = self.peek(0);
                     try self.push(top);
@@ -829,6 +840,13 @@ pub const VM = struct {
                 .op_select => {
                     const arm_count = self.readByteFrame();
                     try self.execOpSelect(arm_count);
+                },
+                .op_method_call => {
+                    const name_hi = self.readByteFrame();
+                    const name_lo = self.readByteFrame();
+                    const name_const: u16 = (@as(u16, name_hi) << 8) | @as(u16, name_lo);
+                    const arg_count = self.readByteFrame();
+                    try self.execMethodCall(name_const, arg_count);
                 },
             }
         }
@@ -1184,6 +1202,147 @@ pub const VM = struct {
         try self.push(result);
     }
 
+    /// Execute op_safe_get_field: like op_get_field but returns nil for nil/non-record/map.
+    fn execSafeGetField(self: *Self, field_val: Value) RuntimeError!void {
+        const obj_val = try self.pop();
+
+        // nil → nil
+        if (obj_val.isNil()) {
+            try self.push(Value.nil);
+            return;
+        }
+
+        // Get field name string from the constant.
+        const field_name = if (field_val.isObj() and field_val.asObj().obj_type == .string)
+            ObjString.fromObj(field_val.asObj()).bytes
+        else {
+            try self.push(Value.nil);
+            return;
+        };
+
+        if (obj_val.isObj()) {
+            const obj_ptr = obj_val.asObj();
+            switch (obj_ptr.obj_type) {
+                .record => {
+                    const rec = ObjRecord.fromObj(obj_ptr);
+                    for (rec.field_names[0..rec.field_count], 0..) |name, idx| {
+                        if (std.mem.eql(u8, name, field_name)) {
+                            try self.push(rec.field_values[idx]);
+                            return;
+                        }
+                    }
+                    try self.push(Value.nil);
+                },
+                .map => {
+                    const m = ObjMap.fromObj(obj_ptr);
+                    if (m.entries.get(field_val)) |val| {
+                        try self.push(val);
+                    } else {
+                        try self.push(Value.nil);
+                    }
+                },
+                else => {
+                    // Non-record/map: return nil instead of erroring.
+                    try self.push(Value.nil);
+                },
+            }
+        } else {
+            // Non-object (int, bool, etc.): return nil.
+            try self.push(Value.nil);
+        }
+    }
+
+    /// Execute a method call: resolve method by receiver type, dispatch to builtin.
+    /// Stack: [..., receiver, arg1, ..., argN]
+    /// name_const: constant pool index for the method name string.
+    /// arg_count: number of arguments (not counting receiver).
+    fn execMethodCall(self: *Self, name_const: u16, extra_arg_count: u8) RuntimeError!void {
+        const st = self.getStackTop();
+        const stack = self.getStack();
+        // receiver is below the extra args
+        const receiver_slot = st.* - @as(u32, extra_arg_count) - 1;
+        const receiver = stack[receiver_slot];
+
+        // Get method name from constant pool.
+        const method_name_val = self.currentFrame().closure.function.chunk.constants.items[name_const];
+        const method_name = obj_mod.ObjString.fromObj(method_name_val.asObj()).bytes;
+
+        // Determine module prefix from receiver type.
+        const module_prefix: ?[]const u8 = blk: {
+            if (receiver.isObjType(.list)) break :blk "List";
+            if (receiver.isObjType(.map)) break :blk "Map";
+            if (receiver.isObjType(.string)) break :blk "String";
+            if (receiver.isObjType(.tuple)) break :blk "Tuple";
+            if (receiver.isObjType(.adt)) {
+                const adt = obj_mod.ObjAdt.fromObj(receiver.asObj());
+                if (adt.type_id == 0) break :blk "Option";
+                if (adt.type_id == 1) break :blk "Result";
+            }
+            break :blk null;
+        };
+
+        // Try module-qualified name first (e.g., "List.map").
+        var resolved_idx: ?u32 = null;
+        if (module_prefix) |prefix| {
+            var dotted_buf: [128]u8 = undefined;
+            @memcpy(dotted_buf[0..prefix.len], prefix);
+            dotted_buf[prefix.len] = '.';
+            @memcpy(dotted_buf[prefix.len + 1 ..][0..method_name.len], method_name);
+            const dotted = dotted_buf[0 .. prefix.len + 1 + method_name.len];
+
+            for (builtins_mod.builtins, 0..) |b, idx| {
+                if (std.mem.eql(u8, b.name, dotted)) {
+                    resolved_idx = @intCast(idx);
+                    break;
+                }
+            }
+        }
+
+        // Fallback: try bare method name (for stream operators like map, filter, etc.).
+        if (resolved_idx == null) {
+            for (builtins_mod.builtins, 0..) |b, idx| {
+                if (std.mem.eql(u8, b.name, method_name)) {
+                    resolved_idx = @intCast(idx);
+                    break;
+                }
+            }
+        }
+
+        if (resolved_idx) |idx| {
+            // Call the builtin with receiver + extra args.
+            // The receiver is already on the stack at the right position.
+            // We treat receiver as the callee slot and call with (extra_arg_count + 1) args,
+            // but actually we need to rearrange: put a "fake" callee below receiver.
+            // Simpler: just use callBuiltin which reads args from stack.
+            // Shift stack to make room for a fake callee below receiver.
+            // Current stack: [..., receiver, arg1, ..., argN]
+            // callBuiltin expects: [..., callee, arg1, ..., argN] and pops callee+args.
+            // We'll overwrite the receiver slot with a builtin atom, shift receiver into args.
+
+            // Total arg count for the builtin = extra_arg_count + 1 (receiver).
+            const total_args: u8 = extra_arg_count + 1;
+
+            // Make room: push a dummy value to shift everything up.
+            try self.push(Value.nil);
+            const new_st = self.getStackTop().*;
+            const stk = self.getStack();
+            // Shift args and receiver up by 1 to make callee slot.
+            var j: u32 = new_st - 1;
+            while (j > receiver_slot) : (j -= 1) {
+                stk[j] = stk[j - 1];
+            }
+            // Put builtin atom in the callee slot.
+            stk[receiver_slot] = Value.fromAtom(BUILTIN_BASE + idx);
+
+            try self.callBuiltin(idx, total_args);
+        } else {
+            // No builtin found. Try field access + call (record with closure field).
+            // For now, emit a clear error.
+            try self.runtimeErrorAny(.E001, "unknown method");
+            return error.RuntimeErr;
+        }
+    }
+
     /// Callback function for builtins to register intermediate heap objects.
     fn trackObjectFromBuiltin(vm_ptr: *anyopaque, obj: *obj_mod.Obj) void {
         const vm: *Self = @ptrCast(@alignCast(vm_ptr));
@@ -1363,11 +1522,25 @@ pub const VM = struct {
 
         // Execute the closure via callClosureFromBuiltin.
         // The fiber was created with frame_count=1 and stack_top=1 (closure in slot 0).
-        // Get the closure from the fiber's first call frame.
+        // par_map may push additional arguments at slots 1..stack_top-1.
+        // Extract those arguments, then reset the fiber's stack so
+        // callClosureFromBuiltin can set it up cleanly (it pushes closure + args itself).
         const closure = fiber.frames[0].closure;
         const closure_val = Value.fromObj(&closure.obj);
+
+        // Collect arguments that were pushed after the closure (slots 1..stack_top).
+        const arg_count = fiber.stack_top - 1; // slot 0 is the closure
+        var args_buf: [256]Value = undefined;
+        for (0..arg_count) |i| {
+            args_buf[i] = fiber.stack[1 + i];
+        }
+
+        // Reset fiber state so callClosureFromBuiltin starts from a clean slate.
+        fiber.stack_top = 0;
+        fiber.frame_count = 0;
+
         const err_count_before = vm.errors.items.len;
-        const result = callClosureFromBuiltin(@ptrCast(vm), closure_val, &[_]Value{});
+        const result = callClosureFromBuiltin(@ptrCast(vm), closure_val, args_buf[0..arg_count]);
 
         if (result) |val| {
             fiber.result = val;
@@ -1559,6 +1732,11 @@ pub const VM = struct {
                 const field_val = self.frameChunk().constants.items[const_idx];
                 try self.execOpGetField(field_val);
             },
+            .op_safe_get_field => {
+                const const_idx = self.readU16Frame();
+                const field_val = self.frameChunk().constants.items[const_idx];
+                try self.execSafeGetField(field_val);
+            },
             .op_dup => {
                 const top = self.peek(0);
                 try self.push(top);
@@ -1607,6 +1785,13 @@ pub const VM = struct {
             .op_select => {
                 const arm_count = self.readByteFrame();
                 try self.execOpSelect(arm_count);
+            },
+            .op_method_call => {
+                const name_hi = self.readByteFrame();
+                const name_lo = self.readByteFrame();
+                const name_const: u16 = (@as(u16, name_hi) << 8) | @as(u16, name_lo);
+                const arg_count = self.readByteFrame();
+                try self.execMethodCall(name_const, arg_count);
             },
         }
     }

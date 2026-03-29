@@ -16,16 +16,12 @@ const ChaseLevDeque = deque_mod.ChaseLevDeque;
 const fiber_mod = @import("fiber");
 const ObjFiber = fiber_mod.ObjFiber;
 
-// ── VM dispatch callback ────────────────────────────────────────────
-
 /// Callback type: execute a fiber's closure bytecode on a VM instance.
 /// The VM registers this callback before starting the scheduler.
 /// The callback is responsible ONLY for: executing the fiber's bytecode,
 /// setting fiber.result or fiber.panic_message, and marking fiber.state = .dead.
 /// Waiter-waking is handled by Worker.runFiber after the callback returns.
 pub const RunFiberFn = *const fn (vm_ptr: *anyopaque, fiber: *ObjFiber) void;
-
-// ── Global Queue ────────────────────────────────────────────────────
 
 /// Mutex-protected FIFO queue for overflow and cross-thread scheduling.
 pub const GlobalQueue = struct {
@@ -80,8 +76,6 @@ pub const GlobalQueue = struct {
         return self.items.items.len;
     }
 };
-
-// ── Worker ──────────────────────────────────────────────────────────
 
 /// A worker thread in the scheduler's thread pool.
 pub const Worker = struct {
@@ -206,8 +200,6 @@ pub const Worker = struct {
         fiber.state = .dead;
     }
 };
-
-// ── Scheduler ───────────────────────────────────────────────────────
 
 /// M:N fiber scheduler: distributes fibers across OS worker threads.
 pub const Scheduler = struct {
@@ -366,8 +358,6 @@ pub const Scheduler = struct {
         self.work_available.signal();
     }
 
-    // ── Safepoint protocol ──────────────────────────────────────────
-
     /// Request a safepoint: GC thread calls this before collection.
     pub fn requestSafepoint(self: *Scheduler) void {
         self.safepoint_requested.store(true, .release);
@@ -430,8 +420,6 @@ pub const Scheduler = struct {
         worker.workerLoop();
     }
 };
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 test "GlobalQueue push/pop FIFO ordering" {
     const allocator = std.testing.allocator;

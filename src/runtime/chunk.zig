@@ -105,6 +105,12 @@ pub const OpCode = enum(u8) {
     op_join, // pops fiber handle, pushes Result (blocks if fiber not done)
     op_try_join, // pops fiber handle, pushes Option(Result) (non-blocking)
     op_select, // [arm_count: u8] followed by arm descriptors: [type: u8, body_offset: u16] each
+
+    // -- Safe field access ------------------------------------------------------
+    op_safe_get_field, // [const_idx: u16] like op_get_field but returns nil for non-record/map
+
+    // -- Method dispatch --------------------------------------------------------
+    op_method_call, // [method_name_const: u16, arg_count: u8] receiver + args on stack
 };
 
 /// Bytecode container with constant pool and line information.

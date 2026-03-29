@@ -292,6 +292,8 @@ pub const builtins = [_]BuiltinDesc{
     // ── Stream transforms continued (indices 67-75) ─────────────
     .{ .name = "flat_map", .func = &builtinFlatMap, .arity_min = 2, .arity_max = 2 },
     .{ .name = "filter_map", .func = &builtinFilterMap, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "filter_ok", .func = &builtinFilterOk, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "filter_err", .func = &builtinFilterErr, .arity_min = 1, .arity_max = 1 },
     .{ .name = "scan", .func = &builtinScan, .arity_min = 3, .arity_max = 3 },
     .{ .name = "distinct", .func = &builtinDistinct, .arity_min = 1, .arity_max = 1 },
     .{ .name = "zip", .func = &builtinZip, .arity_min = 2, .arity_max = 2 },
@@ -329,6 +331,16 @@ pub const builtins = [_]BuiltinDesc{
     // ── Rate limiting / buffering (indices 92-93) ───────────
     .{ .name = "throttle", .func = &builtinThrottle, .arity_min = 3, .arity_max = 3 },
     .{ .name = "buffer", .func = &builtinBuffer, .arity_min = 2, .arity_max = 2 },
+
+    // ── Result-aware combinators (indices 94-96) ───────────
+    .{ .name = "single", .func = &builtinSingle, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "ok_or", .func = &builtinOkOr, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "tap_err", .func = &builtinTapErr, .arity_min = 2, .arity_max = 2 },
+
+    // ── Standalone Result/Option helpers (indices 97-99) ──
+    .{ .name = "unwrap", .func = &builtinUnwrap, .arity_min = 1, .arity_max = 1 },
+    .{ .name = "unwrap_or", .func = &builtinUnwrapOr, .arity_min = 2, .arity_max = 2 },
+    .{ .name = "avg", .func = &builtinAvg, .arity_min = 1, .arity_max = 1 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -909,12 +921,18 @@ fn builtinListFilterMap(args: []const Value, allocator: Allocator, err_msg: *[]c
 
     for (src.items.items) |elem| {
         const result = try callClosure(closure_val, &[_]Value{elem});
-        // Check if result is Some(x): ADT with type_id=0 (Option), variant_idx=0 (Some)
+        // Option.Some(x): unwrap and keep.
         if (isAdtVariant(result, 0, 0)) {
             const payload = adtPayload(result, 0);
             try new_list.items.append(allocator, payload);
+        } else if (isAdtVariant(result, 0, 1)) {
+            // Option.None: skip.
+        } else if (result.isNil()) {
+            // nil: skip (convenient for ?. chaining).
+        } else {
+            // Non-Option, non-nil value: keep as-is.
+            try new_list.items.append(allocator, result);
         }
-        // None (variant_idx=1) or non-ADT results are skipped.
     }
 
     return Value.fromObj(&new_list.obj);
@@ -1707,8 +1725,13 @@ fn builtinCollect(args: []const Value, allocator: Allocator, err_msg: *[]const u
         first = try autoWrapRange(first, allocator);
     }
 
+    // If already a list, return as-is (idempotent).
+    if (first.isObjType(.list)) {
+        return first;
+    }
+
     if (!first.isObjType(.stream)) {
-        err_msg.* = "collect() expects a stream as first argument";
+        err_msg.* = "collect() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -1812,6 +1835,36 @@ fn builtinFilterMap(args: []const Value, allocator: Allocator, err_msg: *[]const
     }
     err_msg.* = "filter_map() expects a stream or list as first argument";
     return error.RuntimeError;
+}
+
+///// filter_ok(stream) -> Stream: keep only Result.Ok payloads, skip Err.
+fn builtinFilterOk(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "filter_ok() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .filter_ok_op = .{ .upstream = first } };
+    return createStream(state, allocator);
+}
+
+/// filter_err(stream) -> Stream: keep only Result.Err payloads, skip Ok.
+fn builtinFilterErr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "filter_err() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .filter_err_op = .{ .upstream = first } };
+    return createStream(state, allocator);
 }
 
 /// scan(stream, init, fn) -> Stream: accumulate state across elements.
@@ -2371,9 +2424,110 @@ fn atomName(val: Value) ?[]const u8 {
     return null;
 }
 
+const SourceFormat = enum { text, jsonl, json };
+
+/// Detect source format from optional second atom argument.
+fn detectSourceFormat(args: []const Value) SourceFormat {
+    if (args.len > 1) {
+        if (atomName(args[1])) |name| {
+            if (std.mem.eql(u8, name, "jsonl")) return .jsonl;
+            if (std.mem.eql(u8, name, "json")) return .json;
+        }
+    }
+    return .text;
+}
+
+fn isHttpUrl(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "http://") or
+        std.mem.startsWith(u8, path, "https://");
+}
+
+/// Fetch HTTP(S) URL body. Returns an ArrayList; caller must call deinit().
+fn httpFetch(url: []const u8, allocator: Allocator) !std.ArrayListUnmanaged(u8) {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &aw.writer,
+    }) catch return error.HttpFetchFailed;
+
+    if (result.status != .ok) {
+        aw.deinit();
+        return error.HttpStatusError;
+    }
+
+    return aw.toArrayList();
+}
+
+/// Parse JSON content and create a json_array_iter stream.
+/// If the parsed value is an array, each element is wrapped in Result.Ok.
+/// If it's a single value, a one-element stream with Result.Ok is created.
+/// On parse error, a one-element stream with Result.Err is created.
+fn createJsonStream(content: []const u8, allocator: Allocator, _: *[]const u8) NativeError!Value {
+    // Set up JSON module callbacks.
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |tfn| {
+            json_mod.setVM(vm_ptr, tfn);
+        }
+    }
+    defer json_mod.clearVM();
+
+    const items_list = try ObjList.create(allocator);
+    trackObj(&items_list.obj);
+
+    const parse_result = json_mod.parse(content, allocator);
+    switch (parse_result) {
+        .ok => |val| {
+            // If parsed value is an array, stream each element as Result.Ok.
+            if (val.isObjType(.list)) {
+                const parsed_list = ObjList.fromObj(val.asObj());
+                try items_list.items.ensureTotalCapacity(allocator, parsed_list.items.items.len);
+                for (parsed_list.items.items) |elem| {
+                    const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{elem});
+                    trackObj(&ok_adt.obj);
+                    items_list.items.appendAssumeCapacity(Value.fromObj(&ok_adt.obj));
+                }
+            } else {
+                // Single value: one-element stream.
+                const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{val});
+                trackObj(&ok_adt.obj);
+                try items_list.items.append(allocator, Value.fromObj(&ok_adt.obj));
+            }
+        },
+        .err => |e| {
+            // Parse error: single Result.Err element.
+            const msg_str = try ObjString.create(allocator, e.message, null);
+            trackObj(&msg_str.obj);
+            const field_names = [_][]const u8{ "message", "position" };
+            const field_values = [_]Value{
+                Value.fromObj(&msg_str.obj),
+                Value.fromInt(@intCast(@min(e.position, @as(usize, @intCast(std.math.maxInt(i32)))))),
+            };
+            const record = try ObjRecord.create(allocator, &field_names, &field_values);
+            trackObj(&record.obj);
+            const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&record.obj)});
+            trackObj(&err_adt.obj);
+            try items_list.items.append(allocator, Value.fromObj(&err_adt.obj));
+        },
+    }
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .json_array_iter = .{
+        .items = Value.fromObj(&items_list.obj),
+        .idx = 0,
+    } };
+    return createStream(state, allocator);
+}
+
 /// source(path_or_atom, format?) -> Stream
 /// source("file.txt") creates a stream of lines from a plain text file.
 /// source("file.jsonl", format: :jsonl) creates Stream(Result(Map, ParseError)).
+/// source("file.json", format: :json) parses entire JSON; arrays streamed element-wise.
+/// source("https://...", :json) fetches URL and parses as JSON.
 /// source(:stdin) reads from standard input.
 fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
     const first = args[0];
@@ -2396,16 +2550,45 @@ fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8
         return error.RuntimeError;
     }
 
-    // Must be a string path.
+    // Must be a string path or URL.
     if (!first.isString()) {
-        err_msg.* = "source() expects a string path or :stdin atom as first argument";
+        err_msg.* = "source() expects a string path, URL, or :stdin atom as first argument";
         return error.RuntimeError;
     }
 
     const path_str = ObjString.fromObj(first.asObj());
     const path = path_str.bytes;
+    const format = detectSourceFormat(args);
 
-    // Open the file.
+    // HTTP URL path.
+    if (isHttpUrl(path)) {
+        if (format != .json) {
+            err_msg.* = "HTTP sources require :json format";
+            return error.RuntimeError;
+        }
+        var body_list = httpFetch(path, allocator) catch {
+            err_msg.* = "HTTP request failed";
+            return error.RuntimeError;
+        };
+        defer body_list.deinit(allocator);
+        return createJsonStream(body_list.items, allocator, err_msg);
+    }
+
+    // Local file: :json format reads entire file and parses.
+    if (format == .json) {
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024) catch |err| {
+            err_msg.* = switch (err) {
+                error.FileNotFound => "file not found",
+                error.AccessDenied => "permission denied",
+                else => "failed to read file",
+            };
+            return error.RuntimeError;
+        };
+        defer allocator.free(content);
+        return createJsonStream(content, allocator, err_msg);
+    }
+
+    // Local file: text or jsonl (existing streaming path).
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         err_msg.* = switch (err) {
             error.FileNotFound => "file not found",
@@ -2415,14 +2598,6 @@ fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8
         return error.RuntimeError;
     };
 
-    // Determine format: if arity == 2 and args[1] is atom :jsonl, use JSONL reader.
-    const is_jsonl = if (args.len > 1) blk: {
-        if (atomName(args[1])) |name| {
-            break :blk std.mem.eql(u8, name, "jsonl");
-        }
-        break :blk false;
-    } else false;
-
     const frs = StreamState.FileReaderState.create(allocator, file, false) catch {
         file.close();
         err_msg.* = "failed to create file reader";
@@ -2430,7 +2605,7 @@ fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     };
 
     const state = try allocator.create(StreamState);
-    if (is_jsonl) {
+    if (format == .jsonl) {
         state.* = .{ .jsonl_reader = .{ .frs = frs } };
     } else {
         state.* = .{ .file_reader = .{ .frs = frs } };
@@ -2450,20 +2625,19 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
     }
-    if (!first.isObjType(.stream)) {
-        err_msg.* = "sink() expects a stream as first argument";
-        return error.RuntimeError;
-    }
+    // Track whether we have a plain value (non-stream) to write directly.
+    const is_stream = first.isObjType(.stream);
 
     const dest = args[1];
 
     // Determine format.
-    const is_jsonl = if (args.len > 2) blk: {
+    const sink_format: SourceFormat = if (args.len > 2) blk: {
         if (atomName(args[2])) |name| {
-            break :blk std.mem.eql(u8, name, "jsonl");
+            if (std.mem.eql(u8, name, "jsonl")) break :blk .jsonl;
+            if (std.mem.eql(u8, name, "json")) break :blk .json;
         }
-        break :blk false;
-    } else false;
+        break :blk .text;
+    } else .text;
 
     // Determine output target.
     var out_file: std.fs.File = undefined;
@@ -2506,6 +2680,26 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     var write_buf: [64 * 1024]u8 = undefined;
     var bw = out_file.writer(&write_buf);
 
+    // Non-stream value: write directly and return.
+    if (!is_stream) {
+        var write_buf_direct: [64 * 1024]u8 = undefined;
+        var bw_direct = out_file.writer(&write_buf_direct);
+        if (sink_format == .json) {
+            try sinkWriteJsonValue(first, &bw_direct, allocator, err_msg);
+            bw_direct.interface.writeByte('\n') catch {};
+        } else {
+            const formatted = formatValue(first, allocator, current_atom_names) catch {
+                err_msg.* = "failed to format value for sink";
+                return error.RuntimeError;
+            };
+            defer allocator.free(formatted);
+            bw_direct.interface.writeAll(formatted) catch {};
+            bw_direct.interface.writeByte('\n') catch {};
+        }
+        bw_direct.interface.flush() catch {};
+        return Value.nil;
+    }
+
     // Set stream module callbacks for pulling.
     setStreamCallbacks();
     defer stream_mod.clearVM();
@@ -2513,37 +2707,67 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     const stream_obj = ObjStream.fromObj(first.asObj());
 
     // Pull loop: consume all elements from the stream.
-    while (true) {
-        const val = try stream_obj.state.next(allocator);
-        if (isAdtVariant(val, 0, 1)) break; // None
-        const elem = adtPayload(val, 0);
+    if (sink_format == .json) {
+        // :json — write elements as a JSON array: [elem1,elem2,...]\n
+        bw.interface.writeByte('[') catch {
+            err_msg.* = "failed to write to file";
+            return error.RuntimeError;
+        };
 
-        if (is_jsonl) {
-            // JSONL: if the element is a list (e.g. from batch()), flatten it
-            // so each sub-element is written as a separate JSON line.
-            if (elem.isObjType(.list)) {
-                const lst = ObjList.fromObj(elem.asObj());
-                for (lst.items.items) |item| {
-                    try sinkWriteJsonlLine(item, &bw, allocator, err_msg);
+        var first_elem = true;
+        while (true) {
+            const val = try stream_obj.state.next(allocator);
+            if (isAdtVariant(val, 0, 1)) break; // None
+            const elem = adtPayload(val, 0);
+
+            if (!first_elem) {
+                bw.interface.writeByte(',') catch {
+                    err_msg.* = "failed to write to file";
+                    return error.RuntimeError;
+                };
+            }
+            first_elem = false;
+
+            try sinkWriteJsonValue(elem, &bw, allocator, err_msg);
+        }
+
+        bw.interface.writeAll("]\n") catch {
+            err_msg.* = "failed to write to file";
+            return error.RuntimeError;
+        };
+    } else {
+        while (true) {
+            const val = try stream_obj.state.next(allocator);
+            if (isAdtVariant(val, 0, 1)) break; // None
+            const elem = adtPayload(val, 0);
+
+            if (sink_format == .jsonl) {
+                // JSONL: if the element is a list (e.g. from batch()), flatten it
+                // so each sub-element is written as a separate JSON line.
+                if (elem.isObjType(.list)) {
+                    const lst = ObjList.fromObj(elem.asObj());
+                    for (lst.items.items) |item| {
+                        try sinkWriteJsonlLine(item, &bw, allocator, err_msg);
+                    }
+                } else {
+                    try sinkWriteJsonlLine(elem, &bw, allocator, err_msg);
                 }
             } else {
-                try sinkWriteJsonlLine(elem, &bw, allocator, err_msg);
+                // Plain text: format as string, write as line.
+                const formatted = formatValue(elem, allocator, current_atom_names) catch {
+                    err_msg.* = "failed to format value for sink";
+                    return error.RuntimeError;
+                };
+                defer allocator.free(formatted);
+                bw.interface.writeAll(formatted) catch {
+                    err_msg.* = "failed to write to file";
+                    return error.RuntimeError;
+                };
+                bw.interface.writeByte('\n') catch {
+                    err_msg.* = "failed to write newline to file";
+                    return error.RuntimeError;
+                };
             }
-        } else {
-            // Plain text: format as string, write as line.
-            const formatted = formatValue(elem, allocator, current_atom_names) catch {
-                err_msg.* = "failed to format value for sink";
-                return error.RuntimeError;
-            };
-            defer allocator.free(formatted);
-            bw.interface.writeAll(formatted) catch {
-                err_msg.* = "failed to write to file";
-                return error.RuntimeError;
-            };
-            bw.interface.writeByte('\n') catch {
-                err_msg.* = "failed to write newline to file";
-                return error.RuntimeError;
-            };
         }
     }
 
@@ -2554,6 +2778,39 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     };
 
     return Value.nil;
+}
+
+/// Write a single value as JSON (no trailing newline).
+fn sinkWriteJsonValue(
+    value: Value,
+    bw: anytype,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!void {
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |tfn| {
+            json_mod.setVM(vm_ptr, tfn);
+        }
+    }
+    if (current_atom_names) |names| {
+        json_mod.setAtomNames(names);
+    }
+    const emit_result = json_mod.emit(value, allocator);
+    json_mod.clearVM();
+    switch (emit_result) {
+        .ok => |json_bytes| {
+            bw.interface.writeAll(json_bytes) catch {
+                allocator.free(json_bytes);
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
+            allocator.free(json_bytes);
+        },
+        .err => |msg| {
+            err_msg.* = msg;
+            return error.RuntimeError;
+        },
+    }
 }
 
 /// Write a single value as one JSONL line (JSON + newline).
@@ -2832,6 +3089,139 @@ fn builtinBuffer(args: []const Value, allocator: Allocator, err_msg: *[]const u8
         .exhausted = false,
     } };
     return createStream(state, allocator);
+}
+
+/// single(stream) -> value: expects exactly one element from stream.
+/// 0 elements -> Result.Err("empty stream")
+/// 1 element -> that element AS-IS
+/// >1 elements -> Result.Err("expected single element")
+fn builtinSingle(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "single() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+
+    setStreamCallbacks();
+    defer stream_mod.clearVM();
+
+    const stream_obj = ObjStream.fromObj(first.asObj());
+
+    // Pull first element.
+    const val1 = try stream_obj.state.next(allocator);
+    if (isAdtVariant(val1, 0, 1)) {
+        // Empty stream.
+        const msg = try ObjString.create(allocator, "empty stream", null);
+        trackObj(&msg.obj);
+        return makeErr(Value.fromObj(&msg.obj), allocator);
+    }
+    const elem = adtPayload(val1, 0);
+
+    // Pull second to verify singularity.
+    const val2 = try stream_obj.state.next(allocator);
+    if (isAdtVariant(val2, 0, 1)) {
+        // Exactly one element.
+        return elem;
+    }
+
+    // More than one element.
+    const msg = try ObjString.create(allocator, "expected single element", null);
+    trackObj(&msg.obj);
+    return makeErr(Value.fromObj(&msg.obj), allocator);
+}
+
+/// ok_or(value, default) -> value: if Result.Ok(v) return v, else return default.
+fn builtinOkOr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    if (args[0].isObjType(.adt)) {
+        const adt = ObjAdt.fromObj(args[0].asObj());
+        if (adt.type_id == 1 and adt.variant_idx == 0) {
+            return adt.payload[0];
+        }
+    }
+    return args[1];
+}
+
+/// tap_err(stream, fn) -> Stream: invoke fn on Result.Err payloads for side effects.
+fn builtinTapErr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var first = args[0];
+    if (first.isObjType(.range)) {
+        first = try autoWrapRange(first, allocator);
+    }
+    if (!first.isObjType(.stream)) {
+        err_msg.* = "tap_err() expects a stream as first argument";
+        return error.RuntimeError;
+    }
+    if (!args[1].isObjType(.closure)) {
+        err_msg.* = "tap_err() expects a function as second argument";
+        return error.RuntimeError;
+    }
+    const state = try allocator.create(StreamState);
+    state.* = .{ .tap_err_op = .{
+        .upstream = first,
+        .fn_val = args[1],
+    } };
+    return createStream(state, allocator);
+}
+
+/// unwrap(value) -> payload: panics if Result.Err or Option.None.
+fn builtinUnwrap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    if (args[0].isObjType(.adt)) {
+        const adt = ObjAdt.fromObj(args[0].asObj());
+        // Result.Ok (type_id=1, variant_idx=0) or Option.Some (type_id=0, variant_idx=0)
+        if (adt.variant_idx == 0 and (adt.type_id == 0 or adt.type_id == 1)) {
+            return adt.payload[0];
+        }
+        // Result.Err or Option.None
+        err_msg.* = "unwrap called on Err or None";
+        return error.RuntimeError;
+    }
+    err_msg.* = "unwrap expects a Result or Option";
+    return error.RuntimeError;
+}
+
+/// unwrap_or(value, default) -> payload or default. Works with both Result and Option.
+fn builtinUnwrapOr(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    _ = allocator;
+    _ = err_msg;
+    if (args[0].isObjType(.adt)) {
+        const adt = ObjAdt.fromObj(args[0].asObj());
+        // Result.Ok or Option.Some → return payload
+        if (adt.variant_idx == 0 and (adt.type_id == 0 or adt.type_id == 1)) {
+            return adt.payload[0];
+        }
+    }
+    return args[1];
+}
+
+/// avg(list) -> Option: average of a list of numbers. Returns Option.None for empty list.
+fn builtinAvg(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    if (!args[0].isObjType(.list)) {
+        err_msg.* = "avg() expects a list";
+        return error.RuntimeError;
+    }
+    const list = ObjList.fromObj(args[0].asObj());
+    if (list.items.items.len == 0) {
+        return makeNone(allocator);
+    }
+    var sum: f64 = 0;
+    for (list.items.items) |v| {
+        if (v.isInt()) {
+            sum += @floatFromInt(v.asInt());
+        } else if (v.isFloat()) {
+            sum += v.asFloat();
+        } else {
+            err_msg.* = "avg() expects a list of numbers";
+            return error.RuntimeError;
+        }
+    }
+    const result = sum / @as(f64, @floatFromInt(list.items.items.len));
+    return makeSome(Value.fromFloat(result), allocator);
 }
 
 /// Get the CPU core count, defaulting to 4 if unavailable.

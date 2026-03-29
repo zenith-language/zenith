@@ -55,6 +55,10 @@ pub const StreamState = union(enum) {
     tick: TickOp,
     throttle_op: ThrottleOp,
     buffer_op: BufferOp,
+    json_array_iter: JsonArrayIter,
+    filter_ok_op: UpstreamOnlyOp,
+    filter_err_op: UpstreamOnlyOp,
+    tap_err_op: TapOp,
 
     pub const RangeIter = struct {
         current: i32,
@@ -270,6 +274,17 @@ pub const StreamState = union(enum) {
         frs: *FileReaderState,
     };
 
+    /// Simple upstream-only operator (no function). Used by filter_ok, filter_err.
+    pub const UpstreamOnlyOp = struct {
+        upstream: Value, // NaN-boxed ObjStream pointer
+    };
+
+    /// Pre-parsed JSON array iterator. Items is an ObjList of Result-wrapped values.
+    pub const JsonArrayIter = struct {
+        items: Value, // NaN-boxed ObjList
+        idx: usize,
+    };
+
     /// Par_map: parallel map with order preservation and fail-fast.
     /// When a scheduler is present, dispatches batch items to fibers via
     /// scheduler.schedule() for true parallel execution. Falls back to
@@ -481,17 +496,69 @@ pub const StreamState = union(enum) {
                     if (isNone(upstream_val)) return upstream_val;
                     const elem = adtPayload(upstream_val, 0);
                     const result = try callClosure(s.fn_val, &[_]Value{elem});
-                    // Check if result is Some(v) (type_id=0, variant=0).
+                    // Option.Some(v): unwrap and yield.
                     if (result.isObjType(.adt)) {
                         const adt = ObjAdt.fromObj(result.asObj());
                         if (adt.type_id == 0 and adt.variant_idx == 0) {
-                            // Some(v) -- extract and yield.
                             return makeSome(adt.payload[0], allocator);
                         }
-                        // None -- skip and continue.
+                        if (adt.type_id == 0 and adt.variant_idx == 1) {
+                            continue; // Option.None: skip.
+                        }
                     }
-                    // Non-Option values are skipped (filter_map contract: fn must return Option).
+                    // nil: skip (convenient for ?. chaining).
+                    if (result.isNil()) continue;
+                    // Non-Option, non-nil: yield as-is.
+                    return makeSome(result, allocator);
                 }
+            },
+            .filter_ok_op => |s| {
+                // Pull Result values, keep only Ok payloads, skip Err.
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                while (true) {
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) return upstream_val;
+                    const elem = adtPayload(upstream_val, 0);
+                    // Result.Ok: type_id=1, variant_idx=0
+                    if (elem.isObjType(.adt)) {
+                        const adt = ObjAdt.fromObj(elem.asObj());
+                        if (adt.type_id == 1 and adt.variant_idx == 0) {
+                            return makeSome(adt.payload[0], allocator);
+                        }
+                    }
+                    // Result.Err or non-Result values are skipped.
+                }
+            },
+            .filter_err_op => |s| {
+                // Pull Result values, keep only Err payloads, skip Ok.
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                while (true) {
+                    const upstream_val = try upstream_stream.state.next(allocator);
+                    if (isNone(upstream_val)) return upstream_val;
+                    const elem = adtPayload(upstream_val, 0);
+                    // Result.Err: type_id=1, variant_idx=1
+                    if (elem.isObjType(.adt)) {
+                        const adt = ObjAdt.fromObj(elem.asObj());
+                        if (adt.type_id == 1 and adt.variant_idx == 1) {
+                            return makeSome(adt.payload[0], allocator);
+                        }
+                    }
+                }
+            },
+            .tap_err_op => |s| {
+                // Pass all elements through; invoke fn on Result.Err payloads.
+                const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const upstream_val = try upstream_stream.state.next(allocator);
+                if (isNone(upstream_val)) return upstream_val;
+                const elem = adtPayload(upstream_val, 0);
+                // Result.Err: type_id=1, variant_idx=1
+                if (elem.isObjType(.adt)) {
+                    const adt = ObjAdt.fromObj(elem.asObj());
+                    if (adt.type_id == 1 and adt.variant_idx == 1) {
+                        _ = try callClosure(s.fn_val, &[_]Value{adt.payload[0]});
+                    }
+                }
+                return makeSome(elem, allocator);
             },
             .scan_op => |*s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
@@ -662,6 +729,13 @@ pub const StreamState = union(enum) {
             },
             .jsonl_reader => |s| {
                 return jsonlReaderNext(s.frs, allocator);
+            },
+            .json_array_iter => |*s| {
+                const lst = ObjList.fromObj(s.items.asObj());
+                if (s.idx >= lst.items.items.len) return makeNone(allocator);
+                const val = lst.items.items[s.idx];
+                s.idx += 1;
+                return makeSome(val, allocator);
             },
             .par_map => |*s| {
                 // Return buffered result if available.
@@ -1160,6 +1234,9 @@ pub const StreamState = union(enum) {
     pub fn traceGCRefs(self: *StreamState, nursery: anytype, gc: anytype) !void {
         switch (self.*) {
             .range_iter, .file_reader, .jsonl_reader, .stdin_reader => {},
+            .json_array_iter => |*s| {
+                try nursery.processValue(&s.items, gc);
+            },
             .repeat_iter => |*s| {
                 try nursery.processValue(&s.value, gc);
             },
@@ -1190,6 +1267,9 @@ pub const StreamState = union(enum) {
                 try nursery.processValue(&s.upstream, gc);
                 try nursery.processValue(&s.fn_val, gc);
             },
+            .filter_ok_op, .filter_err_op => |*s| {
+                try nursery.processValue(&s.upstream, gc);
+            },
             .scan_op => |*s| {
                 try nursery.processValue(&s.upstream, gc);
                 try nursery.processValue(&s.acc, gc);
@@ -1207,7 +1287,7 @@ pub const StreamState = union(enum) {
                 try nursery.processValue(&s.inner_list, gc);
                 try nursery.processValue(&s.inner_stream, gc);
             },
-            .tap_op => |*s| {
+            .tap_op, .tap_err_op => |*s| {
                 try nursery.processValue(&s.upstream, gc);
                 try nursery.processValue(&s.fn_val, gc);
             },
@@ -1297,6 +1377,9 @@ pub const StreamState = union(enum) {
     pub fn traceGCRefsOldGen(self: *StreamState, oldgen: anytype, gc: anytype) !void {
         switch (self.*) {
             .range_iter, .file_reader, .jsonl_reader, .stdin_reader => {},
+            .json_array_iter => |*s| {
+                try oldgen.processValue(&s.items, gc);
+            },
             .repeat_iter => |*s| {
                 try oldgen.processValue(&s.value, gc);
             },
@@ -1327,6 +1410,9 @@ pub const StreamState = union(enum) {
                 try oldgen.processValue(&s.upstream, gc);
                 try oldgen.processValue(&s.fn_val, gc);
             },
+            .filter_ok_op, .filter_err_op => |*s| {
+                try oldgen.processValue(&s.upstream, gc);
+            },
             .scan_op => |*s| {
                 try oldgen.processValue(&s.upstream, gc);
                 try oldgen.processValue(&s.acc, gc);
@@ -1344,7 +1430,7 @@ pub const StreamState = union(enum) {
                 try oldgen.processValue(&s.inner_list, gc);
                 try oldgen.processValue(&s.inner_stream, gc);
             },
-            .tap_op => |*s| {
+            .tap_op, .tap_err_op => |*s| {
                 try oldgen.processValue(&s.upstream, gc);
                 try oldgen.processValue(&s.fn_val, gc);
             },
@@ -1528,7 +1614,6 @@ fn partitionNext(shared: *StreamState.PartitionState, want_ok: bool, allocator: 
     }
 }
 
-// ── VM Callback Interface ─────────────────────────────────────────────
 // Stream.next() needs to invoke closures (for iterate, map, filter).
 // Uses the same callback pattern as builtins.zig -- the VM sets these
 // before running any stream terminal.
@@ -1617,7 +1702,6 @@ fn valueLessThan(a: Value, b: Value) bool {
     return a.bits < b.bits;
 }
 
-// ── ADT Helper Functions ──────────────────────────────────────────────
 // Option: type_id=0, Some=variant_idx 0 (arity 1), None=variant_idx 1 (arity 0)
 
 fn makeNone(allocator: Allocator) NativeError!Value {

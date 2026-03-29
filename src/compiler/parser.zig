@@ -68,8 +68,6 @@ pub const Parser = struct {
         return self.ast;
     }
 
-    // ── Statement parsing ──────────────────────────────────────────────
-
     fn parseStatement(self: *Parser) Error!Node.Index {
         return switch (self.peekTag()) {
             .kw_let => self.parseLetDecl(),
@@ -190,8 +188,6 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
-    // ── Expression parsing (Pratt) ─────────────────────────────────────
-
     const Precedence = enum(u8) {
         none,
         or_prec, // or
@@ -244,6 +240,8 @@ pub const Parser = struct {
             .kw_nil => self.parseLiteral(.nil_literal),
             .identifier => self.parseIdentifier(),
             .kw_match => self.parseMatchExpr(),
+            .kw_tee => self.parseTeeExpr(),
+            .dot => self.parseFieldAccessor(),
             else => {
                 try self.emitError("expected expression");
                 return error.ParseError;
@@ -263,6 +261,11 @@ pub const Parser = struct {
         // Dot access (field_access): infix at call precedence.
         if (op_tag == .dot) {
             return self.parseDotAccess(left);
+        }
+
+        // Safe navigation (?.field): infix at call precedence.
+        if (op_tag == .question_dot) {
+            return self.parseSafeFieldAccess(left);
         }
 
         // Pipe operator: special handling for left-associative pipe chains.
@@ -525,7 +528,8 @@ pub const Parser = struct {
         }
 
         // `{identifier :` -> record literal (but NOT `{identifier =` which is assignment in block).
-        if (after_brace < self.tokens.len and self.tokens[after_brace].tag == .identifier) {
+        // Keywords are also allowed as field names (e.g. {type: "purchase"}).
+        if (after_brace < self.tokens.len and isRecordFieldName(self.tokens[after_brace].tag)) {
             const after_ident = after_brace + 1;
             if (after_ident < self.tokens.len and self.tokens[after_ident].tag == .colon) {
                 return self.parseRecordLiteral();
@@ -552,10 +556,10 @@ pub const Parser = struct {
         var pairs: std.ArrayListUnmanaged(u32) = .empty;
         defer pairs.deinit(self.allocator);
 
-        // Parse first field.
-        if (self.peekTag() == .identifier) {
+        // Parse first field (identifiers and keywords are valid field names).
+        if (isRecordFieldName(self.peekTag())) {
             const name_tok = self.pos;
-            self.advance(); // consume identifier
+            self.advance(); // consume field name
             if (self.peekTag() != .colon) {
                 try self.emitError("expected ':' after record field name");
                 return error.ParseError;
@@ -570,7 +574,7 @@ pub const Parser = struct {
         while (self.peekTag() == .comma) {
             self.advance(); // consume ','
             if (self.peekTag() == .right_brace) break; // trailing comma
-            if (self.peekTag() != .identifier) {
+            if (!isRecordFieldName(self.peekTag())) {
                 try self.emitError("expected field name in record literal");
                 return error.ParseError;
             }
@@ -684,12 +688,12 @@ pub const Parser = struct {
         while (self.peekTag() == .comma) {
             self.advance(); // consume ','
             if (self.peekTag() == .right_brace) break; // trailing comma
-            if (self.peekTag() != .identifier) {
+            if (!isRecordFieldName(self.peekTag())) {
                 try self.emitError("expected field name in record spread override");
                 return error.ParseError;
             }
             const name_tok = self.pos;
-            self.advance(); // consume identifier
+            self.advance(); // consume field name
             if (self.peekTag() != .colon) {
                 try self.emitError("expected ':' after override field name");
                 return error.ParseError;
@@ -724,6 +728,96 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
+    /// Parse `tee { name: expr, ... }` — pipeline branching operator.
+    fn parseTeeExpr(self: *Parser) Error!Node.Index {
+        const tee_tok = self.pos;
+        self.advance(); // consume 'tee'
+
+        if (self.peekTag() != .left_brace) {
+            try self.emitError("expected '{' after 'tee'");
+            return error.ParseError;
+        }
+        self.advance(); // consume '{'
+
+        var pairs: std.ArrayListUnmanaged(u32) = .empty;
+        defer pairs.deinit(self.allocator);
+
+        // Parse first branch.
+        if (self.peekTag() != .right_brace) {
+            if (!isRecordFieldName(self.peekTag())) {
+                try self.emitError("expected branch name in tee");
+                return error.ParseError;
+            }
+            const name_tok = self.pos;
+            self.advance(); // consume name
+            if (self.peekTag() != .colon) {
+                try self.emitError("expected ':' after tee branch name");
+                return error.ParseError;
+            }
+            self.advance(); // consume ':'
+            const value = try self.parseExpression();
+            try pairs.append(self.allocator, name_tok);
+            try pairs.append(self.allocator, value);
+
+            // Parse remaining branches.
+            while (self.peekTag() == .comma) {
+                self.advance(); // consume ','
+                if (self.peekTag() == .right_brace) break; // trailing comma
+                if (!isRecordFieldName(self.peekTag())) {
+                    try self.emitError("expected branch name in tee");
+                    return error.ParseError;
+                }
+                const ntok = self.pos;
+                self.advance();
+                if (self.peekTag() != .colon) {
+                    try self.emitError("expected ':' after tee branch name");
+                    return error.ParseError;
+                }
+                self.advance();
+                const val = try self.parseExpression();
+                try pairs.append(self.allocator, ntok);
+                try pairs.append(self.allocator, val);
+            }
+        }
+
+        if (self.peekTag() != .right_brace) {
+            try self.emitError("expected '}' to close tee");
+            return error.ParseError;
+        }
+        self.advance(); // consume '}'
+
+        const extra_start: u32 = @intCast(self.ast.extra_data.items.len);
+        for (pairs.items) |p| {
+            _ = try self.ast.addExtra(p, self.allocator);
+        }
+        const extra_end: u32 = @intCast(self.ast.extra_data.items.len);
+
+        return self.ast.addNode(.{
+            .tag = .tee_expr,
+            .main_token = tee_tok,
+            .data = .{ .lhs = extra_start, .rhs = extra_end },
+        }, self.allocator);
+    }
+
+    /// Parse `.field` shorthand: desugars to `|x| x.field` field accessor lambda.
+    fn parseFieldAccessor(self: *Parser) Error!Node.Index {
+        const dot_tok = self.pos;
+        self.advance(); // consume '.'
+
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected identifier after '.' in field accessor");
+            return error.ParseError;
+        }
+        const field_tok = self.pos;
+        self.advance(); // consume identifier
+
+        return self.ast.addNode(.{
+            .tag = .field_accessor,
+            .main_token = dot_tok,
+            .data = .{ .lhs = field_tok, .rhs = 0 },
+        }, self.allocator);
+    }
+
     /// Parse dot access: `expr.identifier` -> field_access node.
     fn parseDotAccess(self: *Parser, left: Node.Index) Error!Node.Index {
         const dot_tok = self.pos;
@@ -743,7 +837,24 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
-    // ── Select expression parsing (Phase 7) ────────────────────────────
+    /// Parse safe field access: `expr?.identifier` -> safe_field_access node.
+    fn parseSafeFieldAccess(self: *Parser, left: Node.Index) Error!Node.Index {
+        const dot_tok = self.pos;
+        self.advance(); // consume '?.'
+
+        if (self.peekTag() != .identifier) {
+            try self.emitError("expected identifier after '?.'");
+            return error.ParseError;
+        }
+        const field_tok = self.pos;
+        self.advance(); // consume identifier
+
+        return self.ast.addNode(.{
+            .tag = .safe_field_access,
+            .main_token = dot_tok,
+            .data = .{ .lhs = left, .rhs = field_tok },
+        }, self.allocator);
+    }
 
     /// Parse `select { | recv(ch) -> |val| body | send(ch, v) -> body | after(ms) -> body }`
     ///
@@ -930,8 +1041,6 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
-    // ── Type declaration parsing ──────────────────────────────────────
-
     /// Parse `type Name = | Variant1 | Variant2(T1, T2) | ...`
     fn parseTypeDecl(self: *Parser) Error!Node.Index {
         const type_tok = self.pos;
@@ -1022,8 +1131,6 @@ pub const Parser = struct {
             .data = .{ .lhs = extra_idx, .rhs = 0 },
         }, self.allocator);
     }
-
-    // ── Match expression parsing ──────────────────────────────────────
 
     /// Parse `match scrutinee | pattern -> body | pattern when guard -> body | ...`
     fn parseMatchExpr(self: *Parser) Error!Node.Index {
@@ -1512,8 +1619,6 @@ pub const Parser = struct {
         }, self.allocator);
     }
 
-    // ── Function / Lambda / Pipe / Return parsing ──────────────────────
-
     /// Parse a named function declaration in statement position:
     /// `fn name(params) { body }`
     /// Also binds the name as a local (acts like `let name = fn ...`).
@@ -1810,8 +1915,6 @@ pub const Parser = struct {
         return self.source[tok.start..tok.end];
     }
 
-    // ── Operator precedence table ─────────────────────────────────────
-
     fn infixPrecedence(self: *const Parser, tag: Tag) Precedence {
         _ = self;
         return switch (tag) {
@@ -1822,7 +1925,7 @@ pub const Parser = struct {
             .less, .greater, .less_equal, .greater_equal => .comparison,
             .plus, .minus, .plus_plus => .additive,
             .star, .slash, .percent => .multiplicative,
-            .left_paren, .dot => .call,
+            .left_paren, .dot, .question_dot => .call,
             else => .none,
         };
     }
@@ -1848,8 +1951,6 @@ pub const Parser = struct {
         };
     }
 
-    // ── Token access helpers ──────────────────────────────────────────
-
     fn peekTag(self: *const Parser) Tag {
         if (self.pos >= self.tokens.len) return .eof;
         return self.tokens[self.pos].tag;
@@ -1864,8 +1965,6 @@ pub const Parser = struct {
     fn atEnd(self: *const Parser) bool {
         return self.peekTag() == .eof;
     }
-
-    // ── Error handling ───────────────────────────────────────────────
 
     fn emitError(self: *Parser, message: []const u8) Error!void {
         const tok = if (self.pos < self.tokens.len) self.tokens[self.pos] else self.tokens[self.tokens.len - 1];
@@ -1888,11 +1987,39 @@ pub const Parser = struct {
             }
         }
     }
-};
 
-// ═══════════════════════════════════════════════════════════════════════
-// ── Test helpers ──────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════
+    /// Check if a token tag can be used as a record field name.
+    /// Identifiers and keywords are valid (e.g. {type: "purchase"}).
+    fn isRecordFieldName(tag: Tag) bool {
+        return switch (tag) {
+            .identifier,
+            .kw_type,
+            .kw_let,
+            .kw_if,
+            .kw_else,
+            .kw_while,
+            .kw_for,
+            .kw_in,
+            .kw_and,
+            .kw_or,
+            .kw_not,
+            .kw_fn,
+            .kw_true,
+            .kw_false,
+            .kw_nil,
+            .kw_match,
+            .kw_with,
+            .kw_return,
+            .kw_break,
+            .kw_continue,
+            .kw_import,
+            .kw_when,
+            .kw_select,
+            => true,
+            else => false,
+        };
+    }
+};
 
 const lexer_mod = @import("lexer");
 const Lexer = lexer_mod.Lexer;
@@ -1966,10 +2093,6 @@ fn rootStmts(ast: *const Ast) []const u32 {
     const data = ast.nodes.items(.data)[root_idx];
     return ast.extra_data.items[data.lhs..data.rhs];
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// ── Tests ──────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════
 
 // Test 1: Parse `42` produces AST with single int_literal node
 test "parser: int literal" {
@@ -2254,8 +2377,6 @@ test "parser: function call" {
     try std.testing.expectEqual(Node.Tag.identifier, nodeTag(&r.ast, call_data.lhs));
 }
 
-// Additional tests:
-
 test "parser: nil literal" {
     const allocator = std.testing.allocator;
     var r = try testParseOwned("nil", allocator);
@@ -2392,10 +2513,6 @@ test "parser: if without else" {
     try std.testing.expectEqual(Node.null_node, else_branch);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// ── Phase 2: Function, Lambda, Pipe, Return, Named Arg Tests ─────────
-// ═══════════════════════════════════════════════════════════════════════
-
 test "parser: fn declaration with 2 params" {
     const allocator = std.testing.allocator;
     var r = try testParseOwned("fn add(a, b) { a + b }", allocator);
@@ -2447,7 +2564,7 @@ test "parser: fn with named param and default" {
 
 test "parser: lambda with one param" {
     const allocator = std.testing.allocator;
-    // Wrap lambda in parentheses to ensure it's parsed as expression.
+    // Wrap lambda in parentheses so it's parsed as an expression.
     var r = try testParseOwned("(|x| x + 1)", allocator);
     defer r.deinit(allocator);
 
@@ -2696,8 +2813,6 @@ test "parser: fn with zero params" {
     try std.testing.expectEqual(@as(u32, 0), param_end - param_start);
 }
 
-// ── Phase 3 Collection Literal Parsing Tests ─────────────────────────
-
 test "parser: empty list literal []" {
     const allocator = std.testing.allocator;
     var r = try testParseOwned("[]", allocator);
@@ -2883,8 +2998,6 @@ test "parser: block expression still works with { statements }" {
     const expr = nodeData(&r.ast, stmts[0]).lhs;
     try std.testing.expectEqual(Node.Tag.block_expr, nodeTag(&r.ast, expr));
 }
-
-// ── Phase 3 ADT and Pattern Matching Parsing Tests ────────────────────
 
 test "parser: type declaration with variants" {
     const allocator = std.testing.allocator;

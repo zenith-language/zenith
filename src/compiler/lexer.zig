@@ -59,8 +59,6 @@ pub const Lexer = struct {
         self.errors.deinit(allocator);
     }
 
-    // ── Private scanning methods ───────────────────────────────────────
-
     fn scanToken(self: *Lexer, allocator: Allocator) !void {
         const c = self.advance();
         switch (c) {
@@ -153,6 +151,14 @@ pub const Lexer = struct {
 
             '}' => try self.addToken(.right_brace, allocator),
 
+            '?' => {
+                if (self.match('.')) {
+                    try self.addToken(.question_dot, allocator);
+                } else {
+                    try self.addErrorToken("unexpected character '?'", allocator);
+                }
+            },
+
             ':' => {
                 // Check if next character starts an identifier for atom literal.
                 if (!self.isAtEnd() and isIdentStart(self.peek())) {
@@ -234,8 +240,6 @@ pub const Lexer = struct {
         }, allocator);
     }
 
-    // ── Comment scanning ──────────────────────────────────────────────
-
     fn skipLineComment(self: *Lexer) void {
         while (!self.isAtEnd() and self.peek() != '\n') {
             _ = self.advance();
@@ -270,8 +274,6 @@ pub const Lexer = struct {
             }
         }
     }
-
-    // ── String scanning ───────────────────────────────────────────────
 
     fn scanString(self: *Lexer, allocator: Allocator) !void {
         while (!self.isAtEnd() and self.peek() != '"') {
@@ -311,8 +313,6 @@ pub const Lexer = struct {
         try self.addToken(.string_literal, allocator);
     }
 
-    // ── Number scanning ───────────────────────────────────────────────
-
     fn scanNumber(self: *Lexer, allocator: Allocator) !void {
         while (!self.isAtEnd() and isDigit(self.peek())) {
             _ = self.advance();
@@ -334,8 +334,6 @@ pub const Lexer = struct {
         }
     }
 
-    // ── Atom scanning ────────────────────────────────────────────────
-
     fn scanAtom(self: *Lexer, allocator: Allocator) !void {
         // self.start is at ':', current is past it, and peek() is the first ident char.
         while (!self.isAtEnd() and isIdentCont(self.peek())) {
@@ -343,8 +341,6 @@ pub const Lexer = struct {
         }
         try self.addToken(.atom_literal, allocator);
     }
-
-    // ── Identifier / keyword scanning ────────────────────────────────
 
     fn scanIdentifier(self: *Lexer, allocator: Allocator) !void {
         while (!self.isAtEnd() and isIdentCont(self.peek())) {
@@ -355,8 +351,6 @@ pub const Lexer = struct {
         const tag = token_mod.keyword(text) orelse .identifier;
         try self.addToken(tag, allocator);
     }
-
-    // ── Character classification ──────────────────────────────────────
 
     fn isDigit(c: u8) bool {
         return c >= '0' and c <= '9';
@@ -370,10 +364,6 @@ pub const Lexer = struct {
         return isIdentStart(c) or isDigit(c);
     }
 };
-
-// ═══════════════════════════════════════════════════════════════════════
-// ── Tests ──────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════
 
 fn expectTags(source: []const u8, expected: []const Tag) !void {
     const allocator = std.testing.allocator;
@@ -533,8 +523,6 @@ test "lexer: identifiers" {
     try expectLexeme("foo _bar baz123", 1, "_bar");
     try expectLexeme("foo _bar baz123", 2, "baz123");
 }
-
-// Additional edge cases:
 
 test "lexer: all single-char punctuation" {
     try expectTags("( ) { } [ ] , : . ;", &.{
