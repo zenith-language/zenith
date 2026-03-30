@@ -205,6 +205,8 @@ pub const Compiler = struct {
         "single", "ok_or", "tap_err",
         // Standalone Result/Option helpers (99-101)
         "unwrap", "unwrap_or", "avg",
+        // Environment (102)
+        "env",
     };
 
     // Builtin type atom names, pre-registered at IDs 0-14 to match

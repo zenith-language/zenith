@@ -1,0 +1,5 @@
+source("https://raw.githubusercontent.com/umpirsky/language-list/refs/heads/master/data/ak/language.json", :json)
+  |> single()
+  |> unwrap
+  |> sort_by(|e| .)
+  |> sink(:stdout, :json_pretty)

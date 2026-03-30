@@ -276,6 +276,34 @@ pub fn build(b: *std.Build) void {
     stream_mod_build.addImport("fiber", fiber_mod);
     stream_mod_build.addImport("scheduler", scheduler_mod);
 
+    const uri_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/uri.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const aws_sig_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/aws_sig.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const azure_sig_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/azure_sig.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const auth_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/auth.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+            .{ .name = "obj", .module = obj_mod },
+        },
+    });
+
     const builtins_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib/builtins.zig"),
         .target = target,
@@ -285,6 +313,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "obj", .module = obj_mod },
             .{ .name = "stream", .module = stream_mod_build },
             .{ .name = "json", .module = json_mod },
+            .{ .name = "uri", .module = uri_mod },
+            .{ .name = "aws_sig", .module = aws_sig_mod },
+            .{ .name = "azure_sig", .module = azure_sig_mod },
+            .{ .name = "auth", .module = auth_mod },
         },
     });
 

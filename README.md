@@ -4,15 +4,22 @@ A functional stream processing language for data pipelines. Bytecode VM with gen
 
 ```zenith
 -- Read JSONL, filter errors, transform, and write results
-source("events.jsonl", :jsonl)
-  |> filter_map(|r| {
-    match r
-      | Result.Ok(v) -> Option.Some(v)
-      | Result.Err(_) -> Option.None
-  })
-  |> par_map(4, |event| transform(event))
-  |> batch(1000)
-  |> sink("output.jsonl", :jsonl)
+source("https://gripmock.org/schema/stub.json", :json)
+  |> single()
+  |> unwrap
+  |> .examples
+  |> tee {
+    descriptions: map(.description) |> collect(),
+    speeds: filter_map(|ex| ex.value?.output?.stream)
+      |> flatten()
+      |> map(.speed)
+      |> collect()
+  }
+  |> |r| {..r, avg_speed: r.speeds.avg() |> unwrap_or(0)}
+  |> sink(:stdout, :json)
+  
+  -- output:
+  -- {"descriptions":["Single stub object","Array of stubs","Streaming stub","Header-based authentication","Error response"],"speeds":[45,46],"avg_speed":45.5}
 ```
 
 ## Features

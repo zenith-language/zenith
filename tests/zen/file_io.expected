@@ -5,3 +5,10 @@ true
 true
 [1, 2, 3]
 3
+[name,age,city, alice,30,NYC, bob,25,LA]
+[name	age, alice	30, bob	25]
+[1,2, 3,4]
+4
+8
+3
+4

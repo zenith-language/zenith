@@ -10,4 +10,4 @@ source("https://gripmock.org/schema/stub.json", :json)
       |> collect()
   }
   |> |r| {..r, avg_speed: r.speeds.avg() |> unwrap_or(0)}
-  |> sink(:stdout, :json)
+  |> sink(:stdout, :json_pretty)

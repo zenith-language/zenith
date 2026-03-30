@@ -25,3 +25,38 @@ print(source("/tmp/zen_e2e_sink_test.txt") |> collect())
 -- sink with JSONL format
 range(1, 4) |> sink("/tmp/zen_e2e_sink_jsonl.jsonl", :jsonl)
 print(source("/tmp/zen_e2e_sink_jsonl.jsonl") |> count())
+
+-- SINK-CSV: sink with CSV format (records -> CSV with headers)
+[{name: "alice", age: 30, city: "NYC"}, {name: "bob", age: 25, city: "LA"}]
+  |> sink("/tmp/zen_e2e_csv.csv", :csv)
+print(source("/tmp/zen_e2e_csv.csv") |> collect())
+
+-- SINK-TSV: sink with TSV format
+[{name: "alice", age: 30}, {name: "bob", age: 25}]
+  |> sink("/tmp/zen_e2e_tsv.tsv", :tsv)
+print(source("/tmp/zen_e2e_tsv.tsv") |> collect())
+
+-- SINK-CSV-NOHDR: CSV without header row
+[{x: 1, y: 2}, {x: 3, y: 4}]
+  |> sink("/tmp/zen_e2e_csv_noh.csv", :csv, {header: false})
+print(source("/tmp/zen_e2e_csv_noh.csv") |> collect())
+
+-- SINK-APPEND: append mode
+range(1, 3) |> sink("/tmp/zen_e2e_append.txt")
+range(3, 5) |> sink("/tmp/zen_e2e_append.txt", :text, {append: true})
+print(source("/tmp/zen_e2e_append.txt") |> count())
+
+-- SINK-JSON-PRETTY: pretty-printed JSON
+[{name: "alice"}, {name: "bob"}]
+  |> sink("/tmp/zen_e2e_pretty.json", :json_pretty)
+print(source("/tmp/zen_e2e_pretty.json") |> count())
+
+-- SINK-TABLE: pretty table to file
+[{name: "alice", age: 30}, {name: "bob", age: 25}]
+  |> sink("/tmp/zen_e2e_table.txt", :table)
+print(source("/tmp/zen_e2e_table.txt") |> count())
+
+-- SINK-MARKDOWN: markdown table to file
+[{name: "alice", age: 30}, {name: "bob", age: 25}]
+  |> sink("/tmp/zen_e2e_md.txt", :markdown)
+print(source("/tmp/zen_e2e_md.txt") |> count())

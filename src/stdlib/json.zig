@@ -759,6 +759,147 @@ fn emitJsonString(bytes: []const u8, allocator: Allocator, buf: *std.ArrayListUn
     try writer.writeByte('"');
 }
 
+// ── Pretty JSON Emitter ──────────────────────────────────────────────
+
+pub fn emitPretty(value: Value, allocator: Allocator, indent_size: u8) EmitResult {
+    return emitPrettyAtDepth(value, allocator, indent_size, 0);
+}
+
+pub fn emitPrettyAtDepth(value: Value, allocator: Allocator, indent_size: u8, base_depth: u16) EmitResult {
+    var buf = std.ArrayListUnmanaged(u8){};
+    if (emitValuePretty(value, allocator, &buf, indent_size, base_depth)) {
+        return .{ .ok = buf.toOwnedSlice(allocator) catch return .{ .err = "out of memory" } };
+    } else |_| {
+        buf.deinit(allocator);
+        return .{ .err = emit_error_msg };
+    }
+}
+
+fn emitValuePretty(value: Value, allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), indent_size: u8, depth: u16) !void {
+    const writer = buf.writer(allocator);
+
+    // Scalars: delegate to compact emitter.
+    if (value.isInt() or value.isFloat() or value.isBool() or value.isNil() or value.isAtom()) {
+        return emitValue(value, allocator, buf);
+    }
+
+    if (!value.isObj()) {
+        return emitValue(value, allocator, buf);
+    }
+
+    const obj_ptr = value.asObj();
+    switch (obj_ptr.obj_type) {
+        .string => {
+            const str = ObjString.fromObj(obj_ptr);
+            try emitJsonString(str.bytes, allocator, buf);
+        },
+        .list => {
+            const list = ObjList.fromObj(obj_ptr);
+            if (list.items.items.len == 0) {
+                try writer.writeAll("[]");
+                return;
+            }
+            try writer.writeAll("[\n");
+            for (list.items.items, 0..) |item, i| {
+                if (i > 0) try writer.writeAll(",\n");
+                try writeIndent(writer, indent_size, depth + 1);
+                try emitValuePretty(item, allocator, buf, indent_size, depth + 1);
+            }
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent_size, depth);
+            try writer.writeByte(']');
+        },
+        .map => {
+            const map = ObjMap.fromObj(obj_ptr);
+            if (map.entries.count() == 0) {
+                try writer.writeAll("{}");
+                return;
+            }
+            try writer.writeAll("{\n");
+            var it = map.entries.iterator();
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try writer.writeAll(",\n");
+                first = false;
+
+                try writeIndent(writer, indent_size, depth + 1);
+                const key = entry.key_ptr.*;
+                if (key.isObj() and key.asObj().obj_type == .string) {
+                    const key_str = ObjString.fromObj(key.asObj());
+                    try emitJsonString(key_str.bytes, allocator, buf);
+                } else if (key.isAtom()) {
+                    if (atom_names_ptr) |names| {
+                        const id = key.asAtom();
+                        if (id < names.len) {
+                            try emitJsonString(names[id], allocator, buf);
+                        } else {
+                            emit_error_msg = "cannot encode map with unknown atom key to JSON";
+                            return error.OutOfMemory;
+                        }
+                    } else {
+                        emit_error_msg = "cannot encode map with atom key without atom names";
+                        return error.OutOfMemory;
+                    }
+                } else {
+                    emit_error_msg = "cannot encode map with non-string key to JSON";
+                    return error.OutOfMemory;
+                }
+                try writer.writeAll(": ");
+                try emitValuePretty(entry.value_ptr.*, allocator, buf, indent_size, depth + 1);
+            }
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent_size, depth);
+            try writer.writeByte('}');
+        },
+        .tuple => {
+            const t = ObjTuple.fromObj(obj_ptr);
+            if (t.fields.len == 0) {
+                try writer.writeAll("[]");
+                return;
+            }
+            try writer.writeAll("[\n");
+            for (t.fields, 0..) |field, i| {
+                if (i > 0) try writer.writeAll(",\n");
+                try writeIndent(writer, indent_size, depth + 1);
+                try emitValuePretty(field, allocator, buf, indent_size, depth + 1);
+            }
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent_size, depth);
+            try writer.writeByte(']');
+        },
+        .record => {
+            const rec = ObjRecord.fromObj(obj_ptr);
+            if (rec.field_count == 0) {
+                try writer.writeAll("{}");
+                return;
+            }
+            try writer.writeAll("{\n");
+            for (0..rec.field_count) |i| {
+                if (i > 0) try writer.writeAll(",\n");
+                try writeIndent(writer, indent_size, depth + 1);
+                try emitJsonString(rec.field_names[i], allocator, buf);
+                try writer.writeAll(": ");
+                try emitValuePretty(rec.field_values[i], allocator, buf, indent_size, depth + 1);
+            }
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent_size, depth);
+            try writer.writeByte('}');
+        },
+        // All other types use compact format.
+        else => {
+            try emitValue(value, allocator, buf);
+        },
+    }
+}
+
+fn writeIndent(writer: anytype, indent_size: u8, depth: u16) !void {
+    const total = @as(usize, indent_size) * @as(usize, depth);
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        try writer.writeByte(' ');
+    }
+}
+
 // ── Test Helpers ──────────────────────────────────────────────────────
 
 /// Recursively destroy a parsed JSON value and all nested objects.

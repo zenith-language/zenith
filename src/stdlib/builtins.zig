@@ -14,6 +14,10 @@ const ObjRange = obj_mod.ObjRange;
 const stream_mod = @import("stream");
 const StreamState = stream_mod.StreamState;
 const json_mod = @import("json");
+const uri_mod = @import("uri");
+const aws_sig = @import("aws_sig");
+const azure_sig = @import("azure_sig");
+const auth_mod = @import("auth");
 
 /// Error type for native function execution.
 pub const NativeError = error{
@@ -318,9 +322,9 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "Json.decode", .func = &builtinJsonDecode, .arity_min = 1, .arity_max = 1 },
     .{ .name = "Json.encode", .func = &builtinJsonEncode, .arity_min = 1, .arity_max = 1 },
 
-    // ── File I/O (indices 86-87) ────────────────────────────────
-    .{ .name = "source", .func = &builtinSource, .arity_min = 1, .arity_max = 2 },
-    .{ .name = "sink", .func = &builtinSink, .arity_min = 2, .arity_max = 3 },
+    // ── I/O: source/sink (indices 86-87) ──────────────────────
+    .{ .name = "source", .func = &builtinSource, .arity_min = 1, .arity_max = 3 },
+    .{ .name = "sink", .func = &builtinSink, .arity_min = 2, .arity_max = 5 },
 
     // ── Concurrency stream operators (indices 88-91) ─────────
     .{ .name = "par_map", .func = &builtinParMap, .arity_min = 2, .arity_max = 3 },
@@ -341,6 +345,9 @@ pub const builtins = [_]BuiltinDesc{
     .{ .name = "unwrap", .func = &builtinUnwrap, .arity_min = 1, .arity_max = 1 },
     .{ .name = "unwrap_or", .func = &builtinUnwrapOr, .arity_min = 2, .arity_max = 2 },
     .{ .name = "avg", .func = &builtinAvg, .arity_min = 1, .arity_max = 1 },
+
+    // ── Environment (index 100) ────────────────────────────
+    .{ .name = "env", .func = &builtinEnv, .arity_min = 1, .arity_max = 2 },
 };
 
 /// Format a value as a string (shared helper for print, str, show).
@@ -1589,6 +1596,20 @@ fn autoWrapRange(val: Value, allocator: Allocator) NativeError!Value {
     return val;
 }
 
+fn autoWrapList(val: Value, allocator: Allocator) NativeError!Value {
+    if (val.isObjType(.list)) {
+        const state = try allocator.create(StreamState);
+        state.* = .{ .flatten_op = .{
+            .upstream = Value.nil,
+            .inner_list = val,
+            .inner_idx = 0,
+            .inner_stream = Value.nil,
+        } };
+        return createStream(state, allocator);
+    }
+    return val;
+}
+
 /// repeat(value) -> Stream: infinite stream that always yields value.
 fn builtinRepeat(args: []const Value, allocator: Allocator, _: *[]const u8) NativeError!Value {
     const state = try allocator.create(StreamState);
@@ -2424,7 +2445,7 @@ fn atomName(val: Value) ?[]const u8 {
     return null;
 }
 
-const SourceFormat = enum { text, jsonl, json };
+const SourceFormat = enum { text, jsonl, json, csv };
 
 /// Detect source format from optional second atom argument.
 fn detectSourceFormat(args: []const Value) SourceFormat {
@@ -2432,14 +2453,228 @@ fn detectSourceFormat(args: []const Value) SourceFormat {
         if (atomName(args[1])) |name| {
             if (std.mem.eql(u8, name, "jsonl")) return .jsonl;
             if (std.mem.eql(u8, name, "json")) return .json;
+            if (std.mem.eql(u8, name, "csv")) return .csv;
         }
     }
     return .text;
 }
 
-fn isHttpUrl(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, "http://") or
-        std.mem.startsWith(u8, path, "https://");
+// ── Sink format & options ────────────────────────────────────────────
+
+const SinkFormat = enum { text, jsonl, json, json_pretty, csv, tsv, table, markdown };
+
+const Compression = enum { none, gzip };
+
+const SinkOptions = struct {
+    append: bool = false,
+    header: bool = true,
+    delimiter: u8 = ',',
+    indent: u8 = 2,
+    compress: Compression = .none,
+    retry: u8 = 0,
+    timeout: u32 = 0, // 0 = default
+};
+
+fn parseSinkFormat(args: []const Value) SinkFormat {
+    if (args.len > 2) {
+        if (atomName(args[2])) |name| {
+            if (std.mem.eql(u8, name, "jsonl")) return .jsonl;
+            if (std.mem.eql(u8, name, "json")) return .json;
+            if (std.mem.eql(u8, name, "json_pretty")) return .json_pretty;
+            if (std.mem.eql(u8, name, "csv")) return .csv;
+            if (std.mem.eql(u8, name, "tsv")) return .tsv;
+            if (std.mem.eql(u8, name, "table")) return .table;
+            if (std.mem.eql(u8, name, "markdown")) return .markdown;
+        }
+    }
+    return .text;
+}
+
+fn parseSinkOptions(args: []const Value) SinkOptions {
+    var opts = SinkOptions{};
+    if (args.len <= 3) return opts;
+    const ov = args[3];
+
+    // Handle record syntax: {header: false, append: true}
+    if (ov.isObjType(.record)) {
+        const rec = ObjRecord.fromObj(ov.asObj());
+        for (0..rec.field_count) |i| {
+            const kn = rec.field_names[i];
+            const val = rec.field_values[i];
+            applySinkOption(&opts, kn, val);
+        }
+        return opts;
+    }
+
+    // Handle map syntax: {"header": false}
+    if (ov.isObjType(.map)) {
+        const m = ObjMap.fromObj(ov.asObj());
+        var it = m.entries.iterator();
+        while (it.next()) |entry| {
+            const key_name = blk: {
+                const k = entry.key_ptr.*;
+                if (k.isAtom()) {
+                    break :blk atomName(k);
+                } else if (k.isObj() and k.asObj().obj_type == .string) {
+                    break :blk @as(?[]const u8, ObjString.fromObj(k.asObj()).bytes);
+                }
+                break :blk @as(?[]const u8, null);
+            };
+            if (key_name) |kn| {
+                applySinkOption(&opts, kn, entry.value_ptr.*);
+            }
+        }
+    }
+    return opts;
+}
+
+fn applySinkOption(opts: *SinkOptions, kn: []const u8, val: Value) void {
+    if (std.mem.eql(u8, kn, "append")) {
+        if (val.isBool()) opts.append = val.asBool();
+    } else if (std.mem.eql(u8, kn, "header")) {
+        if (val.isBool()) opts.header = val.asBool();
+    } else if (std.mem.eql(u8, kn, "delimiter")) {
+        if (val.isObj() and val.asObj().obj_type == .string) {
+            const s = ObjString.fromObj(val.asObj());
+            if (s.bytes.len > 0) opts.delimiter = s.bytes[0];
+        }
+    } else if (std.mem.eql(u8, kn, "indent")) {
+        if (val.isInt()) {
+            const iv = val.asInt();
+            if (iv >= 0 and iv <= 16) opts.indent = @intCast(@as(u32, @bitCast(iv)));
+        }
+    } else if (std.mem.eql(u8, kn, "compress")) {
+        if (val.isAtom()) {
+            if (atomName(val)) |name| {
+                if (std.mem.eql(u8, name, "gzip")) opts.compress = .gzip;
+            }
+        }
+    } else if (std.mem.eql(u8, kn, "retry")) {
+        if (val.isInt()) {
+            const iv = val.asInt();
+            if (iv >= 0 and iv <= 10) opts.retry = @intCast(@as(u32, @bitCast(iv)));
+        }
+    } else if (std.mem.eql(u8, kn, "timeout")) {
+        if (val.isInt()) {
+            const iv = val.asInt();
+            if (iv > 0) opts.timeout = @intCast(@as(u32, @bitCast(iv)));
+        }
+    }
+}
+
+// ── Sink helpers: tabular data ───────────────────────────────────────
+
+const SinkHeaders = struct {
+    names: []const []const u8,
+    owned: bool, // true if caller must free `names` slice
+};
+
+fn sinkExtractHeaders(value: Value, allocator: Allocator, err_msg: *[]const u8) ?SinkHeaders {
+    if (value.isObjType(.record)) {
+        const rec = ObjRecord.fromObj(value.asObj());
+        return .{ .names = rec.field_names, .owned = false };
+    }
+    if (value.isObjType(.map)) {
+        const m = ObjMap.fromObj(value.asObj());
+        var names = std.ArrayListUnmanaged([]const u8){};
+        var it = m.entries.iterator();
+        while (it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const name: ?[]const u8 = if (k.isAtom())
+                atomName(k)
+            else if (k.isObj() and k.asObj().obj_type == .string)
+                ObjString.fromObj(k.asObj()).bytes
+            else
+                null;
+            if (name) |n| {
+                names.append(allocator, n) catch {
+                    err_msg.* = "out of memory";
+                    return null;
+                };
+            }
+        }
+        if (names.items.len > 0) {
+            const owned = names.toOwnedSlice(allocator) catch {
+                err_msg.* = "out of memory";
+                return null;
+            };
+            return .{ .names = owned, .owned = true };
+        }
+        names.deinit(allocator);
+    }
+    err_msg.* = "sink() :csv/:tsv/:table/:markdown expects stream of maps or records";
+    return null;
+}
+
+fn sinkFreeHeaders(hdr: SinkHeaders, allocator: Allocator) void {
+    if (hdr.owned) {
+        allocator.free(hdr.names);
+    }
+}
+
+fn sinkLookupField(value: Value, key_name: []const u8) ?Value {
+    if (value.isObjType(.record)) {
+        const rec = ObjRecord.fromObj(value.asObj());
+        for (rec.field_names, 0..) |fn_name, i| {
+            if (std.mem.eql(u8, fn_name, key_name)) return rec.field_values[i];
+        }
+        return null;
+    }
+    if (value.isObjType(.map)) {
+        const m = ObjMap.fromObj(value.asObj());
+        var it = m.entries.iterator();
+        while (it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const name: ?[]const u8 = if (k.isAtom())
+                atomName(k)
+            else if (k.isObj() and k.asObj().obj_type == .string)
+                ObjString.fromObj(k.asObj()).bytes
+            else
+                null;
+            if (name) |n| {
+                if (std.mem.eql(u8, n, key_name)) return entry.value_ptr.*;
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
+fn sinkCsvQuoteField(field: []const u8, delimiter: u8, bw: anytype) !void {
+    var needs_quote = false;
+    for (field) |c| {
+        if (c == delimiter or c == '"' or c == '\n' or c == '\r') {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (needs_quote) {
+        try bw.interface.writeByte('"');
+        for (field) |c| {
+            if (c == '"') {
+                try bw.interface.writeAll("\"\"");
+            } else {
+                try bw.interface.writeByte(c);
+            }
+        }
+        try bw.interface.writeByte('"');
+    } else {
+        try bw.interface.writeAll(field);
+    }
+}
+
+fn sinkWritePadding(bw: anytype, count: usize) void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        bw.interface.writeByte(' ') catch return;
+    }
+}
+
+fn sinkWriteDashes(bw: anytype, count: usize) void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        bw.interface.writeByte('-') catch return;
+    }
 }
 
 /// Fetch HTTP(S) URL body. Returns an ArrayList; caller must call deinit().
@@ -2523,12 +2758,144 @@ fn createJsonStream(content: []const u8, allocator: Allocator, _: *[]const u8) N
     return createStream(state, allocator);
 }
 
-/// source(path_or_atom, format?) -> Stream
-/// source("file.txt") creates a stream of lines from a plain text file.
-/// source("file.jsonl", format: :jsonl) creates Stream(Result(Map, ParseError)).
-/// source("file.json", format: :json) parses entire JSON; arrays streamed element-wise.
-/// source("https://...", :json) fetches URL and parses as JSON.
-/// source(:stdin) reads from standard input.
+/// Parse CSV content into a stream of records.
+/// First row = headers, subsequent rows = records with those field names.
+fn createCsvStream(content: []const u8, delimiter: u8, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    const items_list = try ObjList.create(allocator);
+    trackObj(&items_list.obj);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+
+    // First line = headers.
+    const header_line = lines.next() orelse {
+        // Empty file — return empty stream.
+        const state = try allocator.create(StreamState);
+        state.* = .{ .json_array_iter = .{ .items = Value.fromObj(&items_list.obj), .idx = 0 } };
+        return createStream(state, allocator);
+    };
+
+    var raw_headers = std.ArrayListUnmanaged([]const u8){};
+    defer raw_headers.deinit(allocator);
+    try csvSplitFields(header_line, delimiter, &raw_headers, allocator);
+
+    if (raw_headers.items.len == 0) {
+        err_msg.* = "CSV source: no headers found in first row";
+        return error.RuntimeError;
+    }
+
+    // Dupe header names so they outlive the content buffer.
+    // ObjRecord.create copies the pointer array but not the strings themselves,
+    // so duped strings must stay alive as long as the records exist (GC-managed).
+    const field_names = try allocator.alloc([]const u8, raw_headers.items.len);
+    for (raw_headers.items, 0..) |h, i| {
+        field_names[i] = try allocator.dupe(u8, h);
+    }
+
+    // Parse data rows.
+    var row_num: usize = 1;
+    while (lines.next()) |raw_line| {
+        // Strip trailing \r.
+        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+
+        // Skip empty lines.
+        if (line.len == 0) continue;
+
+        row_num += 1;
+
+        var fields = std.ArrayListUnmanaged([]const u8){};
+        defer fields.deinit(allocator);
+        csvSplitFields(line, delimiter, &fields, allocator) catch {
+            err_msg.* = "CSV parse error";
+            return error.RuntimeError;
+        };
+
+        // Build field values — match number of headers.
+        const field_values = try allocator.alloc(Value, field_names.len);
+        defer allocator.free(field_values);
+
+        for (0..field_names.len) |i| {
+            if (i < fields.items.len) {
+                const str = try ObjString.create(allocator, fields.items[i], null);
+                trackObj(&str.obj);
+                field_values[i] = Value.fromObj(&str.obj);
+            } else {
+                field_values[i] = Value.nil;
+            }
+        }
+
+        const record = try ObjRecord.create(allocator, field_names, field_values);
+        trackObj(&record.obj);
+
+        // Wrap in Result.Ok.
+        const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{Value.fromObj(&record.obj)});
+        trackObj(&ok_adt.obj);
+        try items_list.items.append(allocator, Value.fromObj(&ok_adt.obj));
+    }
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .json_array_iter = .{ .items = Value.fromObj(&items_list.obj), .idx = 0 } };
+    return createStream(state, allocator);
+}
+
+/// Split a CSV line into fields, handling quoted fields.
+fn csvSplitFields(line: []const u8, delimiter: u8, fields: *std.ArrayListUnmanaged([]const u8), allocator: Allocator) !void {
+    if (line.len == 0) return;
+    var pos: usize = 0;
+    while (true) {
+        if (pos < line.len and line[pos] == '"') {
+            // Quoted field.
+            pos += 1;
+            var field_buf = std.ArrayListUnmanaged(u8){};
+            errdefer field_buf.deinit(allocator);
+
+            while (pos < line.len) {
+                if (line[pos] == '"') {
+                    if (pos + 1 < line.len and line[pos + 1] == '"') {
+                        try field_buf.append(allocator, '"');
+                        pos += 2;
+                    } else {
+                        pos += 1;
+                        break;
+                    }
+                } else {
+                    try field_buf.append(allocator, line[pos]);
+                    pos += 1;
+                }
+            }
+            const owned = try allocator.dupe(u8, field_buf.items);
+            field_buf.deinit(allocator);
+            try fields.append(allocator, owned);
+        } else {
+            // Unquoted field.
+            const start = pos;
+            while (pos < line.len and line[pos] != delimiter) : (pos += 1) {}
+            try fields.append(allocator, line[start..pos]);
+        }
+        // After field: expect delimiter or end of line.
+        if (pos >= line.len) break;
+        if (line[pos] == delimiter) {
+            pos += 1;
+            // If delimiter is last char, emit empty trailing field.
+            if (pos >= line.len) {
+                try fields.append(allocator, "");
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// source(uri, format?, auth?) -> Stream
+/// URI-based transport dispatch. Supported schemes:
+///   file://, fs://, bare paths → local file
+///   http://, https://         → HTTP fetch
+///   s3://, gs://, az://       → cloud
+///   :stdin atom               → standard input
+/// Format: :text (default), :jsonl, :json, :csv
 fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
     const first = args[0];
 
@@ -2552,29 +2919,49 @@ fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8
 
     // Must be a string path or URL.
     if (!first.isString()) {
-        err_msg.* = "source() expects a string path, URL, or :stdin atom as first argument";
+        err_msg.* = "source() expects a string URI, path, or :stdin atom as first argument";
         return error.RuntimeError;
     }
 
-    const path_str = ObjString.fromObj(first.asObj());
-    const path = path_str.bytes;
+    const raw_str = ObjString.fromObj(first.asObj());
+    const raw = raw_str.bytes;
     const format = detectSourceFormat(args);
 
-    // HTTP URL path.
-    if (isHttpUrl(path)) {
-        if (format != .json) {
-            err_msg.* = "HTTP sources require :json format";
-            return error.RuntimeError;
-        }
-        var body_list = httpFetch(path, allocator) catch {
-            err_msg.* = "HTTP request failed";
+    // Parse URI to determine transport scheme.
+    const uri = uri_mod.parse(raw) catch {
+        err_msg.* = "unsupported URI scheme";
+        return error.RuntimeError;
+    };
+
+    // Extract optional auth parameter (args[2] if present).
+    const auth_val: ?Value = if (args.len > 2) args[2] else null;
+
+    switch (uri.scheme) {
+        .file => return sourceFile(uri.path, format, allocator, err_msg),
+        .http, .https => return sourceHttp(raw, format, allocator, err_msg),
+        .s3 => return sourceS3(uri, format, auth_val, allocator, err_msg),
+        .gs => return sourceGcs(uri, format, auth_val, allocator, err_msg),
+        .az => return sourceAzure(uri, format, auth_val, allocator, err_msg),
+    }
+}
+
+/// Local file source: reads from the filesystem.
+fn sourceFile(path: []const u8, format: SourceFormat, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    // CSV: read entire file, parse into stream of records.
+    if (format == .csv) {
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024) catch |err| {
+            err_msg.* = switch (err) {
+                error.FileNotFound => "file not found",
+                error.AccessDenied => "permission denied",
+                else => "failed to read file",
+            };
             return error.RuntimeError;
         };
-        defer body_list.deinit(allocator);
-        return createJsonStream(body_list.items, allocator, err_msg);
+        defer allocator.free(content);
+        return createCsvStream(content, ',', allocator, err_msg);
     }
 
-    // Local file: :json format reads entire file and parses.
+    // JSON format reads entire file and parses.
     if (format == .json) {
         const content = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024) catch |err| {
             err_msg.* = switch (err) {
@@ -2588,7 +2975,7 @@ fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8
         return createJsonStream(content, allocator, err_msg);
     }
 
-    // Local file: text or jsonl (existing streaming path).
+    // Text or JSONL: streaming line-by-line reader.
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         err_msg.* = switch (err) {
             error.FileNotFound => "file not found",
@@ -2613,31 +3000,523 @@ fn builtinSource(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     return createStream(state, allocator);
 }
 
-/// sink(stream, path_or_atom, format?) -> Nil
+/// HTTP(S) source: fetches URL and creates a stream based on format.
+fn sourceHttp(url: []const u8, format: SourceFormat, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    var body_list = httpFetch(url, allocator) catch {
+        err_msg.* = "HTTP request failed";
+        return error.RuntimeError;
+    };
+
+    if (format == .json) {
+        defer body_list.deinit(allocator);
+        return createJsonStream(body_list.items, allocator, err_msg);
+    }
+    if (format == .csv) {
+        defer body_list.deinit(allocator);
+        return createCsvStream(body_list.items, ',', allocator, err_msg);
+    }
+
+    // For text and JSONL: transfer ownership of body to a memory reader.
+    const owned = body_list.toOwnedSlice(allocator) catch {
+        body_list.deinit(allocator);
+        err_msg.* = "failed to allocate HTTP response buffer";
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .memory_reader = .{
+        .data = owned,
+        .cursor = 0,
+        .is_jsonl = (format == .jsonl),
+        .line_number = 0,
+        .allocator = allocator,
+    } };
+    return createStream(state, allocator);
+}
+
+/// S3 source: fetches an object from S3 using AWS Signature V4.
+/// Supports single-key fetch and glob patterns (e.g. "s3://bucket/prefix/*.jsonl").
+fn sourceS3(
+    uri: uri_mod.ParsedUri,
+    format: SourceFormat,
+    auth_val: ?Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const bucket = uri.host orelse {
+        err_msg.* = "S3 URI must include bucket name: s3://bucket/key";
+        return error.RuntimeError;
+    };
+    const key = uri.path;
+
+    // Check for glob pattern — if key contains '*' or '?', use ListObjectsV2.
+    if (std.mem.indexOfAny(u8, key, "*?")) |_| {
+        return sourceS3Glob(bucket, key, format, auth_val, allocator, err_msg);
+    }
+
+    // Resolve credentials.
+    var creds = auth_mod.resolveAwsCredentials(auth_val, null, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "S3 credentials not found. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or pass auth: parameter",
+            error.InvalidAuthValue => "auth: parameter must be an atom (named profile) or record {access_key:, secret_key:, region:}",
+            error.InvalidProfile => "AWS profile not found in ~/.aws/credentials",
+            error.ConfigReadError => "failed to read AWS credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    // Fetch S3 object.
+    var body = s3GetObject(bucket, key, creds, allocator) catch {
+        err_msg.* = "S3 GetObject request failed";
+        return error.RuntimeError;
+    };
+
+    if (format == .json) {
+        defer body.deinit(allocator);
+        return createJsonStream(body.items, allocator, err_msg);
+    }
+    if (format == .csv) {
+        defer body.deinit(allocator);
+        return createCsvStream(body.items, ',', allocator, err_msg);
+    }
+
+    // Transfer ownership to memory reader for text/jsonl streaming.
+    const owned = body.toOwnedSlice(allocator) catch {
+        body.deinit(allocator);
+        err_msg.* = "failed to allocate S3 response buffer";
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .memory_reader = .{
+        .data = owned,
+        .cursor = 0,
+        .is_jsonl = (format == .jsonl),
+        .line_number = 0,
+        .allocator = allocator,
+    } };
+    return createStream(state, allocator);
+}
+
+/// Make a signed S3 GetObject HTTP request.
+fn s3GetObject(
+    bucket: []const u8,
+    key: []const u8,
+    creds: auth_mod.AwsCredentials,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged(u8) {
+    // Build URL: https://{bucket}.s3.{region}.amazonaws.com/{key}
+    var url_buf = std.ArrayListUnmanaged(u8){};
+    defer url_buf.deinit(allocator);
+    const uw = url_buf.writer(allocator);
+    try uw.writeAll("https://");
+    try uw.writeAll(bucket);
+    try uw.writeAll(".s3.");
+    try uw.writeAll(creds.region);
+    try uw.writeAll(".amazonaws.com/");
+    try uw.writeAll(key);
+    const url = url_buf.items;
+
+    // Build host header value.
+    var host_buf: [512]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region }) catch
+        return error.HttpFetchFailed;
+
+    // Build canonical URI path: /{key}
+    var path_buf: [2048]u8 = undefined;
+    const uri_path = std.fmt.bufPrint(&path_buf, "/{s}", .{key}) catch
+        return error.HttpFetchFailed;
+
+    // Sign the request.
+    const ts = aws_sig.currentTimestamp();
+    const payload_hash = aws_sig.sha256Hex("");
+
+    const sig_creds = aws_sig.Credentials{
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+        .region = creds.region,
+    };
+
+    const auth_header = aws_sig.signRequest(
+        "GET",
+        uri_path,
+        "",
+        host,
+        &payload_hash,
+        sig_creds,
+        ts,
+        allocator,
+    ) catch return error.HttpFetchFailed;
+    defer allocator.free(auth_header);
+
+    // Make the HTTP request.
+    return s3HttpRequest(.GET, url, null, auth_header, &ts, &payload_hash, creds.session_token, allocator);
+}
+
+/// S3 ListObjectsV2 + multi-key streaming for glob patterns.
+fn sourceS3Glob(
+    bucket: []const u8,
+    key_pattern: []const u8,
+    format: SourceFormat,
+    auth_val: ?Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    // Extract prefix (everything before the first wildcard).
+    const wildcard_pos = std.mem.indexOfAny(u8, key_pattern, "*?") orelse 0;
+    // Find the last '/' before the wildcard to get the directory prefix.
+    const prefix_end = if (wildcard_pos > 0)
+        (std.mem.lastIndexOfScalar(u8, key_pattern[0..wildcard_pos], '/') orelse 0)
+    else
+        0;
+    const prefix = if (prefix_end > 0) key_pattern[0 .. prefix_end + 1] else "";
+
+    // Resolve credentials.
+    var creds = auth_mod.resolveAwsCredentials(auth_val, null, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "S3 credentials not found",
+            error.InvalidAuthValue => "invalid auth: parameter",
+            error.InvalidProfile => "AWS profile not found",
+            error.ConfigReadError => "failed to read AWS credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    // List objects matching the prefix.
+    var keys = s3ListObjects(bucket, prefix, creds, allocator) catch {
+        err_msg.* = "S3 ListObjectsV2 request failed";
+        return error.RuntimeError;
+    };
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+
+    // Filter keys by glob pattern.
+    var matched_keys = std.ArrayListUnmanaged([]const u8){};
+    defer matched_keys.deinit(allocator);
+
+    for (keys.items) |obj_key| {
+        if (globMatch(key_pattern, obj_key)) {
+            const dup = allocator.dupe(u8, obj_key) catch {
+                err_msg.* = "out of memory";
+                return error.OutOfMemory;
+            };
+            matched_keys.append(allocator, dup) catch {
+                allocator.free(dup);
+                err_msg.* = "out of memory";
+                return error.OutOfMemory;
+            };
+        }
+    }
+
+    if (matched_keys.items.len == 0) {
+        // No matching keys — return empty stream.
+        return createEmptyStream(allocator);
+    }
+
+    // For each matched key, fetch and concatenate into one buffer.
+    // This is simpler than creating a multi-stream variant.
+    var combined = std.ArrayListUnmanaged(u8){};
+    errdefer combined.deinit(allocator);
+
+    // Re-resolve creds for each fetch (env creds are still valid).
+    var fetch_creds = auth_mod.resolveAwsCredentials(auth_val, null, &atomName, allocator) catch {
+        err_msg.* = "S3 credentials not found";
+        return error.RuntimeError;
+    };
+    defer fetch_creds.deinit(allocator);
+
+    for (matched_keys.items) |obj_key| {
+        var body = s3GetObject(bucket, obj_key, fetch_creds, allocator) catch {
+            err_msg.* = "S3 GetObject request failed during glob fetch";
+            return error.RuntimeError;
+        };
+        defer body.deinit(allocator);
+
+        combined.appendSlice(allocator, body.items) catch {
+            err_msg.* = "out of memory";
+            return error.OutOfMemory;
+        };
+
+        // Ensure newline separator between files.
+        if (body.items.len > 0 and body.items[body.items.len - 1] != '\n') {
+            combined.append(allocator, '\n') catch {
+                err_msg.* = "out of memory";
+                return error.OutOfMemory;
+            };
+        }
+    }
+
+    // Free matched keys now.
+    for (matched_keys.items) |k| allocator.free(k);
+    matched_keys.clearRetainingCapacity();
+
+    if (format == .json) {
+        defer combined.deinit(allocator);
+        return createJsonStream(combined.items, allocator, err_msg);
+    }
+    if (format == .csv) {
+        defer combined.deinit(allocator);
+        return createCsvStream(combined.items, ',', allocator, err_msg);
+    }
+
+    const owned = combined.toOwnedSlice(allocator) catch {
+        combined.deinit(allocator);
+        err_msg.* = "failed to allocate S3 glob buffer";
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .memory_reader = .{
+        .data = owned,
+        .cursor = 0,
+        .is_jsonl = (format == .jsonl),
+        .line_number = 0,
+        .allocator = allocator,
+    } };
+    return createStream(state, allocator);
+}
+
+/// Make a signed S3 ListObjectsV2 HTTP request.
+/// Returns list of object keys matching the prefix.
+fn s3ListObjects(
+    bucket: []const u8,
+    prefix: []const u8,
+    creds: auth_mod.AwsCredentials,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged([]const u8) {
+    var all_keys = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (all_keys.items) |k| allocator.free(k);
+        all_keys.deinit(allocator);
+    }
+
+    var continuation_token: ?[]u8 = null;
+    defer if (continuation_token) |t| allocator.free(t);
+
+    while (true) {
+        // Build query string: list-type=2&prefix=...
+        var query_buf = std.ArrayListUnmanaged(u8){};
+        defer query_buf.deinit(allocator);
+        const qw = query_buf.writer(allocator);
+        try qw.writeAll("list-type=2&prefix=");
+        try uriEncode(qw, prefix);
+        if (continuation_token) |token| {
+            try qw.writeAll("&continuation-token=");
+            try uriEncode(qw, token);
+        }
+
+        // Build URL.
+        var url_buf = std.ArrayListUnmanaged(u8){};
+        defer url_buf.deinit(allocator);
+        const uw = url_buf.writer(allocator);
+        try uw.writeAll("https://");
+        try uw.writeAll(bucket);
+        try uw.writeAll(".s3.");
+        try uw.writeAll(creds.region);
+        try uw.writeAll(".amazonaws.com/?");
+        try uw.writeAll(query_buf.items);
+
+        var host_buf: [512]u8 = undefined;
+        const host = std.fmt.bufPrint(&host_buf, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region }) catch
+            return error.HttpFetchFailed;
+
+        const ts = aws_sig.currentTimestamp();
+        const payload_hash = aws_sig.sha256Hex("");
+
+        const sig_creds = aws_sig.Credentials{
+            .access_key = creds.access_key,
+            .secret_key = creds.secret_key,
+            .session_token = creds.session_token,
+            .region = creds.region,
+        };
+
+        const auth_header = aws_sig.signRequest(
+            "GET",
+            "/",
+            query_buf.items,
+            host,
+            &payload_hash,
+            sig_creds,
+            ts,
+            allocator,
+        ) catch return error.HttpFetchFailed;
+        defer allocator.free(auth_header);
+
+        var body_list = s3HttpRequest(.GET, url_buf.items, null, auth_header, &ts, &payload_hash, creds.session_token, allocator) catch
+            return error.HttpFetchFailed;
+        defer body_list.deinit(allocator);
+        const xml = body_list.items;
+
+        // Parse XML response for <Key> elements.
+        try parseListObjectKeys(xml, &all_keys, allocator);
+
+        // Check for truncation (<IsTruncated>true</IsTruncated>)
+        if (std.mem.indexOf(u8, xml, "<IsTruncated>true</IsTruncated>")) |_| {
+            // Extract <NextContinuationToken>...</NextContinuationToken>
+            if (continuation_token) |old| allocator.free(old);
+            continuation_token = extractXmlTag(xml, "NextContinuationToken", allocator) catch null;
+            if (continuation_token == null) break;
+        } else {
+            break;
+        }
+    }
+
+    return all_keys;
+}
+
+/// Extract <Key>...</Key> values from S3 ListObjectsV2 XML response.
+fn parseListObjectKeys(
+    xml: []const u8,
+    keys: *std.ArrayListUnmanaged([]const u8),
+    allocator: Allocator,
+) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, pos, "<Key>")) |start| {
+        const content_start = start + 5; // len("<Key>")
+        if (std.mem.indexOfPos(u8, xml, content_start, "</Key>")) |end| {
+            const key_text = xml[content_start..end];
+            const dup = try allocator.dupe(u8, key_text);
+            try keys.append(allocator, dup);
+            pos = end + 6; // len("</Key>")
+        } else {
+            break;
+        }
+    }
+}
+
+/// Extract content of an XML tag. Caller owns returned slice.
+fn extractXmlTag(xml: []const u8, tag: []const u8, allocator: Allocator) ![]u8 {
+    // Build "<tag>" and "</tag>" patterns.
+    var open_buf: [128]u8 = undefined;
+    var close_buf: [128]u8 = undefined;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{tag}) catch return error.OutOfMemory;
+    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{tag}) catch return error.OutOfMemory;
+
+    if (std.mem.indexOf(u8, xml, open)) |start| {
+        const content_start = start + open.len;
+        if (std.mem.indexOfPos(u8, xml, content_start, close)) |end| {
+            return try allocator.dupe(u8, xml[content_start..end]);
+        }
+    }
+    return error.OutOfMemory; // tag not found
+}
+
+/// Simple glob pattern matching (supports * and ? wildcards).
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var pi: usize = 0;
+    var ti: usize = 0;
+    var star_pi: ?usize = null;
+    var star_ti: usize = 0;
+
+    while (ti < text.len) {
+        if (pi < pattern.len and (pattern[pi] == '?' or pattern[pi] == text[ti])) {
+            pi += 1;
+            ti += 1;
+        } else if (pi < pattern.len and pattern[pi] == '*') {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if (star_pi) |sp| {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while (pi < pattern.len and pattern[pi] == '*') : (pi += 1) {}
+    return pi == pattern.len;
+}
+
+/// Percent-encode a string for URI query parameters.
+fn uriEncode(writer: anytype, input: []const u8) !void {
+    for (input) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            try writer.writeByte(c);
+        } else {
+            try writer.writeByte('%');
+            const hex = std.fmt.bytesToHex(&[_]u8{c}, .upper);
+            try writer.writeAll(&hex);
+        }
+    }
+}
+
+/// Create an empty stream that immediately returns None.
+fn createEmptyStream(allocator: Allocator) NativeError!Value {
+    const items_list = try ObjList.create(allocator);
+    trackObj(&items_list.obj);
+    const state = try allocator.create(StreamState);
+    state.* = .{ .json_array_iter = .{
+        .items = Value.fromObj(&items_list.obj),
+        .idx = 0,
+    } };
+    return createStream(state, allocator);
+}
+
+/// sink(stream, path_or_atom, format?, options?) -> Nil
 /// Consumes the stream and writes elements to a file.
 /// sink(stream, "out.txt") writes each element as a line.
-/// sink(stream, "out.jsonl", format: :jsonl) writes each element as JSON per line.
-/// sink(stream, :stdout) writes to standard output.
-/// sink(stream, :stderr) writes to standard error.
+/// sink(stream, "out.jsonl", :jsonl) writes each element as JSON per line.
+/// sink(stream, "out.csv", :csv) writes as CSV with headers.
+/// sink(stream, "out.tsv", :tsv) writes as TSV with headers.
+/// sink(stream, "out.json", :json_pretty) writes indented JSON.
+/// sink(stream, :stdout, :table) writes a pretty-printed table.
+/// sink(stream, :stdout, :markdown) writes a markdown table.
+/// sink(stream, "out.csv", :csv, {header: false, delimiter: ";"}) options map.
+/// sink(stream, "log.txt", :text, {append: true}) append mode.
 fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
-    // First arg must be a stream (or range, auto-wrapped).
+    // First arg must be a stream (or range/list, auto-wrapped).
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
-    // Track whether we have a plain value (non-stream) to write directly.
     const is_stream = first.isObjType(.stream);
 
     const dest = args[1];
 
-    // Determine format.
-    const sink_format: SourceFormat = if (args.len > 2) blk: {
-        if (atomName(args[2])) |name| {
-            if (std.mem.eql(u8, name, "jsonl")) break :blk .jsonl;
-            if (std.mem.eql(u8, name, "json")) break :blk .json;
+    // Determine format and options.
+    var sink_format = parseSinkFormat(args);
+    const opts = parseSinkOptions(args);
+
+    // Handle {pretty: true} on :json format.
+    if (sink_format == .json and args.len > 3) {
+        const ov = args[3];
+        if (ov.isObjType(.record)) {
+            const rec = ObjRecord.fromObj(ov.asObj());
+            for (0..rec.field_count) |i| {
+                if (std.mem.eql(u8, rec.field_names[i], "pretty")) {
+                    if (rec.field_values[i].isBool() and rec.field_values[i].asBool())
+                        sink_format = .json_pretty;
+                }
+            }
+        } else if (ov.isObjType(.map)) {
+            const m = ObjMap.fromObj(ov.asObj());
+            var it = m.entries.iterator();
+            while (it.next()) |entry| {
+                const kn = blk: {
+                    const k = entry.key_ptr.*;
+                    if (k.isAtom()) break :blk atomName(k);
+                    if (k.isObj() and k.asObj().obj_type == .string)
+                        break :blk @as(?[]const u8, ObjString.fromObj(k.asObj()).bytes);
+                    break :blk @as(?[]const u8, null);
+                };
+                if (kn) |n| {
+                    if (std.mem.eql(u8, n, "pretty")) {
+                        const v = entry.value_ptr.*;
+                        if (v.isBool() and v.asBool()) sink_format = .json_pretty;
+                    }
+                }
+            }
         }
-        break :blk .text;
-    } else .text;
+    }
 
     // Determine output target.
     var out_file: std.fs.File = undefined;
@@ -2660,43 +3539,198 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
             return error.RuntimeError;
         }
     } else if (dest.isString()) {
-        const path_str = ObjString.fromObj(dest.asObj());
-        out_file = std.fs.cwd().createFile(path_str.bytes, .{}) catch |err| {
-            err_msg.* = switch (err) {
-                error.AccessDenied => "permission denied",
-                else => "failed to create file",
-            };
+        const dest_str = ObjString.fromObj(dest.asObj());
+        const uri = uri_mod.parse(dest_str.bytes) catch {
+            err_msg.* = "unsupported URI scheme";
             return error.RuntimeError;
         };
+        switch (uri.scheme) {
+            .file => {},
+            .http, .https => {
+                err_msg.* = "HTTP sink not supported";
+                return error.RuntimeError;
+            },
+            .s3 => {
+                // S3 sink: buffer all output to memory, then PutObject.
+                return sinkS3(first, is_stream, uri, sink_format, opts, args, allocator, err_msg);
+            },
+            .gs => {
+                return sinkGcs(first, is_stream, uri, sink_format, opts, args, allocator, err_msg);
+            },
+            .az => {
+                return sinkAzure(first, is_stream, uri, sink_format, opts, args, allocator, err_msg);
+            },
+        }
+        if (opts.append) {
+            // Append mode: create without truncation.
+            out_file = std.fs.cwd().createFile(uri.path, .{ .truncate = false }) catch |err| {
+                err_msg.* = switch (err) {
+                    error.AccessDenied => "permission denied",
+                    else => "failed to create file",
+                };
+                return error.RuntimeError;
+            };
+        } else {
+            out_file = std.fs.cwd().createFile(uri.path, .{}) catch |err| {
+                err_msg.* = switch (err) {
+                    error.AccessDenied => "permission denied",
+                    else => "failed to create file",
+                };
+                return error.RuntimeError;
+            };
+        }
     } else {
-        err_msg.* = "sink() expects a string path or :stdout/:stderr atom as second argument";
+        err_msg.* = "sink() expects a string URI, path, or :stdout/:stderr atom as second argument";
         return error.RuntimeError;
     }
     defer {
         if (!is_std_handle) out_file.close();
     }
 
+    // Gzip compression for local files: buffer → compress → write.
+    if (opts.compress == .gzip and !is_std_handle) {
+        var out_buf = std.ArrayListUnmanaged(u8){};
+        defer out_buf.deinit(allocator);
+        sinkFormatToBuffer(first, is_stream, sink_format, opts, &out_buf, allocator, err_msg) catch |err| return err;
+
+        const compressed = gzipCompress(out_buf.items, allocator) catch {
+            err_msg.* = "gzip compression failed";
+            return error.RuntimeError;
+        };
+        defer allocator.free(compressed);
+
+        out_file.writeAll(compressed) catch {
+            err_msg.* = "failed to write compressed data";
+            return error.RuntimeError;
+        };
+        return Value.nil;
+    }
+
     // Set up buffered writer.
     var write_buf: [64 * 1024]u8 = undefined;
     var bw = out_file.writer(&write_buf);
 
+    // For append mode, start writing at the end of the file.
+    if (opts.append and !is_std_handle) {
+        bw.pos = out_file.getEndPos() catch 0;
+    }
+
     // Non-stream value: write directly and return.
     if (!is_stream) {
-        var write_buf_direct: [64 * 1024]u8 = undefined;
-        var bw_direct = out_file.writer(&write_buf_direct);
-        if (sink_format == .json) {
-            try sinkWriteJsonValue(first, &bw_direct, allocator, err_msg);
-            bw_direct.interface.writeByte('\n') catch {};
+        if ((sink_format == .csv or sink_format == .tsv or
+            sink_format == .table or sink_format == .markdown) and
+            (first.isObjType(.map) or first.isObjType(.record)))
+        {
+            // Single map/record: write tabular output directly.
+            const hdr = sinkExtractHeaders(first, allocator, err_msg) orelse
+                return error.RuntimeError;
+            defer sinkFreeHeaders(hdr, allocator);
+            const headers = hdr.names;
+
+            if (sink_format == .csv or sink_format == .tsv) {
+                const delim: u8 = if (sink_format == .tsv) '\t' else opts.delimiter;
+                if (opts.header) {
+                    for (headers, 0..) |h, i| {
+                        if (i > 0) bw.interface.writeByte(delim) catch {};
+                        if (sink_format == .csv) {
+                            sinkCsvQuoteField(h, delim, &bw) catch {};
+                        } else {
+                            bw.interface.writeAll(h) catch {};
+                        }
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                }
+                for (headers, 0..) |h, i| {
+                    if (i > 0) bw.interface.writeByte(delim) catch {};
+                    if (sinkLookupField(first, h)) |fv| {
+                        const fmt = formatValue(fv, allocator, current_atom_names) catch continue;
+                        defer allocator.free(fmt);
+                        if (sink_format == .csv) {
+                            sinkCsvQuoteField(fmt, delim, &bw) catch {};
+                        } else {
+                            for (fmt) |c| {
+                                bw.interface.writeByte(if (c == '\t' or c == '\n' or c == '\r') ' ' else c) catch {};
+                            }
+                        }
+                    }
+                }
+                bw.interface.writeByte('\n') catch {};
+            } else {
+                // table / markdown: compute column widths from single row.
+                var col_widths_buf: [64]usize = undefined;
+                const col_widths = col_widths_buf[0..headers.len];
+                var cell_buf: [64][]const u8 = undefined;
+                const cells = cell_buf[0..headers.len];
+                for (headers, 0..) |h, i| {
+                    cells[i] = if (sinkLookupField(first, h)) |fv|
+                        (formatValue(fv, allocator, current_atom_names) catch "")
+                    else
+                        "";
+                    col_widths[i] = @max(h.len, cells[i].len);
+                }
+                defer for (cells) |c| {
+                    if (c.len > 0) allocator.free(c);
+                };
+                if (sink_format == .markdown) {
+                    bw.interface.writeByte('|') catch {};
+                    for (headers, 0..) |h, i| {
+                        bw.interface.writeByte(' ') catch {};
+                        bw.interface.writeAll(h) catch {};
+                        sinkWritePadding(&bw, col_widths[i] - h.len);
+                        bw.interface.writeAll(" |") catch {};
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                    bw.interface.writeByte('|') catch {};
+                    for (col_widths) |w| {
+                        bw.interface.writeByte(' ') catch {};
+                        sinkWriteDashes(&bw, w);
+                        bw.interface.writeAll(" |") catch {};
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                    bw.interface.writeByte('|') catch {};
+                    for (cells, 0..) |cell, i| {
+                        bw.interface.writeByte(' ') catch {};
+                        bw.interface.writeAll(cell) catch {};
+                        sinkWritePadding(&bw, col_widths[i] - cell.len);
+                        bw.interface.writeAll(" |") catch {};
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                } else {
+                    for (headers, 0..) |h, i| {
+                        if (i > 0) bw.interface.writeAll("  ") catch {};
+                        bw.interface.writeAll(h) catch {};
+                        sinkWritePadding(&bw, col_widths[i] - h.len);
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                    for (cells, 0..) |cell, i| {
+                        if (i > 0) bw.interface.writeAll("  ") catch {};
+                        bw.interface.writeAll(cell) catch {};
+                        sinkWritePadding(&bw, col_widths[i] - cell.len);
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                }
+            }
+            bw.interface.flush() catch {};
+            return Value.nil;
+        }
+
+        if (sink_format == .json or sink_format == .json_pretty) {
+            if (sink_format == .json_pretty) {
+                try sinkWriteJsonPrettyValue(first, &bw, allocator, opts.indent, err_msg);
+            } else {
+                try sinkWriteJsonValue(first, &bw, allocator, err_msg);
+            }
+            bw.interface.writeByte('\n') catch {};
         } else {
             const formatted = formatValue(first, allocator, current_atom_names) catch {
                 err_msg.* = "failed to format value for sink";
                 return error.RuntimeError;
             };
             defer allocator.free(formatted);
-            bw_direct.interface.writeAll(formatted) catch {};
-            bw_direct.interface.writeByte('\n') catch {};
+            bw.interface.writeAll(formatted) catch {};
+            bw.interface.writeByte('\n') catch {};
         }
-        bw_direct.interface.flush() catch {};
+        bw.interface.flush() catch {};
         return Value.nil;
     }
 
@@ -2706,44 +3740,75 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
 
     const stream_obj = ObjStream.fromObj(first.asObj());
 
-    // Pull loop: consume all elements from the stream.
-    if (sink_format == .json) {
-        // :json — write elements as a JSON array: [elem1,elem2,...]\n
-        bw.interface.writeByte('[') catch {
-            err_msg.* = "failed to write to file";
-            return error.RuntimeError;
-        };
+    switch (sink_format) {
+        .json => {
+            // :json — write elements as a JSON array: [elem1,elem2,...]\n
+            bw.interface.writeByte('[') catch {
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
 
-        var first_elem = true;
-        while (true) {
-            const val = try stream_obj.state.next(allocator);
-            if (isAdtVariant(val, 0, 1)) break; // None
-            const elem = adtPayload(val, 0);
+            var first_elem = true;
+            while (true) {
+                const val = try stream_obj.state.next(allocator);
+                if (isAdtVariant(val, 0, 1)) break;
+                const elem = adtPayload(val, 0);
 
-            if (!first_elem) {
-                bw.interface.writeByte(',') catch {
-                    err_msg.* = "failed to write to file";
-                    return error.RuntimeError;
-                };
+                if (!first_elem) {
+                    bw.interface.writeByte(',') catch {
+                        err_msg.* = "failed to write to file";
+                        return error.RuntimeError;
+                    };
+                }
+                first_elem = false;
+
+                try sinkWriteJsonValue(elem, &bw, allocator, err_msg);
             }
-            first_elem = false;
 
-            try sinkWriteJsonValue(elem, &bw, allocator, err_msg);
-        }
+            bw.interface.writeAll("]\n") catch {
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
+        },
 
-        bw.interface.writeAll("]\n") catch {
-            err_msg.* = "failed to write to file";
-            return error.RuntimeError;
-        };
-    } else {
-        while (true) {
-            const val = try stream_obj.state.next(allocator);
-            if (isAdtVariant(val, 0, 1)) break; // None
-            const elem = adtPayload(val, 0);
+        .json_pretty => {
+            // :json_pretty — write elements as an indented JSON array.
+            const indent = opts.indent;
+            bw.interface.writeAll("[\n") catch {
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
 
-            if (sink_format == .jsonl) {
-                // JSONL: if the element is a list (e.g. from batch()), flatten it
-                // so each sub-element is written as a separate JSON line.
+            var first_elem = true;
+            while (true) {
+                const val = try stream_obj.state.next(allocator);
+                if (isAdtVariant(val, 0, 1)) break;
+                const elem = adtPayload(val, 0);
+
+                if (!first_elem) {
+                    bw.interface.writeAll(",\n") catch {
+                        err_msg.* = "failed to write to file";
+                        return error.RuntimeError;
+                    };
+                }
+                first_elem = false;
+
+                sinkWritePadding(&bw, indent);
+                try sinkWriteJsonPrettyValueAtDepth(elem, &bw, allocator, indent, 1, err_msg);
+            }
+
+            bw.interface.writeAll("\n]\n") catch {
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
+        },
+
+        .jsonl => {
+            while (true) {
+                const val = try stream_obj.state.next(allocator);
+                if (isAdtVariant(val, 0, 1)) break;
+                const elem = adtPayload(val, 0);
+
                 if (elem.isObjType(.list)) {
                     const lst = ObjList.fromObj(elem.asObj());
                     for (lst.items.items) |item| {
@@ -2752,8 +3817,174 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
                 } else {
                     try sinkWriteJsonlLine(elem, &bw, allocator, err_msg);
                 }
+            }
+        },
+
+        .csv, .tsv => {
+            const delim: u8 = if (sink_format == .tsv) '\t' else opts.delimiter;
+            var hdr_info: ?SinkHeaders = null;
+            defer if (hdr_info) |hi| sinkFreeHeaders(hi, allocator);
+            var first_elem = true;
+
+            while (true) {
+                const val = try stream_obj.state.next(allocator);
+                if (isAdtVariant(val, 0, 1)) break;
+                const elem = adtPayload(val, 0);
+
+                if (first_elem) {
+                    hdr_info = sinkExtractHeaders(elem, allocator, err_msg);
+                    if (hdr_info == null) return error.RuntimeError;
+
+                    if (opts.header) {
+                        // Write header row.
+                        for (hdr_info.?.names, 0..) |h, i| {
+                            if (i > 0) bw.interface.writeByte(delim) catch {};
+                            if (sink_format == .csv) {
+                                sinkCsvQuoteField(h, delim, &bw) catch {};
+                            } else {
+                                bw.interface.writeAll(h) catch {};
+                            }
+                        }
+                        bw.interface.writeByte('\n') catch {};
+                    }
+                    first_elem = false;
+                }
+
+                // Write data row.
+                if (hdr_info) |hi| {
+                    for (hi.names, 0..) |h, i| {
+                        if (i > 0) bw.interface.writeByte(delim) catch {};
+                        if (sinkLookupField(elem, h)) |field_val| {
+                            const formatted = formatValue(field_val, allocator, current_atom_names) catch continue;
+                            defer allocator.free(formatted);
+                            if (sink_format == .csv) {
+                                sinkCsvQuoteField(formatted, delim, &bw) catch {};
+                            } else {
+                                // TSV: replace tabs/newlines with spaces.
+                                for (formatted) |c| {
+                                    if (c == '\t' or c == '\n' or c == '\r') {
+                                        bw.interface.writeByte(' ') catch {};
+                                    } else {
+                                        bw.interface.writeByte(c) catch {};
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                }
+            }
+        },
+
+        .table, .markdown => {
+            // Buffer all elements to compute column widths.
+            var elements = std.ArrayListUnmanaged(Value){};
+            defer elements.deinit(allocator);
+
+            while (true) {
+                const val = try stream_obj.state.next(allocator);
+                if (isAdtVariant(val, 0, 1)) break;
+                elements.append(allocator, adtPayload(val, 0)) catch {
+                    err_msg.* = "out of memory";
+                    return error.RuntimeError;
+                };
+            }
+
+            if (elements.items.len == 0) {
+                bw.interface.flush() catch {};
+                return Value.nil;
+            }
+
+            const hdr = sinkExtractHeaders(elements.items[0], allocator, err_msg) orelse
+                return error.RuntimeError;
+            defer sinkFreeHeaders(hdr, allocator);
+            const headers = hdr.names;
+
+            // Format all cells and compute max column widths.
+            var col_widths_buf: [64]usize = undefined;
+            const col_widths = col_widths_buf[0..headers.len];
+            for (headers, 0..) |h, i| {
+                col_widths[i] = h.len;
+            }
+
+            // We'll store formatted cell strings in a flat list.
+            var cell_storage = std.ArrayListUnmanaged([]const u8){};
+            defer {
+                for (cell_storage.items) |s| {
+                    if (s.len > 0) allocator.free(s);
+                }
+                cell_storage.deinit(allocator);
+            }
+
+            for (elements.items) |elem| {
+                for (headers, 0..) |h, col| {
+                    const cell_str: []const u8 = if (sinkLookupField(elem, h)) |fv|
+                        (formatValue(fv, allocator, current_atom_names) catch "")
+                    else
+                        "";
+                    cell_storage.append(allocator, cell_str) catch {};
+                    if (cell_str.len > col_widths[col]) col_widths[col] = cell_str.len;
+                }
+            }
+
+            const ncols = headers.len;
+
+            if (sink_format == .markdown) {
+                // Header: | col1 | col2 |
+                bw.interface.writeByte('|') catch {};
+                for (headers, 0..) |h, i| {
+                    bw.interface.writeByte(' ') catch {};
+                    bw.interface.writeAll(h) catch {};
+                    sinkWritePadding(&bw, col_widths[i] - h.len);
+                    bw.interface.writeAll(" |") catch {};
+                }
+                bw.interface.writeByte('\n') catch {};
+                // Separator: | --- | --- |
+                bw.interface.writeByte('|') catch {};
+                for (col_widths) |w| {
+                    bw.interface.writeByte(' ') catch {};
+                    sinkWriteDashes(&bw, w);
+                    bw.interface.writeAll(" |") catch {};
+                }
+                bw.interface.writeByte('\n') catch {};
+                // Data rows.
+                for (0..elements.items.len) |row| {
+                    bw.interface.writeByte('|') catch {};
+                    for (0..ncols) |col| {
+                        const cell = cell_storage.items[row * ncols + col];
+                        bw.interface.writeByte(' ') catch {};
+                        bw.interface.writeAll(cell) catch {};
+                        sinkWritePadding(&bw, col_widths[col] - cell.len);
+                        bw.interface.writeAll(" |") catch {};
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                }
             } else {
-                // Plain text: format as string, write as line.
+                // Plain table: header row, then data rows (space-padded).
+                for (headers, 0..) |h, i| {
+                    if (i > 0) bw.interface.writeAll("  ") catch {};
+                    bw.interface.writeAll(h) catch {};
+                    sinkWritePadding(&bw, col_widths[i] - h.len);
+                }
+                bw.interface.writeByte('\n') catch {};
+                for (0..elements.items.len) |row| {
+                    for (0..ncols) |col| {
+                        if (col > 0) bw.interface.writeAll("  ") catch {};
+                        const cell = cell_storage.items[row * ncols + col];
+                        bw.interface.writeAll(cell) catch {};
+                        sinkWritePadding(&bw, col_widths[col] - cell.len);
+                    }
+                    bw.interface.writeByte('\n') catch {};
+                }
+            }
+        },
+
+        .text => {
+            while (true) {
+                const val = try stream_obj.state.next(allocator);
+                if (isAdtVariant(val, 0, 1)) break;
+                const elem = adtPayload(val, 0);
+
                 const formatted = formatValue(elem, allocator, current_atom_names) catch {
                     err_msg.* = "failed to format value for sink";
                     return error.RuntimeError;
@@ -2768,7 +3999,7 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
                     return error.RuntimeError;
                 };
             }
-        }
+        },
     }
 
     // CRITICAL: flush buffered writer before closing.
@@ -2848,6 +4079,51 @@ fn sinkWriteJsonlLine(
         err_msg.* = "failed to write newline to file";
         return error.RuntimeError;
     };
+}
+
+/// Write a single value as pretty-printed JSON (no trailing newline).
+fn sinkWriteJsonPrettyValue(
+    value: Value,
+    bw: anytype,
+    allocator: Allocator,
+    indent: u8,
+    err_msg: *[]const u8,
+) NativeError!void {
+    return sinkWriteJsonPrettyValueAtDepth(value, bw, allocator, indent, 0, err_msg);
+}
+
+fn sinkWriteJsonPrettyValueAtDepth(
+    value: Value,
+    bw: anytype,
+    allocator: Allocator,
+    indent: u8,
+    depth: u16,
+    err_msg: *[]const u8,
+) NativeError!void {
+    if (current_vm) |vm_ptr| {
+        if (track_obj_fn) |tfn| {
+            json_mod.setVM(vm_ptr, tfn);
+        }
+    }
+    if (current_atom_names) |names| {
+        json_mod.setAtomNames(names);
+    }
+    const emit_result = json_mod.emitPrettyAtDepth(value, allocator, indent, depth);
+    json_mod.clearVM();
+    switch (emit_result) {
+        .ok => |json_bytes| {
+            bw.interface.writeAll(json_bytes) catch {
+                allocator.free(json_bytes);
+                err_msg.* = "failed to write to file";
+                return error.RuntimeError;
+            };
+            allocator.free(json_bytes);
+        },
+        .err => |msg| {
+            err_msg.* = msg;
+            return error.RuntimeError;
+        },
+    }
 }
 
 // ── Concurrency stream operators ─────────────────────────────────────
@@ -3224,9 +4500,1363 @@ fn builtinAvg(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     return makeSome(Value.fromFloat(result), allocator);
 }
 
+/// S3 sink: buffer formatted output to a temp file, then PutObject.
+/// Reuses the existing sink formatting by writing to a temp file first.
+fn sinkS3(
+    stream_val: Value,
+    is_stream: bool,
+    uri: uri_mod.ParsedUri,
+    sink_format: SinkFormat,
+    opts: SinkOptions,
+    args: []const Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const bucket = uri.host orelse {
+        err_msg.* = "S3 URI must include bucket name: s3://bucket/key";
+        return error.RuntimeError;
+    };
+    const key = uri.path;
+
+    // Extract auth parameter. For sink, auth is at args[4] if present
+    // (args = [stream, dest, format?, options?, auth?]).
+    // But we also check args[2] and args[3] for atoms/records.
+    const auth_val: ?Value = blk: {
+        // Walk through optional args looking for auth value.
+        // Format is an atom like :jsonl. Options is a record/map.
+        // Auth is an atom (profile) or record (explicit creds).
+        // We look at args past format and options.
+        var idx: usize = 2;
+        // Skip format atom if present.
+        if (idx < args.len and args[idx].isAtom()) idx += 1;
+        // Skip options map/record if present.
+        if (idx < args.len and (args[idx].isObjType(.record) or args[idx].isObjType(.map))) idx += 1;
+        // Next value (if any) is auth.
+        if (idx < args.len) break :blk args[idx];
+        break :blk null;
+    };
+
+    // Resolve credentials.
+    var creds = auth_mod.resolveAwsCredentials(auth_val, null, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "S3 credentials not found. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+            error.InvalidAuthValue => "invalid auth: parameter for S3 sink",
+            error.InvalidProfile => "AWS profile not found in ~/.aws/credentials",
+            error.ConfigReadError => "failed to read AWS credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    var out_buf = std.ArrayListUnmanaged(u8){};
+    defer out_buf.deinit(allocator);
+    sinkFormatToBuffer(stream_val, is_stream, sink_format, opts, &out_buf, allocator, err_msg) catch |err| return err;
+
+    // Apply compression if requested.
+    const upload = maybeCompress(out_buf.items, opts, allocator) catch {
+        err_msg.* = "gzip compression failed";
+        return error.RuntimeError;
+    };
+    defer if (upload.owned) allocator.free(@constCast(upload.buf));
+
+    // Upload with retry.
+    var attempts: u8 = 0;
+    while (true) {
+        if (s3PutObject(bucket, key, upload.buf, creds, allocator)) {
+            break;
+        } else |_| {
+            if (attempts < opts.retry) {
+                attempts += 1;
+                continue;
+            }
+            err_msg.* = "S3 PutObject request failed";
+            return error.RuntimeError;
+        }
+    }
+
+    return Value.nil;
+}
+
+/// Format stream/value output into a memory buffer (for S3 upload).
+/// Supports text, jsonl, and json formats.
+fn sinkFormatToBuffer(
+    stream_val: Value,
+    is_stream: bool,
+    sink_format: SinkFormat,
+    opts: SinkOptions,
+    out_buf: *std.ArrayListUnmanaged(u8),
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!void {
+    _ = opts;
+    if (!is_stream) {
+        // Non-stream single value.
+        const formatted = formatValue(stream_val, allocator, current_atom_names) catch {
+            err_msg.* = "failed to format value";
+            return error.RuntimeError;
+        };
+        defer allocator.free(formatted);
+        out_buf.appendSlice(allocator, formatted) catch return error.OutOfMemory;
+        out_buf.append(allocator, '\n') catch return error.OutOfMemory;
+        return;
+    }
+
+    const stream_obj = ObjStream.fromObj(stream_val.asObj());
+
+    if (sink_format == .json or sink_format == .json_pretty) {
+        // Collect all elements and format as JSON array.
+        var items = std.ArrayListUnmanaged(Value){};
+        defer items.deinit(allocator);
+
+        while (true) {
+            const val = stream_obj.state.next(allocator) catch {
+                err_msg.* = "stream error during S3 sink";
+                return error.RuntimeError;
+            };
+            // Option.None = type_id=0, variant_idx=1
+            if (isAdtVariant(val, 0, 1)) break;
+            const inner = adtPayload(val, 0);
+            items.append(allocator, inner) catch return error.OutOfMemory;
+        }
+
+        const w = out_buf.writer(allocator);
+        w.writeByte('[') catch return error.OutOfMemory;
+        for (items.items, 0..) |item, i| {
+            if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+            if (sink_format == .json_pretty) w.writeByte('\n') catch return error.OutOfMemory;
+            switch (json_mod.emit(item, allocator)) {
+                .ok => |s| {
+                    defer allocator.free(s);
+                    w.writeAll(s) catch return error.OutOfMemory;
+                },
+                .err => continue,
+            }
+        }
+        if (sink_format == .json_pretty and items.items.len > 0) {
+            w.writeByte('\n') catch return error.OutOfMemory;
+        }
+        w.writeByte(']') catch return error.OutOfMemory;
+        w.writeByte('\n') catch return error.OutOfMemory;
+        return;
+    }
+
+    // Text and JSONL: line-by-line.
+    while (true) {
+        const val = stream_obj.state.next(allocator) catch {
+            err_msg.* = "stream error during S3 sink";
+            return error.RuntimeError;
+        };
+        if (isAdtVariant(val, 0, 1)) break;
+        const inner = adtPayload(val, 0);
+
+        if (sink_format == .jsonl) {
+            switch (json_mod.emit(inner, allocator)) {
+                .ok => |s| {
+                    defer allocator.free(s);
+                    out_buf.appendSlice(allocator, s) catch return error.OutOfMemory;
+                },
+                .err => continue,
+            }
+        } else {
+            // Text format.
+            const formatted = formatValue(inner, allocator, current_atom_names) catch continue;
+            defer allocator.free(formatted);
+            out_buf.appendSlice(allocator, formatted) catch return error.OutOfMemory;
+        }
+        out_buf.append(allocator, '\n') catch return error.OutOfMemory;
+    }
+}
+
+/// Make a signed S3 PutObject HTTP request.
+fn s3PutObject(
+    bucket: []const u8,
+    key: []const u8,
+    body: []const u8,
+    creds: auth_mod.AwsCredentials,
+    allocator: Allocator,
+) !void {
+    // Build URL.
+    var url_buf = std.ArrayListUnmanaged(u8){};
+    defer url_buf.deinit(allocator);
+    const uw = url_buf.writer(allocator);
+    try uw.writeAll("https://");
+    try uw.writeAll(bucket);
+    try uw.writeAll(".s3.");
+    try uw.writeAll(creds.region);
+    try uw.writeAll(".amazonaws.com/");
+    try uw.writeAll(key);
+
+    var host_buf: [512]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_buf, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region }) catch
+        return error.HttpFetchFailed;
+
+    var path_buf: [2048]u8 = undefined;
+    const uri_path = std.fmt.bufPrint(&path_buf, "/{s}", .{key}) catch
+        return error.HttpFetchFailed;
+
+    const payload_hash = aws_sig.sha256Hex(body);
+    const ts = aws_sig.currentTimestamp();
+
+    const sig_creds = aws_sig.Credentials{
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+        .region = creds.region,
+    };
+
+    const auth_header = aws_sig.signRequest(
+        "PUT",
+        uri_path,
+        "",
+        host,
+        &payload_hash,
+        sig_creds,
+        ts,
+        allocator,
+    ) catch return error.HttpFetchFailed;
+    defer allocator.free(auth_header);
+
+    _ = s3HttpRequest(.PUT, url_buf.items, body, auth_header, &ts, &payload_hash, creds.session_token, allocator) catch
+        return error.HttpFetchFailed;
+}
+
+/// Shared helper for S3 HTTP requests with Sig V4 auth.
+/// For GET: returns response body. For PUT: sends body and returns empty list.
+fn s3HttpRequest(
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    auth_header: []const u8,
+    ts: *const aws_sig.AwsTimestamp,
+    payload_hash: *const [64]u8,
+    session_token: ?[]const u8,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged(u8) {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var extra_headers_buf: [4]std.http.Header = undefined;
+    var header_count: usize = 0;
+    extra_headers_buf[header_count] = .{ .name = "x-amz-date", .value = &ts.datetime };
+    header_count += 1;
+    extra_headers_buf[header_count] = .{ .name = "x-amz-content-sha256", .value = payload_hash };
+    header_count += 1;
+    if (session_token) |token| {
+        extra_headers_buf[header_count] = .{ .name = "x-amz-security-token", .value = token };
+        header_count += 1;
+    }
+
+    if (method == .PUT) {
+        // PUT request: send body, don't collect response.
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .PUT,
+            .payload = body,
+            .headers = .{
+                .authorization = .{ .override = auth_header },
+            },
+            .extra_headers = extra_headers_buf[0..header_count],
+        }) catch return error.HttpFetchFailed;
+
+        if (result.status != .ok) return error.HttpStatusError;
+        return std.ArrayListUnmanaged(u8){};
+    }
+
+    // GET request: collect response body.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{
+            .authorization = .{ .override = auth_header },
+        },
+        .extra_headers = extra_headers_buf[0..header_count],
+        .response_writer = &aw.writer,
+    }) catch {
+        // On fetch failure, free any partial buffer.
+        if (aw.writer.buffer.len > 0) allocator.free(aw.writer.buffer);
+        return error.HttpFetchFailed;
+    };
+
+    if (result.status != .ok) {
+        aw.deinit();
+        return error.HttpStatusError;
+    }
+
+    return aw.toArrayList();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── GCS Transport ────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+const GCS_HOST = "storage.googleapis.com";
+
+/// GCS source: fetches an object from Google Cloud Storage.
+/// Supports HMAC (S3-compat Sig V4) and Bearer token auth modes.
+fn sourceGcs(
+    uri: uri_mod.ParsedUri,
+    format: SourceFormat,
+    auth_val: ?Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const bucket = uri.host orelse {
+        err_msg.* = "GCS URI must include bucket name: gs://bucket/key";
+        return error.RuntimeError;
+    };
+    const key = uri.path;
+
+    // Check for glob pattern.
+    if (std.mem.indexOfAny(u8, key, "*?")) |_| {
+        return sourceGcsGlob(bucket, key, format, auth_val, allocator, err_msg);
+    }
+
+    var creds = auth_mod.resolveGcsCredentials(auth_val, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "GCS credentials not found. Set GCS_HMAC_ACCESS_KEY/GCS_HMAC_SECRET_KEY or GOOGLE_BEARER_TOKEN, or pass auth: parameter",
+            error.InvalidAuthValue => "auth: parameter must be an atom (profile) or record {access_key:, secret_key:} / {token:}",
+            error.InvalidProfile => "GCS profile not found in credentials file",
+            error.ConfigReadError => "failed to read credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    var body = gcsGetObject(bucket, key, creds, allocator) catch {
+        err_msg.* = "GCS GetObject request failed";
+        return error.RuntimeError;
+    };
+
+    if (format == .json) {
+        defer body.deinit(allocator);
+        return createJsonStream(body.items, allocator, err_msg);
+    }
+
+    const owned = body.toOwnedSlice(allocator) catch {
+        body.deinit(allocator);
+        err_msg.* = "failed to allocate GCS response buffer";
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .memory_reader = .{
+        .data = owned,
+        .cursor = 0,
+        .is_jsonl = (format == .jsonl),
+        .line_number = 0,
+        .allocator = allocator,
+    } };
+    return createStream(state, allocator);
+}
+
+/// GCS sink: buffer formatted output, then PutObject.
+fn sinkGcs(
+    stream_val: Value,
+    is_stream: bool,
+    uri: uri_mod.ParsedUri,
+    sink_format: SinkFormat,
+    opts: SinkOptions,
+    args: []const Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const bucket = uri.host orelse {
+        err_msg.* = "GCS URI must include bucket name: gs://bucket/key";
+        return error.RuntimeError;
+    };
+    const key = uri.path;
+
+    // Extract auth — walk past format atom and options record.
+    const auth_val: ?Value = blk: {
+        var idx: usize = 2;
+        if (idx < args.len and args[idx].isAtom()) idx += 1;
+        if (idx < args.len and (args[idx].isObjType(.record) or args[idx].isObjType(.map))) idx += 1;
+        if (idx < args.len) break :blk args[idx];
+        break :blk null;
+    };
+
+    var creds = auth_mod.resolveGcsCredentials(auth_val, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "GCS credentials not found. Set GCS_HMAC_ACCESS_KEY/GCS_HMAC_SECRET_KEY or GOOGLE_BEARER_TOKEN",
+            error.InvalidAuthValue => "invalid auth: parameter for GCS sink",
+            error.InvalidProfile => "GCS profile not found",
+            error.ConfigReadError => "failed to read credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    var out_buf = std.ArrayListUnmanaged(u8){};
+    defer out_buf.deinit(allocator);
+
+    sinkFormatToBuffer(stream_val, is_stream, sink_format, opts, &out_buf, allocator, err_msg) catch |err| return err;
+
+    const upload = maybeCompress(out_buf.items, opts, allocator) catch {
+        err_msg.* = "gzip compression failed";
+        return error.RuntimeError;
+    };
+    defer if (upload.owned) allocator.free(@constCast(upload.buf));
+
+    var attempts: u8 = 0;
+    while (true) {
+        if (gcsPutObject(bucket, key, upload.buf, creds, allocator)) {
+            break;
+        } else |_| {
+            if (attempts < opts.retry) { attempts += 1; continue; }
+            err_msg.* = "GCS PutObject request failed";
+            return error.RuntimeError;
+        }
+    }
+
+    return Value.nil;
+}
+
+/// Fetch a GCS object. Dispatches to HMAC or Bearer mode.
+fn gcsGetObject(
+    bucket: []const u8,
+    key: []const u8,
+    creds: auth_mod.GcsCredentials,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged(u8) {
+    // Build URL: https://storage.googleapis.com/{bucket}/{key}
+    var url_buf = std.ArrayListUnmanaged(u8){};
+    defer url_buf.deinit(allocator);
+    const uw = url_buf.writer(allocator);
+    try uw.writeAll("https://");
+    try uw.writeAll(GCS_HOST);
+    try uw.writeByte('/');
+    try uw.writeAll(bucket);
+    try uw.writeByte('/');
+    try uw.writeAll(key);
+
+    switch (creds.mode) {
+        .hmac => {
+            // Canonical URI: /{bucket}/{key}
+            var path_buf: [2048]u8 = undefined;
+            const uri_path = std.fmt.bufPrint(&path_buf, "/{s}/{s}", .{ bucket, key }) catch
+                return error.HttpFetchFailed;
+
+            const ts = aws_sig.currentTimestamp();
+            const payload_hash = aws_sig.sha256Hex("");
+            const sig_creds = aws_sig.Credentials{
+                .access_key = creds.access_key,
+                .secret_key = creds.secret_key,
+                .region = creds.region,
+            };
+            const auth_header = aws_sig.signRequest("GET", uri_path, "", GCS_HOST, &payload_hash, sig_creds, ts, allocator) catch
+                return error.HttpFetchFailed;
+            defer allocator.free(auth_header);
+
+            return s3HttpRequest(.GET, url_buf.items, null, auth_header, &ts, &payload_hash, null, allocator);
+        },
+        .bearer => {
+            return gcsBearerRequest(.GET, url_buf.items, null, creds.token, allocator);
+        },
+    }
+}
+
+/// Upload an object to GCS. Dispatches to HMAC or Bearer mode.
+fn gcsPutObject(
+    bucket: []const u8,
+    key: []const u8,
+    body: []const u8,
+    creds: auth_mod.GcsCredentials,
+    allocator: Allocator,
+) !void {
+    var url_buf = std.ArrayListUnmanaged(u8){};
+    defer url_buf.deinit(allocator);
+    const uw = url_buf.writer(allocator);
+    try uw.writeAll("https://");
+    try uw.writeAll(GCS_HOST);
+    try uw.writeByte('/');
+    try uw.writeAll(bucket);
+    try uw.writeByte('/');
+    try uw.writeAll(key);
+
+    switch (creds.mode) {
+        .hmac => {
+            var path_buf: [2048]u8 = undefined;
+            const uri_path = std.fmt.bufPrint(&path_buf, "/{s}/{s}", .{ bucket, key }) catch
+                return error.HttpFetchFailed;
+
+            const payload_hash = aws_sig.sha256Hex(body);
+            const ts = aws_sig.currentTimestamp();
+            const sig_creds = aws_sig.Credentials{
+                .access_key = creds.access_key,
+                .secret_key = creds.secret_key,
+                .region = creds.region,
+            };
+            const auth_header = aws_sig.signRequest("PUT", uri_path, "", GCS_HOST, &payload_hash, sig_creds, ts, allocator) catch
+                return error.HttpFetchFailed;
+            defer allocator.free(auth_header);
+
+            _ = s3HttpRequest(.PUT, url_buf.items, body, auth_header, &ts, &payload_hash, null, allocator) catch
+                return error.HttpFetchFailed;
+        },
+        .bearer => {
+            _ = gcsBearerRequest(.PUT, url_buf.items, body, creds.token, allocator) catch
+                return error.HttpFetchFailed;
+        },
+    }
+}
+
+/// GCS glob: list objects and fetch matching keys.
+fn sourceGcsGlob(
+    bucket: []const u8,
+    key_pattern: []const u8,
+    format: SourceFormat,
+    auth_val: ?Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const wildcard_pos = std.mem.indexOfAny(u8, key_pattern, "*?") orelse 0;
+    const prefix_end = if (wildcard_pos > 0)
+        (std.mem.lastIndexOfScalar(u8, key_pattern[0..wildcard_pos], '/') orelse 0)
+    else
+        0;
+    const prefix = if (prefix_end > 0) key_pattern[0 .. prefix_end + 1] else "";
+
+    var creds = auth_mod.resolveGcsCredentials(auth_val, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "GCS credentials not found",
+            error.InvalidAuthValue => "invalid auth: parameter",
+            error.InvalidProfile => "GCS profile not found",
+            error.ConfigReadError => "failed to read credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    // List objects.
+    var keys = gcsListObjects(bucket, prefix, creds, allocator) catch {
+        err_msg.* = "GCS list objects request failed";
+        return error.RuntimeError;
+    };
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+
+    // Filter by glob pattern.
+    var matched_keys = std.ArrayListUnmanaged([]const u8){};
+    defer matched_keys.deinit(allocator);
+
+    for (keys.items) |obj_key| {
+        if (globMatch(key_pattern, obj_key)) {
+            const dup = allocator.dupe(u8, obj_key) catch return error.OutOfMemory;
+            matched_keys.append(allocator, dup) catch {
+                allocator.free(dup);
+                return error.OutOfMemory;
+            };
+        }
+    }
+
+    if (matched_keys.items.len == 0) {
+        return createEmptyStream(allocator);
+    }
+
+    // Fetch and concatenate.
+    var combined = std.ArrayListUnmanaged(u8){};
+    errdefer combined.deinit(allocator);
+
+    var fetch_creds = auth_mod.resolveGcsCredentials(auth_val, &atomName, allocator) catch {
+        err_msg.* = "GCS credentials not found";
+        return error.RuntimeError;
+    };
+    defer fetch_creds.deinit(allocator);
+
+    for (matched_keys.items) |obj_key| {
+        var body = gcsGetObject(bucket, obj_key, fetch_creds, allocator) catch {
+            err_msg.* = "GCS GetObject request failed during glob fetch";
+            return error.RuntimeError;
+        };
+        defer body.deinit(allocator);
+        combined.appendSlice(allocator, body.items) catch return error.OutOfMemory;
+        if (body.items.len > 0 and body.items[body.items.len - 1] != '\n') {
+            combined.append(allocator, '\n') catch return error.OutOfMemory;
+        }
+    }
+
+    for (matched_keys.items) |k| allocator.free(k);
+    matched_keys.clearRetainingCapacity();
+
+    if (format == .json) {
+        defer combined.deinit(allocator);
+        return createJsonStream(combined.items, allocator, err_msg);
+    }
+    if (format == .csv) {
+        defer combined.deinit(allocator);
+        return createCsvStream(combined.items, ',', allocator, err_msg);
+    }
+
+    const owned = combined.toOwnedSlice(allocator) catch {
+        combined.deinit(allocator);
+        err_msg.* = "failed to allocate GCS glob buffer";
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .memory_reader = .{
+        .data = owned,
+        .cursor = 0,
+        .is_jsonl = (format == .jsonl),
+        .line_number = 0,
+        .allocator = allocator,
+    } };
+    return createStream(state, allocator);
+}
+
+/// List objects in a GCS bucket with a prefix.
+fn gcsListObjects(
+    bucket: []const u8,
+    prefix: []const u8,
+    creds: auth_mod.GcsCredentials,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged([]const u8) {
+    var all_keys = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (all_keys.items) |k| allocator.free(k);
+        all_keys.deinit(allocator);
+    }
+
+    switch (creds.mode) {
+        .hmac => {
+            // Use S3-compat ListObjectsV2 API.
+            var continuation_token: ?[]u8 = null;
+            defer if (continuation_token) |t| allocator.free(t);
+
+            while (true) {
+                var query_buf = std.ArrayListUnmanaged(u8){};
+                defer query_buf.deinit(allocator);
+                const qw = query_buf.writer(allocator);
+                try qw.writeAll("list-type=2&prefix=");
+                try uriEncode(qw, prefix);
+                if (continuation_token) |token| {
+                    try qw.writeAll("&continuation-token=");
+                    try uriEncode(qw, token);
+                }
+
+                var url_buf = std.ArrayListUnmanaged(u8){};
+                defer url_buf.deinit(allocator);
+                const uw = url_buf.writer(allocator);
+                try uw.writeAll("https://");
+                try uw.writeAll(GCS_HOST);
+                try uw.writeByte('/');
+                try uw.writeAll(bucket);
+                try uw.writeAll("/?");
+                try uw.writeAll(query_buf.items);
+
+                var path_buf: [2048]u8 = undefined;
+                const uri_path = std.fmt.bufPrint(&path_buf, "/{s}/", .{bucket}) catch
+                    return error.HttpFetchFailed;
+
+                const ts = aws_sig.currentTimestamp();
+                const payload_hash = aws_sig.sha256Hex("");
+                const sig_creds = aws_sig.Credentials{
+                    .access_key = creds.access_key,
+                    .secret_key = creds.secret_key,
+                    .region = creds.region,
+                };
+                const auth_header = aws_sig.signRequest("GET", uri_path, query_buf.items, GCS_HOST, &payload_hash, sig_creds, ts, allocator) catch
+                    return error.HttpFetchFailed;
+                defer allocator.free(auth_header);
+
+                var body_list = s3HttpRequest(.GET, url_buf.items, null, auth_header, &ts, &payload_hash, null, allocator) catch
+                    return error.HttpFetchFailed;
+                defer body_list.deinit(allocator);
+
+                try parseListObjectKeys(body_list.items, &all_keys, allocator);
+
+                if (std.mem.indexOf(u8, body_list.items, "<IsTruncated>true</IsTruncated>")) |_| {
+                    if (continuation_token) |old| allocator.free(old);
+                    continuation_token = extractXmlTag(body_list.items, "NextContinuationToken", allocator) catch null;
+                    if (continuation_token == null) break;
+                } else break;
+            }
+        },
+        .bearer => {
+            // Use GCS JSON API: GET /storage/v1/b/{bucket}/o?prefix={prefix}
+            var page_token: ?[]u8 = null;
+            defer if (page_token) |t| allocator.free(t);
+
+            while (true) {
+                var url_buf = std.ArrayListUnmanaged(u8){};
+                defer url_buf.deinit(allocator);
+                const uw = url_buf.writer(allocator);
+                try uw.writeAll("https://");
+                try uw.writeAll(GCS_HOST);
+                try uw.writeAll("/storage/v1/b/");
+                try uw.writeAll(bucket);
+                try uw.writeAll("/o?prefix=");
+                try uriEncode(uw, prefix);
+                if (page_token) |pt| {
+                    try uw.writeAll("&pageToken=");
+                    try uriEncode(uw, pt);
+                }
+
+                var body_list = gcsBearerRequest(.GET, url_buf.items, null, creds.token, allocator) catch
+                    return error.HttpFetchFailed;
+                defer body_list.deinit(allocator);
+
+                // Parse JSON response for items[].name
+                try parseGcsJsonListKeys(body_list.items, &all_keys, allocator);
+
+                // Check for nextPageToken
+                if (page_token) |old| allocator.free(old);
+                page_token = extractJsonStringField(body_list.items, "nextPageToken", allocator) catch null;
+                if (page_token == null) break;
+            }
+        },
+    }
+
+    return all_keys;
+}
+
+/// Parse GCS JSON API list response for object names.
+/// Extracts "name" fields from "items" array.
+fn parseGcsJsonListKeys(
+    json_body: []const u8,
+    keys: *std.ArrayListUnmanaged([]const u8),
+    allocator: Allocator,
+) !void {
+    // Simple extraction: find "name": "..." patterns after "items"
+    var pos: usize = 0;
+    const name_pattern = "\"name\":";
+    while (std.mem.indexOfPos(u8, json_body, pos, name_pattern)) |start| {
+        const after = start + name_pattern.len;
+        // Skip whitespace.
+        var i = after;
+        while (i < json_body.len and (json_body[i] == ' ' or json_body[i] == '\t')) : (i += 1) {}
+        if (i >= json_body.len or json_body[i] != '"') {
+            pos = after;
+            continue;
+        }
+        i += 1; // skip opening quote
+        const name_start = i;
+        while (i < json_body.len and json_body[i] != '"') : (i += 1) {}
+        if (i >= json_body.len) break;
+        const name = json_body[name_start..i];
+        // Skip folder markers (keys ending with /).
+        if (name.len > 0 and name[name.len - 1] != '/') {
+            const dup = try allocator.dupe(u8, name);
+            try keys.append(allocator, dup);
+        }
+        pos = i + 1;
+    }
+}
+
+/// Extract a string field value from JSON by field name.
+fn extractJsonStringField(json_body: []const u8, field: []const u8, allocator: Allocator) ![]u8 {
+    // Build pattern: "field":
+    var pattern_buf: [128]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&pattern_buf, "\"{s}\":", .{field}) catch return error.OutOfMemory;
+
+    if (std.mem.indexOf(u8, json_body, pattern)) |start| {
+        var i = start + pattern.len;
+        while (i < json_body.len and (json_body[i] == ' ' or json_body[i] == '\t')) : (i += 1) {}
+        if (i >= json_body.len or json_body[i] != '"') return error.OutOfMemory;
+        i += 1;
+        const val_start = i;
+        while (i < json_body.len and json_body[i] != '"') : (i += 1) {}
+        if (i >= json_body.len) return error.OutOfMemory;
+        return try allocator.dupe(u8, json_body[val_start..i]);
+    }
+    return error.OutOfMemory;
+}
+
+/// HTTP request with Bearer token authentication.
+fn gcsBearerRequest(
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    token: []const u8,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged(u8) {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    // Build "Bearer <token>" header value.
+    var auth_buf = std.ArrayListUnmanaged(u8){};
+    defer auth_buf.deinit(allocator);
+    const aw_auth = auth_buf.writer(allocator);
+    try aw_auth.writeAll("Bearer ");
+    try aw_auth.writeAll(token);
+
+    if (method == .PUT) {
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .PUT,
+            .payload = body,
+            .headers = .{
+                .authorization = .{ .override = auth_buf.items },
+            },
+        }) catch return error.HttpFetchFailed;
+
+        if (result.status != .ok) return error.HttpStatusError;
+        return std.ArrayListUnmanaged(u8){};
+    }
+
+    // GET request.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{
+            .authorization = .{ .override = auth_buf.items },
+        },
+        .response_writer = &aw.writer,
+    }) catch {
+        if (aw.writer.buffer.len > 0) allocator.free(aw.writer.buffer);
+        return error.HttpFetchFailed;
+    };
+
+    if (result.status != .ok) {
+        aw.deinit();
+        return error.HttpStatusError;
+    }
+
+    return aw.toArrayList();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Azure Blob Transport ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Azure Blob source: fetches a blob from Azure Blob Storage.
+fn sourceAzure(
+    uri: uri_mod.ParsedUri,
+    format: SourceFormat,
+    auth_val: ?Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const container = uri.host orelse {
+        err_msg.* = "Azure URI must include container name: az://container/blob";
+        return error.RuntimeError;
+    };
+    const blob = uri.path;
+
+    if (std.mem.indexOfAny(u8, blob, "*?")) |_| {
+        return sourceAzureGlob(container, blob, format, auth_val, allocator, err_msg);
+    }
+
+    var creds = auth_mod.resolveAzureCredentials(auth_val, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "Azure credentials not found. Set AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_KEY, or pass auth: parameter",
+            error.InvalidAuthValue => "auth: must be an atom (profile) or record {account:, account_key:}",
+            error.InvalidProfile => "Azure profile not found in credentials file",
+            error.ConfigReadError => "failed to read credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    var body = azureGetBlob(container, blob, creds, allocator) catch {
+        err_msg.* = "Azure GetBlob request failed";
+        return error.RuntimeError;
+    };
+
+    if (format == .json) {
+        defer body.deinit(allocator);
+        return createJsonStream(body.items, allocator, err_msg);
+    }
+
+    const owned = body.toOwnedSlice(allocator) catch {
+        body.deinit(allocator);
+        err_msg.* = "failed to allocate Azure response buffer";
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .memory_reader = .{
+        .data = owned,
+        .cursor = 0,
+        .is_jsonl = (format == .jsonl),
+        .line_number = 0,
+        .allocator = allocator,
+    } };
+    return createStream(state, allocator);
+}
+
+/// Azure Blob sink: buffer formatted output, then PutBlob.
+fn sinkAzure(
+    stream_val: Value,
+    is_stream: bool,
+    uri: uri_mod.ParsedUri,
+    sink_format: SinkFormat,
+    opts: SinkOptions,
+    args: []const Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const container = uri.host orelse {
+        err_msg.* = "Azure URI must include container name: az://container/blob";
+        return error.RuntimeError;
+    };
+    const blob = uri.path;
+
+    const auth_val: ?Value = blk: {
+        var idx: usize = 2;
+        if (idx < args.len and args[idx].isAtom()) idx += 1;
+        if (idx < args.len and (args[idx].isObjType(.record) or args[idx].isObjType(.map))) idx += 1;
+        if (idx < args.len) break :blk args[idx];
+        break :blk null;
+    };
+
+    var creds = auth_mod.resolveAzureCredentials(auth_val, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "Azure credentials not found. Set AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_KEY",
+            error.InvalidAuthValue => "invalid auth: parameter for Azure sink",
+            error.InvalidProfile => "Azure profile not found",
+            error.ConfigReadError => "failed to read credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    var out_buf = std.ArrayListUnmanaged(u8){};
+    defer out_buf.deinit(allocator);
+    sinkFormatToBuffer(stream_val, is_stream, sink_format, opts, &out_buf, allocator, err_msg) catch |err| return err;
+
+    const upload = maybeCompress(out_buf.items, opts, allocator) catch {
+        err_msg.* = "gzip compression failed";
+        return error.RuntimeError;
+    };
+    defer if (upload.owned) allocator.free(@constCast(upload.buf));
+
+    var attempts: u8 = 0;
+    while (true) {
+        if (azurePutBlob(container, blob, upload.buf, creds, allocator)) {
+            break;
+        } else |_| {
+            if (attempts < opts.retry) { attempts += 1; continue; }
+            err_msg.* = "Azure PutBlob request failed";
+            return error.RuntimeError;
+        }
+    }
+
+    return Value.nil;
+}
+
+/// Azure GetBlob HTTP request with Shared Key auth.
+fn azureGetBlob(
+    container: []const u8,
+    blob: []const u8,
+    creds: auth_mod.AzureCredentials,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged(u8) {
+    var url_buf = std.ArrayListUnmanaged(u8){};
+    defer url_buf.deinit(allocator);
+    const uw = url_buf.writer(allocator);
+    try uw.writeAll("https://");
+    try uw.writeAll(creds.account);
+    try uw.writeAll(".blob.core.windows.net/");
+    try uw.writeAll(container);
+    try uw.writeByte('/');
+    try uw.writeAll(blob);
+
+    // Canonicalized resource: /{account}/{container}/{blob}
+    var res_buf: [2048]u8 = undefined;
+    const canon_res = std.fmt.bufPrint(&res_buf, "/{s}/{s}/{s}", .{ creds.account, container, blob }) catch
+        return error.HttpFetchFailed;
+
+    const date = azure_sig.currentRfc1123();
+    const auth_header = azure_sig.signRequest("GET", 0, "", &date, azure_sig.API_VERSION, canon_res, creds.account, creds.account_key, allocator) catch
+        return error.HttpFetchFailed;
+    defer allocator.free(auth_header);
+
+    return azureHttpRequest(.GET, url_buf.items, null, auth_header, &date, allocator);
+}
+
+/// Azure PutBlob HTTP request with Shared Key auth.
+fn azurePutBlob(
+    container: []const u8,
+    blob: []const u8,
+    body: []const u8,
+    creds: auth_mod.AzureCredentials,
+    allocator: Allocator,
+) !void {
+    var url_buf = std.ArrayListUnmanaged(u8){};
+    defer url_buf.deinit(allocator);
+    const uw = url_buf.writer(allocator);
+    try uw.writeAll("https://");
+    try uw.writeAll(creds.account);
+    try uw.writeAll(".blob.core.windows.net/");
+    try uw.writeAll(container);
+    try uw.writeByte('/');
+    try uw.writeAll(blob);
+
+    var res_buf: [2048]u8 = undefined;
+    const canon_res = std.fmt.bufPrint(&res_buf, "/{s}/{s}/{s}", .{ creds.account, container, blob }) catch
+        return error.HttpFetchFailed;
+
+    const date = azure_sig.currentRfc1123();
+    const auth_header = azure_sig.signRequest("PUT", body.len, "application/octet-stream", &date, azure_sig.API_VERSION, canon_res, creds.account, creds.account_key, allocator) catch
+        return error.HttpFetchFailed;
+    defer allocator.free(auth_header);
+
+    _ = azureHttpRequest(.PUT, url_buf.items, body, auth_header, &date, allocator) catch
+        return error.HttpFetchFailed;
+}
+
+/// Azure glob: list blobs matching a pattern.
+fn sourceAzureGlob(
+    container: []const u8,
+    blob_pattern: []const u8,
+    format: SourceFormat,
+    auth_val: ?Value,
+    allocator: Allocator,
+    err_msg: *[]const u8,
+) NativeError!Value {
+    const wildcard_pos = std.mem.indexOfAny(u8, blob_pattern, "*?") orelse 0;
+    const prefix_end = if (wildcard_pos > 0)
+        (std.mem.lastIndexOfScalar(u8, blob_pattern[0..wildcard_pos], '/') orelse 0)
+    else
+        0;
+    const prefix = if (prefix_end > 0) blob_pattern[0 .. prefix_end + 1] else "";
+
+    var creds = auth_mod.resolveAzureCredentials(auth_val, &atomName, allocator) catch |err| {
+        err_msg.* = switch (err) {
+            error.MissingCredentials => "Azure credentials not found",
+            error.InvalidAuthValue => "invalid auth: parameter",
+            error.InvalidProfile => "Azure profile not found",
+            error.ConfigReadError => "failed to read credentials file",
+        };
+        return error.RuntimeError;
+    };
+    defer creds.deinit(allocator);
+
+    var keys = azureListBlobs(container, prefix, creds, allocator) catch {
+        err_msg.* = "Azure list blobs request failed";
+        return error.RuntimeError;
+    };
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+
+    var matched_keys = std.ArrayListUnmanaged([]const u8){};
+    defer matched_keys.deinit(allocator);
+    for (keys.items) |obj_key| {
+        if (globMatch(blob_pattern, obj_key)) {
+            const dup = allocator.dupe(u8, obj_key) catch return error.OutOfMemory;
+            matched_keys.append(allocator, dup) catch { allocator.free(dup); return error.OutOfMemory; };
+        }
+    }
+
+    if (matched_keys.items.len == 0) return createEmptyStream(allocator);
+
+    var combined = std.ArrayListUnmanaged(u8){};
+    errdefer combined.deinit(allocator);
+
+    var fetch_creds = auth_mod.resolveAzureCredentials(auth_val, &atomName, allocator) catch {
+        err_msg.* = "Azure credentials not found";
+        return error.RuntimeError;
+    };
+    defer fetch_creds.deinit(allocator);
+
+    for (matched_keys.items) |obj_key| {
+        var body = azureGetBlob(container, obj_key, fetch_creds, allocator) catch {
+            err_msg.* = "Azure GetBlob failed during glob fetch";
+            return error.RuntimeError;
+        };
+        defer body.deinit(allocator);
+        combined.appendSlice(allocator, body.items) catch return error.OutOfMemory;
+        if (body.items.len > 0 and body.items[body.items.len - 1] != '\n')
+            combined.append(allocator, '\n') catch return error.OutOfMemory;
+    }
+
+    for (matched_keys.items) |k| allocator.free(k);
+    matched_keys.clearRetainingCapacity();
+
+    if (format == .json) {
+        defer combined.deinit(allocator);
+        return createJsonStream(combined.items, allocator, err_msg);
+    }
+    if (format == .csv) {
+        defer combined.deinit(allocator);
+        return createCsvStream(combined.items, ',', allocator, err_msg);
+    }
+
+    const owned = combined.toOwnedSlice(allocator) catch {
+        combined.deinit(allocator);
+        return error.RuntimeError;
+    };
+
+    const state = try allocator.create(StreamState);
+    state.* = .{ .memory_reader = .{
+        .data = owned,
+        .cursor = 0,
+        .is_jsonl = (format == .jsonl),
+        .line_number = 0,
+        .allocator = allocator,
+    } };
+    return createStream(state, allocator);
+}
+
+/// Azure List Blobs API with Shared Key auth.
+fn azureListBlobs(
+    container: []const u8,
+    prefix: []const u8,
+    creds: auth_mod.AzureCredentials,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged([]const u8) {
+    var all_keys = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (all_keys.items) |k| allocator.free(k);
+        all_keys.deinit(allocator);
+    }
+
+    var marker: ?[]u8 = null;
+    defer if (marker) |m| allocator.free(m);
+
+    while (true) {
+        var url_buf = std.ArrayListUnmanaged(u8){};
+        defer url_buf.deinit(allocator);
+        const uw = url_buf.writer(allocator);
+        try uw.writeAll("https://");
+        try uw.writeAll(creds.account);
+        try uw.writeAll(".blob.core.windows.net/");
+        try uw.writeAll(container);
+        try uw.writeAll("?restype=container&comp=list&prefix=");
+        try uriEncode(uw, prefix);
+        if (marker) |m| {
+            try uw.writeAll("&marker=");
+            try uriEncode(uw, m);
+        }
+
+        var res_buf: [2048]u8 = undefined;
+        const canon_res = std.fmt.bufPrint(&res_buf, "/{s}/{s}\ncomp:list\nprefix:{s}\nrestype:container", .{ creds.account, container, prefix }) catch
+            return error.HttpFetchFailed;
+
+        const date = azure_sig.currentRfc1123();
+        const auth_header = azure_sig.signRequest("GET", 0, "", &date, azure_sig.API_VERSION, canon_res, creds.account, creds.account_key, allocator) catch
+            return error.HttpFetchFailed;
+        defer allocator.free(auth_header);
+
+        var body_list = azureHttpRequest(.GET, url_buf.items, null, auth_header, &date, allocator) catch
+            return error.HttpFetchFailed;
+        defer body_list.deinit(allocator);
+
+        // Parse XML: extract <Name>...</Name> within <Blob> elements
+        try parseAzureBlobNames(body_list.items, &all_keys, allocator);
+
+        // Check for <NextMarker>...</NextMarker>
+        if (marker) |old| allocator.free(old);
+        marker = extractXmlTag(body_list.items, "NextMarker", allocator) catch null;
+        if (marker == null or marker.?.len == 0) {
+            if (marker) |m| allocator.free(m);
+            marker = null;
+            break;
+        }
+    }
+
+    return all_keys;
+}
+
+/// Parse Azure List Blobs XML for blob names.
+fn parseAzureBlobNames(xml: []const u8, keys: *std.ArrayListUnmanaged([]const u8), allocator: Allocator) !void {
+    // Azure wraps blob names in <Blob><Name>...</Name></Blob>
+    // We look for <Name>...</Name> within the response.
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, pos, "<Name>")) |start| {
+        const content_start = start + 6;
+        if (std.mem.indexOfPos(u8, xml, content_start, "</Name>")) |end| {
+            const name = xml[content_start..end];
+            const dup = try allocator.dupe(u8, name);
+            try keys.append(allocator, dup);
+            pos = end + 7;
+        } else break;
+    }
+}
+
+/// Azure HTTP request with Shared Key auth headers.
+fn azureHttpRequest(
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    auth_header: []const u8,
+    date: []const u8,
+    allocator: Allocator,
+) !std.ArrayListUnmanaged(u8) {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "x-ms-date", .value = date },
+        .{ .name = "x-ms-version", .value = azure_sig.API_VERSION },
+        .{ .name = "x-ms-blob-type", .value = "BlockBlob" },
+    };
+
+    // For PUT we need fewer headers, for GET only date+version matter.
+    const header_count: usize = if (method == .PUT) 3 else 2;
+
+    if (method == .PUT) {
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .PUT,
+            .payload = body,
+            .headers = .{
+                .authorization = .{ .override = auth_header },
+                .content_type = .{ .override = "application/octet-stream" },
+            },
+            .extra_headers = extra_headers[0..header_count],
+        }) catch return error.HttpFetchFailed;
+
+        if (result.status != .created and result.status != .ok)
+            return error.HttpStatusError;
+        return std.ArrayListUnmanaged(u8){};
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{
+            .authorization = .{ .override = auth_header },
+        },
+        .extra_headers = extra_headers[0..header_count],
+        .response_writer = &aw.writer,
+    }) catch {
+        if (aw.writer.buffer.len > 0) allocator.free(aw.writer.buffer);
+        return error.HttpFetchFailed;
+    };
+
+    if (result.status != .ok) {
+        aw.deinit();
+        return error.HttpStatusError;
+    }
+
+    return aw.toArrayList();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Compression & retry helpers ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Gzip-wrap data using stored (uncompressed) deflate blocks.
+/// Produces a valid gzip file that any standard tool can decompress.
+/// Uses stored blocks (no actual compression) since Zig 0.15 flate is incomplete.
+fn gzipCompress(data: []const u8, allocator: Allocator) ![]u8 {
+    // Gzip format: 10-byte header + deflate stored blocks + 8-byte footer (CRC32 + ISIZE)
+    // Stored block: 5-byte header (BFINAL, BTYPE=00, LEN, NLEN) + raw data
+    // Max stored block size: 65535 bytes
+
+    const max_block: usize = 65535;
+    const num_blocks = if (data.len == 0) 1 else (data.len + max_block - 1) / max_block;
+    const total_size = 10 + (num_blocks * 5) + data.len + 8;
+
+    const out = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(out);
+
+    var pos: usize = 0;
+
+    // Gzip header (10 bytes): magic, method=deflate, flags=0, mtime=0, xfl=0, os=0xff
+    out[pos] = 0x1f; pos += 1; // ID1
+    out[pos] = 0x8b; pos += 1; // ID2
+    out[pos] = 0x08; pos += 1; // CM = deflate
+    out[pos] = 0x00; pos += 1; // FLG = 0
+    out[pos] = 0; pos += 1; // MTIME (4 bytes, 0)
+    out[pos] = 0; pos += 1;
+    out[pos] = 0; pos += 1;
+    out[pos] = 0; pos += 1;
+    out[pos] = 0x00; pos += 1; // XFL
+    out[pos] = 0xff; pos += 1; // OS = unknown
+
+    // Deflate stored blocks.
+    var data_pos: usize = 0;
+    while (data_pos < data.len or data_pos == 0) {
+        const remaining = data.len - data_pos;
+        const block_len: u16 = @intCast(@min(remaining, max_block));
+        const is_final: u8 = if (data_pos + block_len >= data.len) 1 else 0;
+
+        out[pos] = is_final; pos += 1; // BFINAL | BTYPE=00 (stored)
+        // LEN (little-endian u16)
+        out[pos] = @intCast(block_len & 0xff); pos += 1;
+        out[pos] = @intCast((block_len >> 8) & 0xff); pos += 1;
+        // NLEN (one's complement of LEN)
+        const nlen = ~block_len;
+        out[pos] = @intCast(nlen & 0xff); pos += 1;
+        out[pos] = @intCast((nlen >> 8) & 0xff); pos += 1;
+        // Raw data.
+        @memcpy(out[pos .. pos + block_len], data[data_pos .. data_pos + block_len]);
+        pos += block_len;
+        data_pos += block_len;
+
+        if (block_len == 0) break; // empty data case
+    }
+
+    // Footer: CRC32 + ISIZE (original size mod 2^32)
+    const crc = crc32(data);
+    out[pos] = @intCast(crc & 0xff); pos += 1;
+    out[pos] = @intCast((crc >> 8) & 0xff); pos += 1;
+    out[pos] = @intCast((crc >> 16) & 0xff); pos += 1;
+    out[pos] = @intCast((crc >> 24) & 0xff); pos += 1;
+    const orig_size: u32 = @intCast(data.len & 0xffffffff);
+    out[pos] = @intCast(orig_size & 0xff); pos += 1;
+    out[pos] = @intCast((orig_size >> 8) & 0xff); pos += 1;
+    out[pos] = @intCast((orig_size >> 16) & 0xff); pos += 1;
+    out[pos] = @intCast((orig_size >> 24) & 0xff); pos += 1;
+
+    return out[0..pos];
+}
+
+/// CRC-32 (IEEE 802.3) for gzip footer.
+fn crc32(data: []const u8) u32 {
+    // Using std.hash.crc
+    return std.hash.crc.Crc32IsoHdlc.hash(data);
+}
+
+/// Apply gzip compression to a buffer if opts.compress == .gzip.
+/// Returns owned compressed data (caller must free) or the original data.
+fn maybeCompress(data: []const u8, opts: SinkOptions, allocator: Allocator) !struct { buf: []const u8, owned: bool } {
+    if (opts.compress == .gzip) {
+        const compressed = try gzipCompress(data, allocator);
+        return .{ .buf = compressed, .owned = true };
+    }
+    return .{ .buf = data, .owned = false };
+}
+
 /// Get the CPU core count, defaulting to 4 if unavailable.
 fn getCpuCount() u32 {
     return @intCast(std.Thread.getCpuCount() catch 4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── Environment: env() ───────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+
+/// env(key) → string | Result.Err(:undefined)
+/// env(key, default) → string
+/// Reads an environment variable by name.
+fn builtinEnv(args: []const Value, allocator: Allocator, err_msg: *[]const u8) NativeError!Value {
+    const key_val = args[0];
+    if (!key_val.isString()) {
+        err_msg.* = "env() expects a string key as first argument";
+        return error.RuntimeError;
+    }
+    const key_str = ObjString.fromObj(key_val.asObj());
+
+    if (std.posix.getenv(key_str.bytes)) |val| {
+        const result = try ObjString.create(allocator, val, null);
+        trackObj(&result.obj);
+        return Value.fromObj(&result.obj);
+    }
+
+    // Not found: if default provided, return it; otherwise return Result.Err(:undefined).
+    if (args.len > 1) {
+        return args[1];
+    }
+
+    // Create Result.Err(:undefined) — look up the :undefined atom or use a string message.
+    const msg = try ObjString.create(allocator, "undefined environment variable", null);
+    trackObj(&msg.obj);
+    const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&msg.obj)});
+    trackObj(&err_adt.obj);
+    return Value.fromObj(&err_adt.obj);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

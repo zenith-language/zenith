@@ -59,6 +59,7 @@ pub const StreamState = union(enum) {
     filter_ok_op: UpstreamOnlyOp,
     filter_err_op: UpstreamOnlyOp,
     tap_err_op: TapOp,
+    memory_reader: MemoryReaderOp,
 
     pub const RangeIter = struct {
         current: i32,
@@ -272,6 +273,20 @@ pub const StreamState = union(enum) {
 
     pub const StdinReaderOp = struct {
         frs: *FileReaderState,
+    };
+
+    /// In-memory line reader for HTTP response bodies and similar buffers.
+    /// Iterates line-by-line over owned data. Supports text and JSONL modes.
+    pub const MemoryReaderOp = struct {
+        data: []const u8, // owned buffer
+        cursor: usize,
+        is_jsonl: bool,
+        line_number: usize,
+        allocator: Allocator,
+
+        pub fn deinit(self: *MemoryReaderOp) void {
+            self.allocator.free(self.data);
+        }
     };
 
     /// Simple upstream-only operator (no function). Used by filter_ok, filter_err.
@@ -730,6 +745,9 @@ pub const StreamState = union(enum) {
             .jsonl_reader => |s| {
                 return jsonlReaderNext(s.frs, allocator);
             },
+            .memory_reader => |*s| {
+                return memoryReaderNext(s, allocator);
+            },
             .json_array_iter => |*s| {
                 const lst = ObjList.fromObj(s.items.asObj());
                 if (s.idx >= lst.items.items.len) return makeNone(allocator);
@@ -1187,6 +1205,9 @@ pub const StreamState = union(enum) {
             .stdin_reader => |*s| {
                 s.frs.deinit(allocator);
             },
+            .memory_reader => |*s| {
+                s.deinit();
+            },
             .par_map => |*s| {
                 if (s.result_buf) |buf| {
                     allocator.free(buf[0..s.concurrency]);
@@ -1233,7 +1254,7 @@ pub const StreamState = union(enum) {
     /// All Value fields that might hold object references must be traced.
     pub fn traceGCRefs(self: *StreamState, nursery: anytype, gc: anytype) !void {
         switch (self.*) {
-            .range_iter, .file_reader, .jsonl_reader, .stdin_reader => {},
+            .range_iter, .file_reader, .jsonl_reader, .stdin_reader, .memory_reader => {},
             .json_array_iter => |*s| {
                 try nursery.processValue(&s.items, gc);
             },
@@ -1376,7 +1397,7 @@ pub const StreamState = union(enum) {
     /// Trace GC references for old-gen collection.
     pub fn traceGCRefsOldGen(self: *StreamState, oldgen: anytype, gc: anytype) !void {
         switch (self.*) {
-            .range_iter, .file_reader, .jsonl_reader, .stdin_reader => {},
+            .range_iter, .file_reader, .jsonl_reader, .stdin_reader, .memory_reader => {},
             .json_array_iter => |*s| {
                 try oldgen.processValue(&s.items, gc);
             },
@@ -1572,6 +1593,70 @@ fn jsonlReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) Nati
             }
         }
         return makeNone(allocator);
+    }
+}
+
+/// Helper for memory_reader next(): read one line from in-memory buffer.
+/// In JSONL mode, each line is parsed as JSON and wrapped in Result.
+/// In text mode, each line is returned as a string.
+fn memoryReaderNext(s: *StreamState.MemoryReaderOp, allocator: Allocator) NativeError!Value {
+    while (true) {
+        if (s.cursor >= s.data.len) return makeNone(allocator);
+
+        // Find next newline.
+        var end = s.cursor;
+        while (end < s.data.len and s.data[end] != '\n') : (end += 1) {}
+
+        // Extract line, strip \r if present.
+        var line = s.data[s.cursor..end];
+        if (line.len > 0 and line[line.len - 1] == '\r') {
+            line = line[0 .. line.len - 1];
+        }
+
+        // Advance cursor past newline.
+        s.cursor = if (end < s.data.len) end + 1 else end;
+        s.line_number += 1;
+
+        if (s.is_jsonl) {
+            // Skip empty lines in JSONL mode.
+            if (line.len == 0) continue;
+
+            // Set JSON module callbacks for tracking.
+            if (current_vm) |vm_ptr| {
+                if (track_obj_fn) |tfn| {
+                    json_mod.setVM(vm_ptr, tfn);
+                }
+            }
+            defer json_mod.clearVM();
+
+            const parse_result = json_mod.parse(line, allocator);
+            switch (parse_result) {
+                .ok => |val| {
+                    const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{val});
+                    trackObj(&ok_adt.obj);
+                    return makeSome(Value.fromObj(&ok_adt.obj), allocator);
+                },
+                .err => |e| {
+                    const msg_str = try ObjString.create(allocator, e.message, null);
+                    trackObj(&msg_str.obj);
+                    const field_names = [_][]const u8{ "message", "line" };
+                    const field_values = [_]Value{
+                        Value.fromObj(&msg_str.obj),
+                        Value.fromInt(@intCast(@min(s.line_number, @as(usize, @intCast(std.math.maxInt(i32)))))),
+                    };
+                    const record = try ObjRecord.create(allocator, &field_names, &field_values);
+                    trackObj(&record.obj);
+                    const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&record.obj)});
+                    trackObj(&err_adt.obj);
+                    return makeSome(Value.fromObj(&err_adt.obj), allocator);
+                },
+            }
+        } else {
+            // Text mode: return line as string.
+            const str = try ObjString.create(allocator, line, null);
+            trackObj(&str.obj);
+            return makeSome(Value.fromObj(&str.obj), allocator);
+        }
     }
 }
 
