@@ -145,10 +145,6 @@ pub const VM = struct {
             .errors = .empty,
             .output_buf = null,
         };
-        // Register VM with GC for root scanning.
-        if (gc) |g| {
-            g.vm = &vm;
-        }
         // Push the script closure as slot 0.
         vm.stack[0] = Value.fromObj(&closure.obj);
         vm.stack_top = 1;
@@ -366,6 +362,12 @@ pub const VM = struct {
 
     /// Execute the loaded chunk/closure. Returns the final value on the stack.
     pub fn run(self: *Self) RuntimeError!Value {
+        // Register with the GC for root scanning. This happens here rather
+        // than in init because init returns the VM by value.
+        if (self.gc) |g| {
+            g.vm = self;
+        }
+
         // If we have frames (closure mode), use frame-based dispatch.
         if (self.getFrameCount().* > 0) {
             return self.runFrames();
