@@ -185,7 +185,7 @@ pub const GC = struct {
             }
         }
 
-        const timer_start = std.time.nanoTimestamp();
+        var timer = std.time.Timer.start() catch null;
         const bytes_before = self.bytes_allocated;
 
         try gc_roots_mod.scanRoots(&self.marker, self, vm);
@@ -202,8 +202,7 @@ pub const GC = struct {
         self.bytes_freed += bytes_before -| self.bytes_allocated;
         self.next_gc = @max(self.min_heap, self.bytes_allocated * GROWTH_FACTOR);
 
-        const timer_end = std.time.nanoTimestamp();
-        self.last_pause_ns = @intCast(@as(i128, timer_end) - @as(i128, timer_start));
+        self.last_pause_ns = if (timer) |*t| t.read() else 0;
 
         if (self.log_enabled) {
             self.logCollection(freed, bytes_before);
