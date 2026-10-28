@@ -1,0 +1,8 @@
+-- min, max and sorting share one total order over values.
+print(range(0, 5) |> map(|i| "k" ++ str(i)) |> max())
+print(range(0, 5) |> map(|i| "k" ++ str(4 - i)) |> min())
+print(range(0, 4) |> map(|i| [1.5, 0, 2, -3] |> List.get(i) |> unwrap) |> max())
+print(List.sort(["pear", "apple", "fig"]))
+print(List.sort([3, 1.5, 2]))
+print(List.sort([[2, 1], [1, 9], [1, 2, 3]]))
+print(List.sort(["b", 2, nil, true, 1.5]))

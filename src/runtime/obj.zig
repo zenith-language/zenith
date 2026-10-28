@@ -542,6 +542,60 @@ fn structuralEql(a: Value, b: Value) bool {
     }
 }
 
+/// Total order over values, used by sorting, min and max. Numbers compare
+/// numerically (NaN after every other number), strings by bytes, lists,
+/// tuples and ADT payloads lexicographically. Values of different kinds
+/// order by kind: nil, bool, number, string, atom, list, tuple, adt, other.
+pub fn compareValues(a: Value, b: Value) std.math.Order {
+    const ka = kindRank(a);
+    const kb = kindRank(b);
+    if (ka != kb) return std.math.order(ka, kb);
+    switch (ka) {
+        0 => return .eq,
+        1 => return std.math.order(@intFromBool(a.asBool()), @intFromBool(b.asBool())),
+        2 => {
+            if (a.isInteger() and b.isInteger()) return std.math.order(a.asI64(), b.asI64());
+            const fa = toF64(a);
+            const fb = toF64(b);
+            const na = std.math.isNan(fa);
+            const nb = std.math.isNan(fb);
+            if (na or nb) return std.math.order(@intFromBool(na), @intFromBool(nb));
+            return std.math.order(fa, fb);
+        },
+        3 => return std.mem.order(u8, ObjString.fromObj(a.asObj()).bytes, ObjString.fromObj(b.asObj()).bytes),
+        5 => return sliceOrder(ObjList.fromObj(a.asObj()).items.items, ObjList.fromObj(b.asObj()).items.items),
+        6 => return sliceOrder(ObjTuple.fromObj(a.asObj()).fields, ObjTuple.fromObj(b.asObj()).fields),
+        7 => {
+            const aa = ObjAdt.fromObj(a.asObj());
+            const ab = ObjAdt.fromObj(b.asObj());
+            if (aa.type_id != ab.type_id) return std.math.order(aa.type_id, ab.type_id);
+            if (aa.variant_idx != ab.variant_idx) return std.math.order(aa.variant_idx, ab.variant_idx);
+            return sliceOrder(aa.payload, ab.payload);
+        },
+        else => return std.math.order(a.bits, b.bits),
+    }
+}
+
+fn kindRank(v: Value) u8 {
+    if (v.isNil()) return 0;
+    if (v.isBool()) return 1;
+    if (isNumber(v)) return 2;
+    if (v.isString()) return 3;
+    if (v.isAtom()) return 4;
+    if (v.isObjType(.list)) return 5;
+    if (v.isObjType(.tuple)) return 6;
+    if (v.isObjType(.adt)) return 7;
+    return 8;
+}
+
+fn sliceOrder(a: []const Value, b: []const Value) std.math.Order {
+    for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| {
+        const o = compareValues(x, y);
+        if (o != .eq) return o;
+    }
+    return std.math.order(a.len, b.len);
+}
+
 fn isNumber(v: Value) bool {
     return v.isFloat() or v.isInteger();
 }

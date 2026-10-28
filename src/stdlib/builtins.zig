@@ -1534,23 +1534,8 @@ pub fn isFalsy(val: Value) bool {
 
 /// Compare two Values for sorting. Returns true if a < b.
 /// int/float are numeric, strings are lexicographic, other types by raw bits.
-fn valueCompare(ctx: void, a: Value, b: Value) bool {
-    _ = ctx;
-    // Both ints.
-    if (a.isInt() and b.isInt()) return a.asInt() < b.asInt();
-    // Both floats.
-    if (a.isFloat() and b.isFloat()) return a.asFloat() < b.asFloat();
-    // Int vs float.
-    if (a.isInt() and b.isFloat()) return @as(f64, @floatFromInt(a.asInt())) < b.asFloat();
-    if (a.isFloat() and b.isInt()) return a.asFloat() < @as(f64, @floatFromInt(b.asInt()));
-    // Both strings.
-    if (a.isString() and b.isString()) {
-        const sa = ObjString.fromObj(a.asObj()).bytes;
-        const sb = ObjString.fromObj(b.asObj()).bytes;
-        return std.mem.order(u8, sa, sb) == .lt;
-    }
-    // Fallback: compare raw bits.
-    return a.bits < b.bits;
+fn valueCompare(_: void, a: Value, b: Value) bool {
+    return obj_mod.compareValues(a, b) == .lt;
 }
 
 // ── Stream builtin implementations ────────────────────────────────────
@@ -2305,11 +2290,7 @@ fn builtinMax(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
 
 /// Helper: compare two numeric values for less-than ordering.
 fn valueLessThan(a: Value, b: Value) bool {
-    if (a.isInt() and b.isInt()) return a.asInt() < b.asInt();
-    // Promote to float for mixed comparisons.
-    const fa: f64 = if (a.isInt()) @floatFromInt(a.asInt()) else if (a.isFloat()) a.asFloat() else return false;
-    const fb: f64 = if (b.isInt()) @floatFromInt(b.asInt()) else if (b.isFloat()) b.asFloat() else return false;
-    return fa < fb;
+    return obj_mod.compareValues(a, b) == .lt;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

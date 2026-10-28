@@ -1622,16 +1622,7 @@ fn callClosure(closure_val: Value, args: []const Value) NativeError!Value {
 
 /// Compare two Values: returns true if a < b.
 fn valueLessThan(a: Value, b: Value) bool {
-    if (a.isInt() and b.isInt()) return a.asInt() < b.asInt();
-    if (a.isFloat() and b.isFloat()) return a.asFloat() < b.asFloat();
-    if (a.isInt() and b.isFloat()) return @as(f64, @floatFromInt(a.asInt())) < b.asFloat();
-    if (a.isFloat() and b.isInt()) return a.asFloat() < @as(f64, @floatFromInt(b.asInt()));
-    if (a.isString() and b.isString()) {
-        const sa = ObjString.fromObj(a.asObj()).bytes;
-        const sb = ObjString.fromObj(b.asObj()).bytes;
-        return std.mem.order(u8, sa, sb) == .lt;
-    }
-    return a.bits < b.bits;
+    return obj_mod.compareValues(a, b) == .lt;
 }
 
 /// Pin a value read from an operator's own buffer before handing it out:

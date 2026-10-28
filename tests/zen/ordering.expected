@@ -1,0 +1,7 @@
+Option.Some(k4)
+Option.Some(k0)
+Option.Some(2)
+[apple, fig, pear]
+[1.5, 2, 3]
+[[1, 2, 3], [1, 9], [2, 1]]
+[nil, true, 1.5, 2, b]
