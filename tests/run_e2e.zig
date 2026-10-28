@@ -25,6 +25,8 @@ const TestCase = struct {
     zen_path: []const u8,
     expected_path: []const u8,
     is_error_test: bool,
+    /// Too slow to run with ZENITH_GC_STRESS set (the test-gc-stress step).
+    heavy: bool = false,
 };
 
 const normal_tests = [_]TestCase{
@@ -82,7 +84,7 @@ const normal_tests = [_]TestCase{
     .{ .name = "nested_builtins", .zen_path = "tests/zen/nested_builtins.zen", .expected_path = "tests/zen/nested_builtins.expected", .is_error_test = false },
     .{ .name = "ordering", .zen_path = "tests/zen/ordering.zen", .expected_path = "tests/zen/ordering.expected", .is_error_test = false },
     .{ .name = "list_streams", .zen_path = "tests/zen/list_streams.zen", .expected_path = "tests/zen/list_streams.expected", .is_error_test = false },
-    .{ .name = "streams_large", .zen_path = "tests/zen/streams_large.zen", .expected_path = "tests/zen/streams_large.expected", .is_error_test = false },
+    .{ .name = "streams_large", .zen_path = "tests/zen/streams_large.zen", .expected_path = "tests/zen/streams_large.expected", .is_error_test = false, .heavy = true },
 };
 
 const error_tests = [_]TestCase{
@@ -300,8 +302,10 @@ const TestFailed = error{TestFailed};
 
 test "e2e: every normal program" {
     // Run all cases before failing so one report lists every mismatch.
+    const gc_stress = std.posix.getenv("ZENITH_GC_STRESS") != null;
     var failed: usize = 0;
     for (normal_tests) |tc| {
+        if (tc.heavy and gc_stress) continue;
         runNormalTest(tc) catch {
             failed += 1;
         };
