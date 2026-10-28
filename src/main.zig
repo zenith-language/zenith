@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zenith = @import("zenith");
 const Lexer = zenith.lexer.Lexer;
 const Parser = zenith.parser.Parser;
@@ -16,13 +17,17 @@ const GCAllocator = zenith.gc.GCAllocator;
 const version_string = "Zenith v0.1.0";
 
 pub fn main() !void {
+    // Leak checking in Debug and ReleaseSafe. The debug allocator is slow and
+    // keeps a page per size class alive for every surviving small object, so
+    // optimized builds use the general-purpose allocator instead.
+    const check_leaks = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
     var gpa_state = std.heap.DebugAllocator(.{}).init;
-    const gpa = gpa_state.allocator();
-    defer {
+    const gpa = if (check_leaks) gpa_state.allocator() else std.heap.smp_allocator;
+    defer if (check_leaks) {
         if (gpa_state.deinit() == .leak) {
             @panic("Memory leak detected");
         }
-    }
+    };
 
     const args = try std.process.argsAlloc(gpa);
     defer std.process.argsFree(gpa, args);
