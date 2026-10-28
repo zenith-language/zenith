@@ -14,6 +14,7 @@ const ObjRange = obj_mod.ObjRange;
 const stream_mod = @import("stream");
 const StreamState = stream_mod.StreamState;
 const json_mod = @import("json");
+const roots = @import("roots");
 const uri_mod = @import("uri");
 const aws_sig = @import("aws_sig");
 const azure_sig = @import("azure_sig");
@@ -1757,7 +1758,9 @@ fn builtinCollect(args: []const Value, allocator: Allocator, err_msg: *[]const u
     const result_list = try ObjList.create(allocator);
     trackObj(&result_list.obj);
 
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         const inner = (try stream_obj.state.next(allocator)) orelse break;
         try result_list.items.append(allocator, inner);
     }
@@ -1785,7 +1788,9 @@ fn builtinCount(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     const stream_obj = ObjStream.fromObj(first.asObj());
     var n: i32 = 0;
 
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         _ = (try stream_obj.state.next(allocator)) orelse break;
         n += 1;
     }
@@ -2079,7 +2084,9 @@ fn builtinSum(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var has_float = false;
     var float_sum: f64 = 0.0;
 
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         const elem = (try stream_obj.state.next(allocator)) orelse break;
         if (elem.isInt()) {
             if (has_float) {
@@ -2125,9 +2132,13 @@ fn builtinReduce(args: []const Value, allocator: Allocator, err_msg: *[]const u8
         var acc = args[1];
         const closure_val = args[2];
 
+        const acc_slot = roots.slot(acc);
+        const m = roots.mark();
         while (true) {
+            roots.restore(m);
             const elem = (try stream_obj.state.next(allocator)) orelse break;
             acc = try callClosure(closure_val, &[_]Value{ acc, elem });
+            roots.set(acc_slot, acc);
         }
         return acc;
     }
@@ -2175,8 +2186,12 @@ fn builtinLast(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     const stream_obj = ObjStream.fromObj(first.asObj());
     var last_val: ?Value = null;
 
+    const last_slot = roots.slot(Value.nil);
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         last_val = (try stream_obj.state.next(allocator)) orelse break;
+        roots.set(last_slot, last_val.?);
     }
 
     if (last_val) |lv| {
@@ -2206,7 +2221,9 @@ fn builtinEach(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     const stream_obj = ObjStream.fromObj(first.asObj());
     const closure_val = args[1];
 
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         const elem = (try stream_obj.state.next(allocator)) orelse break;
         _ = try callClosure(closure_val, &[_]Value{elem});
     }
@@ -2231,14 +2248,19 @@ fn builtinMin(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     const stream_obj = ObjStream.fromObj(first.asObj());
     var min_val: ?Value = null;
 
+    const min_slot = roots.slot(Value.nil);
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         const elem = (try stream_obj.state.next(allocator)) orelse break;
         if (min_val) |current_min| {
             if (valueLessThan(elem, current_min)) {
                 min_val = elem;
+                roots.set(min_slot, elem);
             }
         } else {
             min_val = elem;
+            roots.set(min_slot, elem);
         }
     }
 
@@ -2265,14 +2287,19 @@ fn builtinMax(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     const stream_obj = ObjStream.fromObj(first.asObj());
     var max_val: ?Value = null;
 
+    const max_slot = roots.slot(Value.nil);
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         const elem = (try stream_obj.state.next(allocator)) orelse break;
         if (max_val) |current_max| {
             if (valueLessThan(current_max, elem)) {
                 max_val = elem;
+                roots.set(max_slot, elem);
             }
         } else {
             max_val = elem;
+            roots.set(max_slot, elem);
         }
     }
 
@@ -3721,7 +3748,9 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
             };
 
             var first_elem = true;
+            const m = roots.mark();
             while (true) {
+                roots.restore(m);
                 const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (!first_elem) {
@@ -3750,7 +3779,9 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
             };
 
             var first_elem = true;
+            const m = roots.mark();
             while (true) {
+                roots.restore(m);
                 const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (!first_elem) {
@@ -3772,7 +3803,9 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
         },
 
         .jsonl => {
+            const m = roots.mark();
             while (true) {
+                roots.restore(m);
                 const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (elem.isObjType(.list)) {
@@ -3792,12 +3825,17 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
             defer if (hdr_info) |hi| sinkFreeHeaders(hi, allocator);
             var first_elem = true;
 
+            var m = roots.mark();
             while (true) {
+                roots.restore(m);
                 const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (first_elem) {
                     hdr_info = sinkExtractHeaders(elem, allocator, err_msg);
                     if (hdr_info == null) return error.RuntimeError;
+                    // The headers borrow the first element's field names.
+                    _ = roots.keep(m, elem);
+                    m = roots.mark();
 
                     if (opts.header) {
                         // Write header row.
@@ -3845,8 +3883,11 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
             var elements = std.ArrayListUnmanaged(Value){};
             defer elements.deinit(allocator);
 
+            // Every element is buffered, so each one stays pinned.
             while (true) {
+                const m = roots.mark();
                 const elem = (try stream_obj.state.next(allocator)) orelse break;
+                _ = roots.keep(m, elem);
                 elements.append(allocator, elem) catch {
                     err_msg.* = "out of memory";
                     return error.RuntimeError;
@@ -3943,7 +3984,9 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
         },
 
         .text => {
+            const m = roots.mark();
             while (true) {
+                roots.restore(m);
                 const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 const formatted = formatValue(elem, allocator, current_atom_names) catch {
@@ -4568,11 +4611,14 @@ fn sinkFormatToBuffer(
         var items = std.ArrayListUnmanaged(Value){};
         defer items.deinit(allocator);
 
+        // Every element is buffered, so each one stays pinned.
         while (true) {
+            const m = roots.mark();
             const inner = (stream_obj.state.next(allocator) catch {
                 err_msg.* = "stream error during S3 sink";
                 return error.RuntimeError;
             }) orelse break;
+            _ = roots.keep(m, inner);
             items.append(allocator, inner) catch return error.OutOfMemory;
         }
 
@@ -4598,7 +4644,9 @@ fn sinkFormatToBuffer(
     }
 
     // Text and JSONL: line-by-line.
+    const m = roots.mark();
     while (true) {
+        roots.restore(m);
         const inner = (stream_obj.state.next(allocator) catch {
             err_msg.* = "stream error during S3 sink";
             return error.RuntimeError;

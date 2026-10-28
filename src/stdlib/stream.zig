@@ -13,6 +13,7 @@ const ObjString = obj_mod.ObjString;
 const ObjRecord = obj_mod.ObjRecord;
 const ObjClosure = obj_mod.ObjClosure;
 const json_mod = @import("json");
+const roots = @import("roots");
 const fiber_mod = @import("fiber");
 const ObjFiber = fiber_mod.ObjFiber;
 const scheduler_mod = @import("scheduler");
@@ -377,6 +378,11 @@ pub const StreamState = union(enum) {
     };
 
     /// Pull the next element from this stream; null when it is exhausted.
+    ///
+    /// The returned value is pinned in the caller's root scope (see
+    /// roots.zig). Operators that pull several upstream elements per call
+    /// open a scope per element and `keep()` only the one they return, so
+    /// memory stays bounded however much they skip.
     pub fn next(self: *StreamState, allocator: Allocator) NativeError!?Value {
         switch (self.*) {
             .range_iter => |*s| {
@@ -410,11 +416,13 @@ pub const StreamState = union(enum) {
             .filter_op => |s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 // Keep pulling until we find a matching element or upstream is exhausted.
+                const m = roots.mark();
                 while (true) {
+                    roots.restore(m);
                     const inner = (try upstream_stream.state.next(allocator)) orelse return null;
                     const predicate_result = try callClosure(s.fn_val, &[_]Value{inner});
                     if (!isFalsy(predicate_result)) {
-                        return inner;
+                        return roots.keep(m, inner);
                     }
                 }
             },
@@ -431,6 +439,8 @@ pub const StreamState = union(enum) {
                     // Discard `remaining` elements.
                     var dropped: i32 = 0;
                     while (dropped < s.remaining) : (dropped += 1) {
+                        const m = roots.mark();
+                        defer roots.restore(m);
                         _ = (try upstream_stream.state.next(allocator)) orelse return null;
                     }
                     s.started = true;
@@ -438,12 +448,16 @@ pub const StreamState = union(enum) {
                 return upstream_stream.state.next(allocator);
             },
             .flat_map_op => |*s| {
+                const m = roots.mark();
                 while (true) {
+                    // The current inner stream is reachable through s.inner,
+                    // so each iteration can drop its pins.
+                    roots.restore(m);
                     // If we have an active inner stream, pull from it.
                     if (!s.inner.isNil()) {
                         const inner_stream = ObjStream.fromObj(s.inner.asObj());
                         const inner_val = try inner_stream.state.next(allocator);
-                        if (inner_val) |v| return v;
+                        if (inner_val) |v| return roots.keep(m, v);
                         // Inner stream exhausted, clear it.
                         s.inner = Value.nil;
                     }
@@ -487,21 +501,23 @@ pub const StreamState = union(enum) {
                             s.inner = Value.fromObj(&wrapped.obj);
                         } else {
                             // Not a stream/list/range -- treat as single-element.
-                            return result;
+                            return roots.keep(m, result);
                         }
                     }
                 }
             },
             .filter_map_op => |s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const m = roots.mark();
                 while (true) {
+                    roots.restore(m);
                     const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     const result = try callClosure(s.fn_val, &[_]Value{elem});
                     // Option.Some(v): unwrap and yield.
                     if (result.isObjType(.adt)) {
                         const adt = ObjAdt.fromObj(result.asObj());
                         if (adt.type_id == 0 and adt.variant_idx == 0) {
-                            return adt.payload[0];
+                            return roots.keep(m, adt.payload[0]);
                         }
                         if (adt.type_id == 0 and adt.variant_idx == 1) {
                             continue; // Option.None: skip.
@@ -510,19 +526,21 @@ pub const StreamState = union(enum) {
                     // nil: skip (convenient for ?. chaining).
                     if (result.isNil()) continue;
                     // Non-Option, non-nil: yield as-is.
-                    return result;
+                    return roots.keep(m, result);
                 }
             },
             .filter_ok_op => |s| {
                 // Pull Result values, keep only Ok payloads, skip Err.
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const m = roots.mark();
                 while (true) {
+                    roots.restore(m);
                     const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     // Result.Ok: type_id=1, variant_idx=0
                     if (elem.isObjType(.adt)) {
                         const adt = ObjAdt.fromObj(elem.asObj());
                         if (adt.type_id == 1 and adt.variant_idx == 0) {
-                            return adt.payload[0];
+                            return roots.keep(m, adt.payload[0]);
                         }
                     }
                     // Result.Err or non-Result values are skipped.
@@ -531,13 +549,15 @@ pub const StreamState = union(enum) {
             .filter_err_op => |s| {
                 // Pull Result values, keep only Err payloads, skip Ok.
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const m = roots.mark();
                 while (true) {
+                    roots.restore(m);
                     const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     // Result.Err: type_id=1, variant_idx=1
                     if (elem.isObjType(.adt)) {
                         const adt = ObjAdt.fromObj(elem.asObj());
                         if (adt.type_id == 1 and adt.variant_idx == 1) {
-                            return adt.payload[0];
+                            return roots.keep(m, adt.payload[0]);
                         }
                     }
                 }
@@ -584,12 +604,15 @@ pub const StreamState = union(enum) {
                 return Value.fromObj(&tuple.obj);
             },
             .flatten_op => |*s| {
+                const m = roots.mark();
                 while (true) {
+                    // Inner lists and streams are reachable through the state.
+                    roots.restore(m);
                     // If we have an active inner stream, pull from it.
                     if (!s.inner_stream.isNil()) {
                         const inner_s = ObjStream.fromObj(s.inner_stream.asObj());
                         const inner_val = try inner_s.state.next(allocator);
-                        if (inner_val) |v| return v;
+                        if (inner_val) |v| return roots.keep(m, v);
                         s.inner_stream = Value.nil;
                     }
                     // If we have an active inner list, yield from it.
@@ -598,7 +621,7 @@ pub const StreamState = union(enum) {
                         if (s.inner_idx < list_obj.items.items.len) {
                             const elem = list_obj.items.items[s.inner_idx];
                             s.inner_idx += 1;
-                            return elem;
+                            return roots.keep(m, elem);
                         }
                         // Inner list exhausted.
                         s.inner_list = Value.nil;
@@ -616,7 +639,7 @@ pub const StreamState = union(enum) {
                         s.inner_stream = elem;
                     } else {
                         // Non-list, non-stream element -- yield directly.
-                        return elem;
+                        return roots.keep(m, elem);
                     }
                 }
             },
@@ -634,6 +657,9 @@ pub const StreamState = union(enum) {
                 trackObj(&batch_list.obj);
                 var count: i32 = 0;
                 while (count < s.size) : (count += 1) {
+                    // Elements stay reachable through batch_list.
+                    const m = roots.mark();
+                    defer roots.restore(m);
                     const elem = (try upstream_stream.state.next(allocator)) orelse {
                         s.exhausted = true;
                         break;
@@ -693,7 +719,7 @@ pub const StreamState = union(enum) {
                 if (s.idx >= lst.items.items.len) return null;
                 const val = lst.items.items[s.idx];
                 s.idx += 1;
-                return val;
+                return pinned(val);
             },
             .partition_ok => |s| {
                 return partitionNext(s.shared, true, allocator);
@@ -718,14 +744,14 @@ pub const StreamState = union(enum) {
                 if (s.idx >= lst.items.items.len) return null;
                 const val = lst.items.items[s.idx];
                 s.idx += 1;
-                return val;
+                return pinned(val);
             },
             .par_map => |*s| {
                 // Return buffered result if available.
                 if (s.result_buf != null and s.next_emit < s.batch_size) {
                     const val = s.result_buf.?[s.next_emit];
                     s.next_emit += 1;
-                    return val;
+                    return pinned(val);
                 }
 
                 // Fail-fast: if a previous batch had an error, propagate it.
@@ -829,14 +855,14 @@ pub const StreamState = union(enum) {
 
                 s.batch_size = count;
                 s.next_emit = 1; // Return first result now, rest on subsequent calls.
-                return s.result_buf.?[0];
+                return pinned(s.result_buf.?[0]);
             },
             .par_map_unordered => |*s| {
                 // Return buffered result if available.
                 if (s.result_buf != null and s.next_emit < s.batch_size) {
                     const val = s.result_buf.?[s.next_emit];
                     s.next_emit += 1;
-                    return val;
+                    return pinned(val);
                 }
 
                 // Fail-fast: if a previous batch had an error, propagate it.
@@ -934,14 +960,14 @@ pub const StreamState = union(enum) {
 
                 s.batch_size = count;
                 s.next_emit = 1;
-                return s.result_buf.?[0];
+                return pinned(s.result_buf.?[0]);
             },
             .par_map_result => |*s| {
                 // Return buffered result if available.
                 if (s.result_buf != null and s.next_emit < s.batch_size) {
                     const val = s.result_buf.?[s.next_emit];
                     s.next_emit += 1;
-                    return val;
+                    return pinned(val);
                 }
 
                 if (s.upstream_done) return null;
@@ -1047,7 +1073,7 @@ pub const StreamState = union(enum) {
 
                 s.batch_size = count;
                 s.next_emit = 1;
-                return s.result_buf.?[0];
+                return pinned(s.result_buf.?[0]);
             },
             .throttle_op => |*s| {
                 if (!s.started) {
@@ -1085,7 +1111,7 @@ pub const StreamState = union(enum) {
                         s.buf.clearRetainingCapacity();
                         s.read_idx = 0;
                     }
-                    return val;
+                    return pinned(val);
                 }
 
                 // Buffer empty. If upstream exhausted, we're done.
@@ -1112,7 +1138,7 @@ pub const StreamState = union(enum) {
                     s.buf.clearRetainingCapacity();
                     s.read_idx = 0;
                 }
-                return val;
+                return pinned(val);
             },
             .tick => |*s| {
                 // Generate incrementing integers at regular intervals.
@@ -1482,12 +1508,15 @@ fn partitionNext(shared: *StreamState.PartitionState, want_ok: bool, allocator: 
     const my_queue = if (want_ok) &shared.ok_queue else &shared.err_queue;
     if (my_queue.items.len > 0) {
         const val = my_queue.orderedRemove(0);
-        return val;
+        return pinned(val);
     }
     // Pull from upstream and classify.
     const other_queue = if (want_ok) &shared.err_queue else &shared.ok_queue;
     const upstream_stream = ObjStream.fromObj(shared.upstream.asObj());
+    const m = roots.mark();
     while (true) {
+        // Values for the other side stay reachable through its queue.
+        roots.restore(m);
         const elem = (try upstream_stream.state.next(allocator)) orelse return null;
         // Classify: Result type_id=1, Ok=variant 0, Err=variant 1.
         if (elem.isObjType(.adt)) {
@@ -1496,18 +1525,18 @@ fn partitionNext(shared: *StreamState.PartitionState, want_ok: bool, allocator: 
                 const payload_val = if (adt.payload.len > 0) adt.payload[0] else Value.nil;
                 if (adt.variant_idx == 0) {
                     // Ok variant.
-                    if (want_ok) return payload_val;
+                    if (want_ok) return roots.keep(m, payload_val);
                     try other_queue.append(allocator, payload_val);
                 } else {
                     // Err variant.
-                    if (!want_ok) return payload_val;
+                    if (!want_ok) return roots.keep(m, payload_val);
                     try other_queue.append(allocator, payload_val);
                 }
                 continue;
             }
         }
         // Non-Result values go to ok queue by default.
-        if (want_ok) return elem;
+        if (want_ok) return roots.keep(m, elem);
         try other_queue.append(allocator, elem);
     }
 }
@@ -1598,6 +1627,13 @@ fn valueLessThan(a: Value, b: Value) bool {
         return std.mem.order(u8, sa, sb) == .lt;
     }
     return a.bits < b.bits;
+}
+
+/// Pin a value read from an operator's own buffer before handing it out:
+/// the buffer may drop it on the next pull while the caller still holds it.
+fn pinned(v: Value) Value {
+    roots.pin(v);
+    return v;
 }
 
 /// Check if value is falsy (nil or false).
