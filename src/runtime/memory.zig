@@ -22,7 +22,7 @@ pub fn create() Allocator {
 
 /// Return a GC-aware allocator backed by the given GC state.
 /// The returned allocator tracks bytes_allocated and will eventually
-/// trigger nursery collection when the threshold is reached.
+/// trigger a collection when the threshold is reached.
 pub fn createGC(gc_alloc: *GCAllocator) Allocator {
     return gc_alloc.allocator();
 }

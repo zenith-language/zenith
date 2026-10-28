@@ -32,15 +32,16 @@ pub const ObjType = enum(u8) {
 /// that we can always recover the type tag from any `*Obj` pointer.
 pub const Obj = struct {
     obj_type: ObjType,
-    /// GC flags: bit 0 = mark, bit 1 = old generation.
+    /// GC flags: bit 0 = mark, bit 1 = permanent, bit 2 = tracked.
     gc_flags: u8 = 0,
     /// Linked-list pointer for GC traversal.
     next: ?*Obj = null,
-    /// Forwarding pointer for Cheney's semi-space copying algorithm.
-    forwarded: ?*Obj = null,
 
     pub const GC_MARK: u8 = 0x01;
-    pub const GC_OLD: u8 = 0x02;
+    /// Compiler constants: never swept and never traced.
+    pub const GC_PERM: u8 = 0x02;
+    /// On one of the GC's object lists.
+    pub const GC_TRACKED: u8 = 0x04;
 
     pub inline fn isMarked(self: *const Obj) bool {
         return (self.gc_flags & GC_MARK) != 0;
@@ -54,12 +55,12 @@ pub const Obj = struct {
         }
     }
 
-    pub inline fn isOldGen(self: *const Obj) bool {
-        return (self.gc_flags & GC_OLD) != 0;
+    pub inline fn isPermanent(self: *const Obj) bool {
+        return (self.gc_flags & GC_PERM) != 0;
     }
 
-    pub inline fn promoteToOld(self: *Obj) void {
-        self.gc_flags |= GC_OLD;
+    pub inline fn isTracked(self: *const Obj) bool {
+        return (self.gc_flags & GC_TRACKED) != 0;
     }
 
     /// Free the memory for this object and its payload.

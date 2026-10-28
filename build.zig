@@ -149,46 +149,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const gc_nursery_mod = b.createModule(.{
-        .root_source_file = b.path("src/runtime/gc_nursery.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "obj", .module = obj_mod },
-            .{ .name = "value", .module = value_mod },
-            .{ .name = "gc", .module = gc_mod },
-        },
-    });
-
-    // gc_nursery needs chunk for ObjFunction.chunk.constants (via obj -> chunk).
-    gc_nursery_mod.addImport("chunk", chunk_mod);
-    // gc_nursery needs fiber for ObjFiber GC scanning.
-    gc_nursery_mod.addImport("fiber", fiber_mod);
-
-    const gc_oldgen_mod = b.createModule(.{
-        .root_source_file = b.path("src/runtime/gc_oldgen.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "obj", .module = obj_mod },
-            .{ .name = "value", .module = value_mod },
-            .{ .name = "gc", .module = gc_mod },
-            .{ .name = "gc_nursery", .module = gc_nursery_mod },
-        },
-    });
-
-    // gc_oldgen needs chunk for ObjFunction.chunk.constants (via obj -> chunk).
-    gc_oldgen_mod.addImport("chunk", chunk_mod);
-    // gc_oldgen needs fiber for ObjFiber GC scanning.
-    gc_oldgen_mod.addImport("fiber", fiber_mod);
-    // gc_nursery and gc_oldgen need channel for ObjChannel GC scanning.
-    gc_nursery_mod.addImport("channel", channel_mod);
-    gc_oldgen_mod.addImport("channel", channel_mod);
-
-    // gc_mod needs gc_nursery, gc_oldgen, and gc_roots (added after vm_mod is created below).
-    gc_mod.addImport("gc_nursery", gc_nursery_mod);
-    gc_mod.addImport("gc_oldgen", gc_oldgen_mod);
     gc_mod.addImport("value", value_mod);
+    gc_mod.addImport("fiber", fiber_mod);
+    gc_mod.addImport("channel", channel_mod);
 
     // Wire memory_mod to import gc for createGC function.
     memory_mod.addImport("gc", gc_mod);
@@ -255,9 +218,6 @@ pub fn build(b: *std.Build) void {
     // Wire obj_mod to import stream for ObjStream/StreamState.
     obj_mod.addImport("stream", stream_mod_build);
 
-    // Wire gc_nursery and gc_oldgen to import stream for GC traversal.
-    gc_nursery_mod.addImport("stream", stream_mod_build);
-    gc_oldgen_mod.addImport("stream", stream_mod_build);
 
     const json_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib/json.zig"),
@@ -345,9 +305,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "obj", .module = obj_mod },
             .{ .name = "value", .module = value_mod },
             .{ .name = "gc", .module = gc_mod },
-            .{ .name = "gc_nursery", .module = gc_nursery_mod },
-            .{ .name = "gc_oldgen", .module = gc_oldgen_mod },
-            .{ .name = "arena", .module = arena_mod },
             .{ .name = "vm", .module = vm_mod },
         },
     });
@@ -356,15 +313,12 @@ pub fn build(b: *std.Build) void {
     gc_roots_mod.addImport("fiber", fiber_mod);
     gc_roots_mod.addImport("scheduler", scheduler_mod);
 
-    // Wire gc_mod to import gc_roots (for collectNursery orchestration).
+    // Wire gc_mod to import gc_roots (root scanning in collect).
     gc_mod.addImport("gc_roots", gc_roots_mod);
     // Wire gc_mod to import vm for VM type access.
     gc_mod.addImport("vm", vm_mod);
     // Wire gc_mod to import scheduler for safepoint protocol.
     gc_mod.addImport("scheduler", scheduler_mod);
-
-    // Wire gc_oldgen_mod to import gc_roots (for scanRootsForOldGen in mark phase).
-    gc_oldgen_mod.addImport("gc_roots", gc_roots_mod);
 
     const compiler_mod = b.createModule(.{
         .root_source_file = b.path("src/compiler/compiler.zig"),
@@ -487,8 +441,6 @@ pub fn build(b: *std.Build) void {
         intern_mod,
         arena_mod,
         gc_mod,
-        gc_nursery_mod,
-        gc_oldgen_mod,
         gc_roots_mod,
         obj_mod,
         value_mod,

@@ -11,5 +11,5 @@ while i < 10000 {
 gc()
 let stats = gc_stats()
 print("stress ok")
-print(stats.nursery_collections > 0)
-print(stats.bytes_freed > 0)
+print(stats.collections > 0)
+print(stats.objects_freed > 0)

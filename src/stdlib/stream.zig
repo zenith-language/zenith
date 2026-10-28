@@ -1250,288 +1250,145 @@ pub const StreamState = union(enum) {
         }
     }
 
-    /// Trace GC references in this stream state for nursery collection.
+    /// Trace GC references held by this stream state.
     /// All Value fields that might hold object references must be traced.
-    pub fn traceGCRefs(self: *StreamState, nursery: anytype, gc: anytype) !void {
+    pub fn traceGCRefs(self: *StreamState, marker: anytype, gc: anytype) !void {
         switch (self.*) {
             .range_iter, .file_reader, .jsonl_reader, .stdin_reader, .memory_reader => {},
             .json_array_iter => |*s| {
-                try nursery.processValue(&s.items, gc);
+                try marker.processValue(&s.items, gc);
             },
             .repeat_iter => |*s| {
-                try nursery.processValue(&s.value, gc);
+                try marker.processValue(&s.value, gc);
             },
             .iterate_iter => |*s| {
-                try nursery.processValue(&s.current, gc);
-                try nursery.processValue(&s.fn_val, gc);
+                try marker.processValue(&s.current, gc);
+                try marker.processValue(&s.fn_val, gc);
             },
             .map_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.fn_val, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.fn_val, gc);
             },
             .filter_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.fn_val, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.fn_val, gc);
             },
             .take_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
+                try marker.processValue(&s.upstream, gc);
             },
             .drop_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
+                try marker.processValue(&s.upstream, gc);
             },
             .flat_map_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.fn_val, gc);
-                try nursery.processValue(&s.inner, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.fn_val, gc);
+                try marker.processValue(&s.inner, gc);
             },
             .filter_map_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.fn_val, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.fn_val, gc);
             },
             .filter_ok_op, .filter_err_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
+                try marker.processValue(&s.upstream, gc);
             },
             .scan_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.acc, gc);
-                try nursery.processValue(&s.fn_val, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.acc, gc);
+                try marker.processValue(&s.fn_val, gc);
             },
             .distinct_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
+                try marker.processValue(&s.upstream, gc);
             },
             .zip_op => |*s| {
-                try nursery.processValue(&s.upstream_a, gc);
-                try nursery.processValue(&s.upstream_b, gc);
+                try marker.processValue(&s.upstream_a, gc);
+                try marker.processValue(&s.upstream_b, gc);
             },
             .flatten_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.inner_list, gc);
-                try nursery.processValue(&s.inner_stream, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.inner_list, gc);
+                try marker.processValue(&s.inner_stream, gc);
             },
             .tap_op, .tap_err_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.fn_val, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.fn_val, gc);
             },
             .batch_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
+                try marker.processValue(&s.upstream, gc);
             },
             .sort_by_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.key_fn, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.key_fn, gc);
                 if (s.sorted) |lst| {
                     for (lst.items.items) |*v| {
-                        try nursery.processValue(v, gc);
+                        try marker.processValue(v, gc);
                     }
                 }
             },
             .partition_ok, .partition_err => |*s| {
-                try nursery.processValue(&s.shared.upstream, gc);
+                try marker.processValue(&s.shared.upstream, gc);
                 for (s.shared.ok_queue.items) |*v| {
-                    try nursery.processValue(v, gc);
+                    try marker.processValue(v, gc);
                 }
                 for (s.shared.err_queue.items) |*v| {
-                    try nursery.processValue(v, gc);
+                    try marker.processValue(v, gc);
                 }
             },
             .par_map => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.transform_fn, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.transform_fn, gc);
                 if (s.result_buf) |buf| {
                     var j: u32 = 0;
                     while (j < s.batch_size) : (j += 1) {
-                        try nursery.processValue(&buf[j], gc);
+                        try marker.processValue(&buf[j], gc);
                     }
                 }
                 if (s.input_buf) |buf| {
                     var j: u32 = 0;
                     while (j < s.batch_size) : (j += 1) {
-                        try nursery.processValue(&buf[j], gc);
+                        try marker.processValue(&buf[j], gc);
                     }
                 }
             },
             .par_map_unordered => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.transform_fn, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.transform_fn, gc);
                 if (s.result_buf) |buf| {
                     var j: u32 = 0;
                     while (j < s.batch_size) : (j += 1) {
-                        try nursery.processValue(&buf[j], gc);
+                        try marker.processValue(&buf[j], gc);
                     }
                 }
                 if (s.input_buf) |buf| {
                     var j: u32 = 0;
                     while (j < s.batch_size) : (j += 1) {
-                        try nursery.processValue(&buf[j], gc);
+                        try marker.processValue(&buf[j], gc);
                     }
                 }
             },
             .par_map_result => |*s| {
-                try nursery.processValue(&s.upstream, gc);
-                try nursery.processValue(&s.transform_fn, gc);
+                try marker.processValue(&s.upstream, gc);
+                try marker.processValue(&s.transform_fn, gc);
                 if (s.result_buf) |buf| {
                     var j: u32 = 0;
                     while (j < s.batch_size) : (j += 1) {
-                        try nursery.processValue(&buf[j], gc);
+                        try marker.processValue(&buf[j], gc);
                     }
                 }
                 if (s.input_buf) |buf| {
                     var j: u32 = 0;
                     while (j < s.batch_size) : (j += 1) {
-                        try nursery.processValue(&buf[j], gc);
+                        try marker.processValue(&buf[j], gc);
                     }
                 }
             },
             .tick => {},
             .throttle_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
+                try marker.processValue(&s.upstream, gc);
             },
             .buffer_op => |*s| {
-                try nursery.processValue(&s.upstream, gc);
+                try marker.processValue(&s.upstream, gc);
                 for (s.buf.items) |*v| {
-                    try nursery.processValue(v, gc);
-                }
-            },
-        }
-    }
-
-    /// Trace GC references for old-gen collection.
-    pub fn traceGCRefsOldGen(self: *StreamState, oldgen: anytype, gc: anytype) !void {
-        switch (self.*) {
-            .range_iter, .file_reader, .jsonl_reader, .stdin_reader, .memory_reader => {},
-            .json_array_iter => |*s| {
-                try oldgen.processValue(&s.items, gc);
-            },
-            .repeat_iter => |*s| {
-                try oldgen.processValue(&s.value, gc);
-            },
-            .iterate_iter => |*s| {
-                try oldgen.processValue(&s.current, gc);
-                try oldgen.processValue(&s.fn_val, gc);
-            },
-            .map_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.fn_val, gc);
-            },
-            .filter_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.fn_val, gc);
-            },
-            .take_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-            },
-            .drop_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-            },
-            .flat_map_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.fn_val, gc);
-                try oldgen.processValue(&s.inner, gc);
-            },
-            .filter_map_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.fn_val, gc);
-            },
-            .filter_ok_op, .filter_err_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-            },
-            .scan_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.acc, gc);
-                try oldgen.processValue(&s.fn_val, gc);
-            },
-            .distinct_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-            },
-            .zip_op => |*s| {
-                try oldgen.processValue(&s.upstream_a, gc);
-                try oldgen.processValue(&s.upstream_b, gc);
-            },
-            .flatten_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.inner_list, gc);
-                try oldgen.processValue(&s.inner_stream, gc);
-            },
-            .tap_op, .tap_err_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.fn_val, gc);
-            },
-            .batch_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-            },
-            .sort_by_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.key_fn, gc);
-                if (s.sorted) |lst| {
-                    for (lst.items.items) |*v| {
-                        try oldgen.processValue(v, gc);
-                    }
-                }
-            },
-            .partition_ok, .partition_err => |*s| {
-                try oldgen.processValue(&s.shared.upstream, gc);
-                for (s.shared.ok_queue.items) |*v| {
-                    try oldgen.processValue(v, gc);
-                }
-                for (s.shared.err_queue.items) |*v| {
-                    try oldgen.processValue(v, gc);
-                }
-            },
-            .par_map => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.transform_fn, gc);
-                if (s.result_buf) |buf| {
-                    var j: u32 = 0;
-                    while (j < s.batch_size) : (j += 1) {
-                        try oldgen.processValue(&buf[j], gc);
-                    }
-                }
-                if (s.input_buf) |buf| {
-                    var j: u32 = 0;
-                    while (j < s.batch_size) : (j += 1) {
-                        try oldgen.processValue(&buf[j], gc);
-                    }
-                }
-            },
-            .par_map_unordered => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.transform_fn, gc);
-                if (s.result_buf) |buf| {
-                    var j: u32 = 0;
-                    while (j < s.batch_size) : (j += 1) {
-                        try oldgen.processValue(&buf[j], gc);
-                    }
-                }
-                if (s.input_buf) |buf| {
-                    var j: u32 = 0;
-                    while (j < s.batch_size) : (j += 1) {
-                        try oldgen.processValue(&buf[j], gc);
-                    }
-                }
-            },
-            .par_map_result => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                try oldgen.processValue(&s.transform_fn, gc);
-                if (s.result_buf) |buf| {
-                    var j: u32 = 0;
-                    while (j < s.batch_size) : (j += 1) {
-                        try oldgen.processValue(&buf[j], gc);
-                    }
-                }
-                if (s.input_buf) |buf| {
-                    var j: u32 = 0;
-                    while (j < s.batch_size) : (j += 1) {
-                        try oldgen.processValue(&buf[j], gc);
-                    }
-                }
-            },
-            .tick => {},
-            .throttle_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-            },
-            .buffer_op => |*s| {
-                try oldgen.processValue(&s.upstream, gc);
-                for (s.buf.items) |*v| {
-                    try oldgen.processValue(v, gc);
+                    try marker.processValue(v, gc);
                 }
             },
         }

@@ -124,7 +124,7 @@ pub const VM = struct {
 
     /// Initialize VM with an ObjClosure (Phase 2+ mode).
     /// When `gc` is non-null, all object tracking goes through the GC
-    /// and nursery collection is triggered automatically on allocation.
+    /// and collection is triggered automatically on allocation.
     /// `heap_allocator` is the GC-aware allocator for object creation.
     /// `infra_alloc` is the raw allocator for bookkeeping (errors, atom names).
     pub fn initWithClosure(closure: *ObjClosure, heap_allocator: Allocator, gc: ?*GC, infra_alloc: Allocator) VM {
@@ -210,12 +210,13 @@ pub const VM = struct {
     }
 
     /// Register a heap-allocated object for cleanup.
-    /// In GC mode, delegates to gc.trackObject (nursery list).
+    /// In GC mode, delegates to gc.trackObject.
     /// In legacy mode, uses the VM's own linked list.
     fn trackObject(self: *VM, obj: *obj_mod.Obj) void {
         if (self.gc) |g| {
             g.trackObject(obj);
-        } else {
+        } else if (!obj.isTracked()) {
+            obj.gc_flags |= obj_mod.Obj.GC_TRACKED;
             obj.next = self.objects;
             self.objects = obj;
         }
@@ -223,7 +224,7 @@ pub const VM = struct {
 
     /// Register all heap objects from the compiled constant pools so the VM
     /// owns them for cleanup. Must be called once after initWithClosure.
-    /// In GC mode, these are tracked as old-gen objects (long-lived).
+    /// In GC mode, these are permanent: never swept, never traced.
     pub fn trackCompilerObjects(self: *Self, closure: *ObjClosure) void {
         self.trackConstantsRecursive(closure.function);
     }
@@ -238,10 +239,7 @@ pub const VM = struct {
                     self.trackConstantsRecursive(ObjFunction.fromObj(obj_ptr));
                 } else {
                     if (self.gc) |g| {
-                        // GC mode: track as old-gen (long-lived compiler constants).
-                        if (!obj_ptr.isOldGen()) {
-                            g.trackOldObject(obj_ptr);
-                        }
+                        g.trackPermanent(obj_ptr);
                     } else {
                         // Legacy mode: track in VM's linked list.
                         var cur = self.objects;
@@ -714,10 +712,6 @@ pub const VM = struct {
                     if (frame.closure.upvalues[slot]) |uv| {
                         const val = self.peek(0);
                         uv.location.* = val;
-                        // Write barrier: upvalue (possibly old-gen) stores a new value.
-                        if (self.gc) |g| {
-                            g.writeBarrier(&uv.obj, val);
-                        }
                     }
                 },
 
@@ -1172,33 +1166,7 @@ pub const VM = struct {
             }
         };
 
-        if (result.isObj()) {
-            // Only track if not already tracked (closures called from builtins
-            // may return objects already registered via the VM's normal execution).
-            const obj_ptr = result.asObj();
-            var already_tracked = false;
-            if (self.gc) |g| {
-                var cur: ?*obj_mod.Obj = g.nursery_objects;
-                while (cur) |o| {
-                    if (o == obj_ptr) { already_tracked = true; break; }
-                    cur = o.next;
-                }
-                if (!already_tracked) {
-                    cur = g.old_objects;
-                    while (cur) |o| {
-                        if (o == obj_ptr) { already_tracked = true; break; }
-                        cur = o.next;
-                    }
-                }
-            } else {
-                var cur = self.objects;
-                while (cur) |o| {
-                    if (o == obj_ptr) { already_tracked = true; break; }
-                    cur = o.next;
-                }
-            }
-            if (!already_tracked) self.trackObject(obj_ptr);
-        }
+        if (result.isObj()) self.trackObject(result.asObj());
 
         self.getStackTop().* -= (@as(u32, arg_count) + 1);
         try self.push(result);
@@ -1348,35 +1316,14 @@ pub const VM = struct {
     /// Callback function for builtins to register intermediate heap objects.
     fn trackObjectFromBuiltin(vm_ptr: *anyopaque, obj: *obj_mod.Obj) void {
         const vm: *Self = @ptrCast(@alignCast(vm_ptr));
-        if (vm.gc) |g| {
-            // GC mode: check nursery + old lists.
-            var cur: ?*obj_mod.Obj = g.nursery_objects;
-            while (cur) |o| {
-                if (o == obj) return;
-                cur = o.next;
-            }
-            cur = g.old_objects;
-            while (cur) |o| {
-                if (o == obj) return;
-                cur = o.next;
-            }
-            g.trackObject(obj);
-        } else {
-            // Legacy mode: check VM's list.
-            var cur = vm.objects;
-            while (cur) |o| {
-                if (o == obj) return;
-                cur = o.next;
-            }
-            vm.trackObject(obj);
-        }
+        vm.trackObject(obj);
     }
 
     /// Callback function for builtins to trigger a full GC collection.
     fn triggerGCFromBuiltin(vm_ptr: *anyopaque) void {
         const vm: *Self = @ptrCast(@alignCast(vm_ptr));
         if (vm.gc) |g| {
-            g.collectFull() catch {};
+            g.collect() catch {};
         }
     }
 
@@ -1385,22 +1332,15 @@ pub const VM = struct {
         const vm: *Self = @ptrCast(@alignCast(vm_ptr));
         if (vm.gc) |g| {
             return .{
-                .nursery_collections = g.nursery_count,
-                .oldgen_collections = g.oldgen_count,
-                .bytes_freed = g.total_bytes_freed,
+                .collections = g.collections,
+                .objects_freed = g.objects_freed,
+                .bytes_freed = g.bytes_freed,
                 .last_pause_ns = g.last_pause_ns,
                 .heap_size = g.heapSize(),
-                .nursery_size = g.nursery_capacity,
+                .live_objects = g.object_count,
             };
         }
-        return .{
-            .nursery_collections = 0,
-            .oldgen_collections = 0,
-            .bytes_freed = 0,
-            .last_pause_ns = 0,
-            .heap_size = 0,
-            .nursery_size = 0,
-        };
+        return .{};
     }
 
     /// Callback function for stream operators to retrieve the last error message.
@@ -1675,10 +1615,6 @@ pub const VM = struct {
                 if (frame.closure.upvalues[slot]) |uv| {
                     const val = self.peek(0);
                     uv.location.* = val;
-                    // Write barrier: upvalue (possibly old-gen) stores a new value.
-                    if (self.gc) |g| {
-                        g.writeBarrier(&uv.obj, val);
-                    }
                 }
             },
             .op_close_upvalue => {
@@ -1889,11 +1825,6 @@ pub const VM = struct {
             // Close: copy value from stack to closed field.
             uv.closed = uv.location.*;
             uv.location = &uv.closed;
-            // Write barrier: upvalue (possibly old-gen) now stores a value
-            // that may reference a nursery object.
-            if (self.gc) |g| {
-                g.writeBarrier(&uv.obj, uv.closed);
-            }
             open_uv.* = uv.next;
         }
     }

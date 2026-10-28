@@ -3,142 +3,131 @@ const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const obj_mod = @import("obj");
 const Obj = obj_mod.Obj;
+const ObjFunction = obj_mod.ObjFunction;
+const ObjClosure = obj_mod.ObjClosure;
+const ObjUpvalue = obj_mod.ObjUpvalue;
+const ObjList = obj_mod.ObjList;
+const ObjMap = obj_mod.ObjMap;
+const ObjTuple = obj_mod.ObjTuple;
+const ObjRecord = obj_mod.ObjRecord;
+const ObjAdt = obj_mod.ObjAdt;
+const ObjStream = obj_mod.ObjStream;
 const value_mod = @import("value");
 const Value = value_mod.Value;
 const intern_mod = @import("intern");
 const InternTable = intern_mod.InternTable;
-const gc_nursery_mod = @import("gc_nursery");
-const NurseryCollector = gc_nursery_mod.NurseryCollector;
-const gc_oldgen_mod = @import("gc_oldgen");
-const OldGenCollector = gc_oldgen_mod.OldGenCollector;
-const WriteBarrier = gc_oldgen_mod.WriteBarrier;
 const gc_roots_mod = @import("gc_roots");
 const arena_mod = @import("arena");
 const StageArena = arena_mod.StageArena;
+const fiber_mod = @import("fiber");
+const ObjFiber = fiber_mod.ObjFiber;
+const channel_mod = @import("channel");
+const ObjChannel = channel_mod.ObjChannel;
 const vm_mod = @import("vm");
 const VM = vm_mod.VM;
 const scheduler_mod = @import("scheduler");
 const Scheduler = scheduler_mod.Scheduler;
 
-/// Central GC state for generational garbage collection.
+/// Non-moving mark-sweep garbage collector.
 ///
-/// Manages allocation tracking, collection statistics, the string intern
-/// table, and object lists by generation. The nursery uses a semi-space
-/// copying algorithm (Cheney's), while the old generation uses mark-sweep.
+/// Every heap object sits on one intrusive list. A collection marks what is
+/// reachable from the roots, frees the rest, and schedules the next
+/// collection at twice the surviving heap, so collection work stays
+/// proportional to allocation. Objects never move and there are no write
+/// barriers: native code may mutate any object it holds.
+///
+/// Roots are the VM and fiber stacks, frames and open upvalues, and
+/// registered arenas.
 pub const GC = struct {
-    // ── Allocation tracking ──────────────────────────────────────────
+    // ── Heap accounting ──────────────────────────────────────────────
     bytes_allocated: usize = 0,
-    next_nursery_gc: usize,
+    next_gc: usize,
+    min_heap: usize,
 
-    // ── Collection statistics ────────────────────────────────────────
-    nursery_count: u64 = 0,
-    oldgen_count: u64 = 0,
-    total_bytes_freed: u64 = 0,
+    // ── Statistics ───────────────────────────────────────────────────
+    collections: u64 = 0,
+    objects_freed: u64 = 0,
+    bytes_freed: u64 = 0,
     last_pause_ns: u64 = 0,
+    object_count: usize = 0,
 
-    // ── Intern table ─────────────────────────────────────────────────
     intern_table: InternTable,
 
-    // ── Object lists by generation ───────────────────────────────────
-    nursery_objects: ?*Obj = null,
-    old_objects: ?*Obj = null,
+    /// Objects subject to collection.
+    objects: ?*Obj = null,
+    /// Compiler constants, freed only by deinit.
+    permanent_objects: ?*Obj = null,
 
-    // ── Backing allocator ────────────────────────────────────────────
     backing_allocator: Allocator,
-
-    // ── Nursery collector ─────────────────────────────────────────────
-    nursery_collector: NurseryCollector = NurseryCollector.init(),
-
-    // ── Old-gen collector ─────────────────────────────────────────────
-    oldgen_collector: OldGenCollector = OldGenCollector.init(),
-
-    // ── Write barrier (remembered set) ────────────────────────────────
-    write_barrier: WriteBarrier = WriteBarrier.init(),
-
-    // ── Old-gen sizing ────────────────────────────────────────────────
-    old_gen_size: usize = 0, // count of objects in old gen
-    old_gen_threshold: usize = 2048, // trigger threshold (initial: 2048 objects)
-    old_gen_last_size: usize = 0, // size after last old-gen collection
-
-    // ── Registered arenas ────────────────────────────────────────────
+    marker: Marker = .{},
     arenas: std.ArrayListUnmanaged(*StageArena) = .empty,
 
-    // ── VM reference (set when VM starts execution) ──────────────────
+    /// VM whose roots are scanned (set when the VM starts).
     vm: ?*VM = null,
 
-    // ── Nursery config ───────────────────────────────────────────────
-    nursery_capacity: usize,
-    min_nursery: usize = 256 * 1024, // 256KB min
-    max_nursery: usize = 16 * 1024 * 1024, // 16MB max
-
-    // ── Adaptive nursery tracking ────────────────────────────────────
-    low_survival_streak: u8 = 0,
-
-    // ── GC logging ───────────────────────────────────────────────────
+    /// ZENITH_GC_LOG=1 prints a line per collection to stderr.
     log_enabled: bool,
 
-    // ── Collection lock (prevent re-entrant GC) ──────────────────────
     collecting: bool = false,
 
-    const DEFAULT_NURSERY_CAPACITY: usize = 1024 * 1024; // 1MB
+    pub const DEFAULT_MIN_HEAP: usize = 8 * 1024 * 1024;
+    const GROWTH_FACTOR: usize = 2;
 
     pub fn init(backing: Allocator) !GC {
-        const log_enabled = blk: {
-            if (std.posix.getenv("ZENITH_GC_LOG")) |val| {
-                break :blk std.mem.eql(u8, val, "1");
-            }
-            break :blk false;
-        };
-
         return .{
             .backing_allocator = backing,
             .intern_table = try InternTable.init(backing, 256),
-            .nursery_capacity = DEFAULT_NURSERY_CAPACITY,
-            .next_nursery_gc = DEFAULT_NURSERY_CAPACITY,
-            .log_enabled = log_enabled,
+            .min_heap = DEFAULT_MIN_HEAP,
+            .next_gc = DEFAULT_MIN_HEAP,
+            .log_enabled = envFlag("ZENITH_GC_LOG"),
         };
     }
 
+    fn envFlag(name: [:0]const u8) bool {
+        const val = std.posix.getenv(name) orelse return false;
+        return std.mem.eql(u8, val, "1");
+    }
+
     pub fn deinit(self: *GC) void {
-        // Free collector resources.
-        self.nursery_collector.deinit(self.backing_allocator);
-        self.oldgen_collector.deinit(self.backing_allocator);
-        self.write_barrier.deinit(self.backing_allocator);
+        self.marker.deinit(self.backing_allocator);
         self.arenas.deinit(self.backing_allocator);
-
-        // Free all nursery objects.
-        var obj = self.nursery_objects;
-        while (obj) |o| {
-            const next = o.next;
-            o.destroy(self.backing_allocator);
-            obj = next;
-        }
-        self.nursery_objects = null;
-
-        // Free all old-gen objects.
-        obj = self.old_objects;
-        while (obj) |o| {
-            const next = o.next;
-            o.destroy(self.backing_allocator);
-            obj = next;
-        }
-        self.old_objects = null;
-
+        freeList(self.objects, self.backing_allocator);
+        self.objects = null;
+        freeList(self.permanent_objects, self.backing_allocator);
+        self.permanent_objects = null;
         self.intern_table.deinit();
     }
 
-    /// Track a newly allocated object (add to nursery list).
-    pub fn trackObject(self: *GC, obj: *Obj) void {
-        obj.next = self.nursery_objects;
-        self.nursery_objects = obj;
+    fn freeList(head: ?*Obj, backing: Allocator) void {
+        var obj = head;
+        while (obj) |o| {
+            const next = o.next;
+            o.destroy(backing);
+            obj = next;
+        }
     }
 
-    /// Track an object as old-gen (for long-lived compiler objects).
-    pub fn trackOldObject(self: *GC, obj: *Obj) void {
-        obj.promoteToOld();
-        obj.next = self.old_objects;
-        self.old_objects = obj;
-        self.old_gen_size += 1;
+    /// Allocator that counts bytes and triggers collections.
+    pub fn allocator(self: *GC) Allocator {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    /// Put a newly allocated object under GC management. Idempotent.
+    pub fn trackObject(self: *GC, obj: *Obj) void {
+        if (obj.isTracked()) return;
+        obj.gc_flags |= Obj.GC_TRACKED;
+        obj.next = self.objects;
+        self.objects = obj;
+        self.object_count += 1;
+    }
+
+    /// Register a compiler constant: kept alive until deinit and skipped
+    /// by marking. Constants only reference other constants.
+    pub fn trackPermanent(self: *GC, obj: *Obj) void {
+        if (obj.isTracked()) return;
+        obj.gc_flags |= Obj.GC_TRACKED | Obj.GC_PERM;
+        obj.next = self.permanent_objects;
+        self.permanent_objects = obj;
     }
 
     /// Register a stage arena with the GC for root scanning.
@@ -161,16 +150,12 @@ pub const GC = struct {
         return self.bytes_allocated;
     }
 
-    /// Run nursery collection: scan roots, promote live objects to old-gen,
-    /// sweep dead nursery objects.
-    pub fn collectNursery(self: *GC) !void {
-        // Prevent re-entrant collection (allocation during GC).
+    /// Run a full collection. No-op until a VM is attached.
+    pub fn collect(self: *GC) !void {
         if (self.collecting) return;
+        const vm = self.vm orelse return;
         self.collecting = true;
         defer self.collecting = false;
-
-        // Need a VM to scan roots.
-        const vm = self.vm orelse return;
 
         // Safepoint coordination: if scheduler exists, pause all workers.
         var sched: ?*Scheduler = null;
@@ -186,236 +171,72 @@ pub const GC = struct {
         }
 
         const timer_start = std.time.nanoTimestamp();
+        const bytes_before = self.bytes_allocated;
 
-        // Count nursery objects before collection (for survival rate).
-        var nursery_before: usize = 0;
-        {
-            var obj = self.nursery_objects;
-            while (obj) |o| : (obj = o.next) {
-                nursery_before += 1;
-            }
-        }
+        try gc_roots_mod.scanRoots(&self.marker, self, vm);
+        try self.marker.drain(self);
 
-        // 1. Scan roots: marks reachable nursery objects by promoting them.
-        try gc_roots_mod.scanRoots(&self.nursery_collector, self, vm);
-
-        // 1b. Scan dirty old-gen objects from write barrier for additional
-        //     nursery roots (old-to-young references).
-        try self.write_barrier.scanDirtyObjects(&self.nursery_collector, self);
-        self.write_barrier.clear();
-
-        // 2. Process gray stack: scan promoted objects' references.
-        try self.nursery_collector.processGrayStack(self);
-
-        // 3. Sweep intern table: remove entries for dead nursery strings.
-        //    Must happen before sweepNursery destroys the strings.
+        // The intern table holds weak references: drop dead strings first.
         _ = self.intern_table.removeUnmarked();
 
-        // 4. Migrate promoted objects from nursery list to old-gen list.
-        //    Count how many get promoted to update old_gen_size.
-        const old_gen_before = self.old_gen_size;
-        NurseryCollector.migratePromoted(self);
-        // Count promoted objects by counting new old_objects.
-        {
-            var count: usize = 0;
-            var obj = self.old_objects;
-            while (obj) |o| : (obj = o.next) {
-                count += 1;
-            }
-            self.old_gen_size = count;
-        }
-        const promoted_to_old = self.old_gen_size - old_gen_before;
-        _ = promoted_to_old;
+        const freed = self.sweep();
+        self.marker.clearUntracked();
 
-        // 5. Sweep remaining nursery objects (unreachable).
-        const freed_count = NurseryCollector.sweepNursery(self);
-
-        // 6. Update statistics.
-        self.nursery_count += 1;
-        self.total_bytes_freed += freed_count;
+        self.collections += 1;
+        self.objects_freed += freed;
+        self.bytes_freed += bytes_before -| self.bytes_allocated;
+        self.next_gc = @max(self.min_heap, self.bytes_allocated * GROWTH_FACTOR);
 
         const timer_end = std.time.nanoTimestamp();
         self.last_pause_ns = @intCast(@as(i128, timer_end) - @as(i128, timer_start));
 
-        // 7. Adaptive nursery sizing.
-        const promoted: usize = if (nursery_before > freed_count) nursery_before - freed_count else 0;
-        self.adaptNurserySize(nursery_before, promoted);
-
-        // 8. Log if enabled.
         if (self.log_enabled) {
-            self.logCollection(nursery_before, promoted, freed_count);
+            self.logCollection(freed, bytes_before);
         }
-
-        // 9. Clear mark bits on old-gen objects (used by intern table sweep).
-        self.clearOldGenMarks();
     }
 
-    /// Adjust nursery capacity based on survival rate.
-    /// - If survival > 50%, double capacity (up to max).
-    /// - If survival < 10% for 3 consecutive collections, halve (down to min).
-    fn adaptNurserySize(self: *GC, total: usize, promoted: usize) void {
-        if (total == 0) return;
-
-        const survival_pct = (promoted * 100) / total;
-
-        if (survival_pct > 50) {
-            // High survival: nursery too small, double it.
-            const new_cap = @min(self.nursery_capacity * 2, self.max_nursery);
-            self.nursery_capacity = new_cap;
-            self.next_nursery_gc = self.bytes_allocated + new_cap;
-            self.low_survival_streak = 0;
-        } else if (survival_pct < 10) {
-            self.low_survival_streak += 1;
-            if (self.low_survival_streak >= 3) {
-                // Consistently low survival: nursery too large, halve it.
-                const new_cap = @max(self.nursery_capacity / 2, self.min_nursery);
-                self.nursery_capacity = new_cap;
-                self.next_nursery_gc = self.bytes_allocated + new_cap;
-                self.low_survival_streak = 0;
+    /// Free unmarked objects and clear the marks of the survivors.
+    fn sweep(self: *GC) usize {
+        const alloc = self.allocator();
+        var freed: usize = 0;
+        var prev: ?*Obj = null;
+        var current = self.objects;
+        while (current) |obj| {
+            const next = obj.next;
+            if (obj.isMarked()) {
+                obj.setMarked(false);
+                prev = obj;
             } else {
-                self.next_nursery_gc = self.bytes_allocated + self.nursery_capacity;
+                if (prev) |p| {
+                    p.next = next;
+                } else {
+                    self.objects = next;
+                }
+                obj.destroy(alloc);
+                freed += 1;
             }
-        } else {
-            self.low_survival_streak = 0;
-            self.next_nursery_gc = self.bytes_allocated + self.nursery_capacity;
+            current = next;
         }
+        self.object_count -= freed;
+        return freed;
     }
 
-    /// Log collection details to stderr.
-    fn logCollection(self: *const GC, total: usize, promoted: usize, freed: usize) void {
+    fn logCollection(self: *const GC, freed: usize, bytes_before: usize) void {
         const stderr = std.fs.File.stderr();
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[GC] nursery #{d}: {d} total, {d} promoted, {d} freed, pause {d}ns, heap {d}B\n", .{
-            self.nursery_count,
-            total,
-            promoted,
+        const msg = std.fmt.bufPrint(&buf, "[GC] #{d}: {d} freed, {d} live, heap {d}B -> {d}B, next {d}B, pause {d}ns\n", .{
+            self.collections,
             freed,
-            self.last_pause_ns,
+            self.object_count,
+            bytes_before,
             self.bytes_allocated,
-        }) catch return;
-        stderr.writeAll(msg) catch {};
-    }
-
-    /// Clear mark bits on all old-gen objects after collection.
-    fn clearOldGenMarks(self: *GC) void {
-        var obj = self.old_objects;
-        while (obj) |o| : (obj = o.next) {
-            o.setMarked(false);
-        }
-    }
-
-    // ── Old-gen collection ─────────────────────────────────────────────
-
-    /// Run old-gen mark-sweep collection.
-    /// Orchestrates: mark -> sweep intern table -> sweep old gen.
-    pub fn collectOldGen(self: *GC) !void {
-        // Prevent re-entrant collection.
-        if (self.collecting) return;
-        self.collecting = true;
-        defer self.collecting = false;
-
-        const vm = self.vm orelse return;
-
-        // Safepoint coordination: if scheduler exists, pause all workers.
-        var sched: ?*Scheduler = null;
-        if (vm.scheduler) |sched_ptr| {
-            sched = @ptrCast(@alignCast(sched_ptr));
-            sched.?.requestSafepoint();
-            sched.?.waitForSafepoint();
-        }
-        defer {
-            if (sched) |s| {
-                s.releaseSafepoint();
-            }
-        }
-
-        const timer_start = std.time.nanoTimestamp();
-
-        // Run old-gen mark-sweep (handles mark, intern sweep, old-gen sweep).
-        const freed = try self.oldgen_collector.collect(self, vm);
-
-        // Update statistics.
-        self.oldgen_count += 1;
-        self.total_bytes_freed += freed;
-
-        const timer_end = std.time.nanoTimestamp();
-        self.last_pause_ns = @intCast(@as(i128, timer_end) - @as(i128, timer_start));
-
-        // Update threshold: 2x post-collection size (per user decision).
-        self.old_gen_last_size = self.old_gen_size;
-        self.old_gen_threshold = if (self.old_gen_size > 0) self.old_gen_size * 2 else 2048;
-
-        // Log if enabled.
-        if (self.log_enabled) {
-            self.logOldGenCollection(freed);
-        }
-    }
-
-    /// Run a full collection: nursery first, then old-gen.
-    pub fn collectFull(self: *GC) !void {
-        try self.collectNursery();
-        try self.collectOldGen();
-    }
-
-    /// Write barrier: called when storing a reference value into a container object.
-    /// If the container is old-gen and the value references a nursery object,
-    /// records the container in the remembered set so nursery collection
-    /// will scan it for additional roots.
-    ///
-    /// Write barrier sites in the VM (as of Phase 4):
-    /// - closeUpvalues: copies stack value into uv.closed
-    /// - op_set_upvalue: stores value into upvalue location
-    ///
-    /// Note: All Zenith collections are immutable (per design decision).
-    /// List.append, Map.set, etc. return NEW collections, never mutate.
-    /// Therefore no write barriers are needed in builtins.
-    /// If mutable collection operations are added in the future,
-    /// write barriers must be inserted at those sites.
-    pub fn writeBarrier(self: *GC, container: *Obj, val: Value) void {
-        // Only needed if container is old-gen and value is a nursery object.
-        if (!container.isOldGen()) return;
-        if (!val.isObj()) return;
-        const ref_obj = val.asObj();
-        if (ref_obj.isOldGen()) return;
-
-        // Container is old-gen, value is a nursery object reference.
-        self.write_barrier.recordStore(container, self.backing_allocator) catch {};
-    }
-
-    /// Check if old-gen size exceeds threshold and trigger collection if so.
-    pub fn checkOldGenThreshold(self: *GC) void {
-        if (self.old_gen_size > self.old_gen_threshold) {
-            self.collectOldGen() catch {};
-        }
-    }
-
-    /// Log old-gen collection details to stderr.
-    fn logOldGenCollection(self: *const GC, freed: usize) void {
-        const stderr = std.fs.File.stderr();
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[GC] oldgen #{d}: {d} freed, old_size {d}, threshold {d}, pause {d}ns\n", .{
-            self.oldgen_count,
-            freed,
-            self.old_gen_size,
-            self.old_gen_threshold,
+            self.next_gc,
             self.last_pause_ns,
         }) catch return;
         stderr.writeAll(msg) catch {};
     }
-};
 
-/// GC-aware allocator that wraps a backing allocator and tracks
-/// allocation metrics. Implements the std.mem.Allocator VTable so it
-/// can be used transparently throughout the runtime.
-pub const GCAllocator = struct {
-    gc: *GC,
-
-    pub fn allocator(self: *GCAllocator) Allocator {
-        return .{
-            .ptr = @ptrCast(self),
-            .vtable = &vtable,
-        };
-    }
+    // ── Allocator vtable ─────────────────────────────────────────────
 
     const vtable = Allocator.VTable{
         .alloc = gcAlloc,
@@ -425,17 +246,10 @@ pub const GCAllocator = struct {
     };
 
     fn gcAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *GCAllocator = @ptrCast(@alignCast(ctx));
-        const gc = self.gc;
-
-        // Trigger nursery collection if threshold exceeded.
-        if (gc.bytes_allocated + len > gc.next_nursery_gc) {
-            gc.collectNursery() catch {};
+        const gc: *GC = @ptrCast(@alignCast(ctx));
+        if (gc.bytes_allocated + len > gc.next_gc) {
+            gc.collect() catch {};
         }
-
-        // Check old-gen threshold after nursery collection may have promoted objects.
-        gc.checkOldGenThreshold();
-
         const result = gc.backing_allocator.vtable.alloc(gc.backing_allocator.ptr, len, alignment, ret_addr);
         if (result != null) {
             gc.bytes_allocated += len;
@@ -444,131 +258,231 @@ pub const GCAllocator = struct {
     }
 
     fn gcResize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *GCAllocator = @ptrCast(@alignCast(ctx));
-        const gc = self.gc;
-
-        const old_len = memory.len;
+        const gc: *GC = @ptrCast(@alignCast(ctx));
         const ok = gc.backing_allocator.vtable.resize(gc.backing_allocator.ptr, memory, alignment, new_len, ret_addr);
-        if (ok) {
-            if (new_len > old_len) {
-                gc.bytes_allocated += (new_len - old_len);
-            } else {
-                gc.bytes_allocated -= (old_len - new_len);
-            }
-        }
+        if (ok) gc.adjust(memory.len, new_len);
         return ok;
     }
 
     fn gcRemap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *GCAllocator = @ptrCast(@alignCast(ctx));
-        const gc = self.gc;
-
-        const old_len = memory.len;
+        const gc: *GC = @ptrCast(@alignCast(ctx));
         const result = gc.backing_allocator.vtable.remap(gc.backing_allocator.ptr, memory, alignment, new_len, ret_addr);
-        if (result != null) {
-            if (new_len > old_len) {
-                gc.bytes_allocated += (new_len - old_len);
-            } else {
-                gc.bytes_allocated -= (old_len - new_len);
-            }
-        }
+        if (result != null) gc.adjust(memory.len, new_len);
         return result;
     }
 
     fn gcFree(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
-        const self: *GCAllocator = @ptrCast(@alignCast(ctx));
-        const gc = self.gc;
-
-        gc.bytes_allocated -= memory.len;
+        const gc: *GC = @ptrCast(@alignCast(ctx));
+        // Saturating: some objects were allocated before the GC existed.
+        gc.bytes_allocated -|= memory.len;
         gc.backing_allocator.vtable.free(gc.backing_allocator.ptr, memory, alignment, ret_addr);
+    }
+
+    fn adjust(self: *GC, old_len: usize, new_len: usize) void {
+        if (new_len > old_len) {
+            self.bytes_allocated += new_len - old_len;
+        } else {
+            self.bytes_allocated -|= old_len - new_len;
+        }
+    }
+};
+
+/// Kept for callers that wrap the GC explicitly; same as `GC.allocator()`.
+pub const GCAllocator = struct {
+    gc: *GC,
+
+    pub fn allocator(self: *GCAllocator) Allocator {
+        return self.gc.allocator();
+    }
+};
+
+/// Mark phase: gray-stack tracing from the roots.
+pub const Marker = struct {
+    gray_stack: std.ArrayListUnmanaged(*Obj) = .empty,
+    /// Marked objects that are on no GC list (e.g. compiler functions, or
+    /// objects a builtin has not registered yet). Their marks are cleared
+    /// after the sweep, which never visits them.
+    untracked: std.ArrayListUnmanaged(*Obj) = .empty,
+
+    pub fn deinit(self: *Marker, allocator: Allocator) void {
+        self.gray_stack.deinit(allocator);
+        self.untracked.deinit(allocator);
+    }
+
+    pub fn markObj(self: *Marker, obj: *Obj, gc: *GC) !void {
+        if (obj.isPermanent() or obj.isMarked()) return;
+        obj.setMarked(true);
+        if (!obj.isTracked()) try self.untracked.append(gc.backing_allocator, obj);
+        try self.gray_stack.append(gc.backing_allocator, obj);
+    }
+
+    pub fn processValue(self: *Marker, val: *Value, gc: *GC) !void {
+        if (val.isObj()) try self.markObj(val.asObj(), gc);
+    }
+
+    pub fn drain(self: *Marker, gc: *GC) !void {
+        while (self.gray_stack.pop()) |obj| {
+            try self.scanObject(obj, gc);
+        }
+    }
+
+    fn clearUntracked(self: *Marker) void {
+        for (self.untracked.items) |obj| obj.setMarked(false);
+        self.untracked.clearRetainingCapacity();
+    }
+
+    fn scanObject(self: *Marker, obj: *Obj, gc: *GC) !void {
+        switch (obj.obj_type) {
+            .string, .bytes, .int_big, .range => {},
+            .function => {
+                const func = ObjFunction.fromObj(obj);
+                for (func.chunk.constants.items) |*val| {
+                    try self.processValue(val, gc);
+                }
+            },
+            .closure => {
+                const clos = ObjClosure.fromObj(obj);
+                try self.markObj(&clos.function.obj, gc);
+                for (clos.upvalues) |maybe_uv| {
+                    if (maybe_uv) |uv| try self.markObj(&uv.obj, gc);
+                }
+            },
+            .upvalue => {
+                // Open upvalues point into stacks, which are roots.
+                const uv = ObjUpvalue.fromObj(obj);
+                try self.processValue(&uv.closed, gc);
+            },
+            .list => {
+                const lst = ObjList.fromObj(obj);
+                for (lst.items.items) |*val| {
+                    try self.processValue(val, gc);
+                }
+            },
+            .map => {
+                const m = ObjMap.fromObj(obj);
+                var it = m.entries.iterator();
+                while (it.next()) |entry| {
+                    try self.processValue(entry.key_ptr, gc);
+                    try self.processValue(entry.value_ptr, gc);
+                }
+            },
+            .tuple => {
+                const t = ObjTuple.fromObj(obj);
+                for (t.fields) |*val| {
+                    try self.processValue(val, gc);
+                }
+            },
+            .record => {
+                const rec = ObjRecord.fromObj(obj);
+                for (rec.field_values) |*val| {
+                    try self.processValue(val, gc);
+                }
+            },
+            .adt => {
+                const a = ObjAdt.fromObj(obj);
+                for (a.payload) |*val| {
+                    try self.processValue(val, gc);
+                }
+            },
+            .stream => {
+                const s = ObjStream.fromObj(obj);
+                try s.state.traceGCRefs(self, gc);
+            },
+            .fiber => try self.scanFiber(ObjFiber.fromObj(obj), gc),
+            .channel => {
+                const ch = ObjChannel.fromObj(obj);
+                if (ch.buffer) |buf| {
+                    var i: u32 = 0;
+                    while (i < ch.count) : (i += 1) {
+                        try self.processValue(&buf[(ch.head + i) % ch.capacity], gc);
+                    }
+                }
+                if (ch.handoff) |*h| try self.processValue(h, gc);
+                var sender = ch.senders.head;
+                while (sender) |s| : (sender = s.next_waiter) {
+                    try self.markObj(&s.obj, gc);
+                }
+                var receiver = ch.receivers.head;
+                while (receiver) |r| : (receiver = r.next_waiter) {
+                    try self.markObj(&r.obj, gc);
+                }
+            },
+        }
+    }
+
+    pub fn scanFiber(self: *Marker, fiber: *ObjFiber, gc: *GC) !void {
+        for (fiber.stack[0..fiber.stack_top]) |*val| {
+            try self.processValue(val, gc);
+        }
+        for (fiber.frames[0..fiber.frame_count]) |*f| {
+            try self.markObj(&f.closure.obj, gc);
+        }
+        var uv = fiber.open_upvalues;
+        while (uv) |u| : (uv = u.next) {
+            try self.markObj(&u.obj, gc);
+        }
+        if (fiber.result) |*r| try self.processValue(r, gc);
+        if (fiber.waiting_on) |w| try self.markObj(&w.obj, gc);
+        var waiter = fiber.waiters;
+        while (waiter) |w| : (waiter = w.next_waiter) {
+            try self.markObj(&w.obj, gc);
+        }
     }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-test "GC init/deinit lifecycle" {
-    const backing = std.testing.allocator;
-    var gc = try GC.init(backing);
+test "allocator tracks bytes_allocated" {
+    var gc = try GC.init(std.testing.allocator);
     defer gc.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), gc.bytes_allocated);
-    try std.testing.expectEqual(@as(u64, 0), gc.nursery_count);
-    try std.testing.expectEqual(@as(u64, 0), gc.oldgen_count);
-    try std.testing.expect(gc.nursery_objects == null);
-    try std.testing.expect(gc.old_objects == null);
-    try std.testing.expectEqual(GC.DEFAULT_NURSERY_CAPACITY, gc.nursery_capacity);
-}
-
-test "GCAllocator tracks bytes_allocated correctly" {
-    const backing = std.testing.allocator;
-    var gc = try GC.init(backing);
-    defer gc.deinit();
-
-    var gc_alloc = GCAllocator{ .gc = &gc };
-    const alloc = gc_alloc.allocator();
-
-    // Allocate some memory.
-    const slice = try alloc.alloc(u8, 128);
-    try std.testing.expectEqual(@as(usize, 128), gc.bytes_allocated);
-
-    // Free it -- bytes_allocated should return to 0.
-    alloc.free(slice);
-    try std.testing.expectEqual(@as(usize, 0), gc.bytes_allocated);
-}
-
-test "GCAllocator tracks multiple allocations" {
-    const backing = std.testing.allocator;
-    var gc = try GC.init(backing);
-    defer gc.deinit();
-
-    var gc_alloc = GCAllocator{ .gc = &gc };
-    const alloc = gc_alloc.allocator();
+    const alloc = gc.allocator();
 
     const s1 = try alloc.alloc(u8, 64);
     const s2 = try alloc.alloc(u8, 256);
-    try std.testing.expectEqual(@as(usize, 320), gc.bytes_allocated);
-
+    try std.testing.expectEqual(@as(usize, 320), gc.heapSize());
     alloc.free(s1);
-    try std.testing.expectEqual(@as(usize, 256), gc.bytes_allocated);
-
+    try std.testing.expectEqual(@as(usize, 256), gc.heapSize());
     alloc.free(s2);
-    try std.testing.expectEqual(@as(usize, 0), gc.bytes_allocated);
+    try std.testing.expectEqual(@as(usize, 0), gc.heapSize());
 }
 
-test "trackObject adds to nursery_objects list" {
-    const backing = std.testing.allocator;
-    var gc = try GC.init(backing);
+test "trackObject is idempotent" {
+    var gc = try GC.init(std.testing.allocator);
     defer gc.deinit();
 
-    var gc_alloc = GCAllocator{ .gc = &gc };
-    const alloc = gc_alloc.allocator();
-
-    // Create objects using the GC allocator.
-    const obj_mod_local = @import("obj");
-    const str1 = try obj_mod_local.ObjString.create(alloc, "first", null);
-    gc.trackObject(&str1.obj);
-    const str2 = try obj_mod_local.ObjString.create(alloc, "second", null);
-    gc.trackObject(&str2.obj);
-
-    // Verify linked list: str2 -> str1 -> null (last tracked is head).
-    try std.testing.expectEqual(&str2.obj, gc.nursery_objects.?);
-    try std.testing.expectEqual(&str1.obj, str2.obj.next.?);
-    try std.testing.expect(str1.obj.next == null);
+    const str = try obj_mod.ObjString.create(gc.allocator(), "s", null);
+    gc.trackObject(&str.obj);
+    gc.trackObject(&str.obj);
+    try std.testing.expectEqual(@as(usize, 1), gc.object_count);
+    try std.testing.expect(str.obj.next == null);
 }
 
-test "heapSize reports bytes_allocated" {
-    const backing = std.testing.allocator;
-    var gc = try GC.init(backing);
+test "collect frees unreachable objects and keeps rooted ones" {
+    var gc = try GC.init(std.testing.allocator);
     defer gc.deinit();
+    const alloc = gc.allocator();
 
-    try std.testing.expectEqual(@as(usize, 0), gc.heapSize());
+    var vm = VM.init(undefined, std.testing.allocator);
+    vm.stack_top = 0;
+    gc.vm = &vm;
 
-    var gc_alloc = GCAllocator{ .gc = &gc };
-    const alloc = gc_alloc.allocator();
+    const live = try obj_mod.ObjString.create(alloc, "live", null);
+    gc.trackObject(&live.obj);
+    const lst = try ObjList.create(alloc);
+    gc.trackObject(&lst.obj);
+    try lst.items.append(alloc, Value.fromObj(&live.obj));
+    const dead = try obj_mod.ObjString.create(alloc, "dead", null);
+    gc.trackObject(&dead.obj);
 
-    const s = try alloc.alloc(u8, 512);
-    try std.testing.expectEqual(@as(usize, 512), gc.heapSize());
+    vm.stack[0] = Value.fromObj(&lst.obj);
+    vm.stack_top = 1;
 
-    alloc.free(s);
-    try std.testing.expectEqual(@as(usize, 0), gc.heapSize());
+    try gc.collect();
+    try std.testing.expectEqual(@as(usize, 2), gc.object_count);
+    try std.testing.expectEqual(@as(u64, 1), gc.objects_freed);
+    try std.testing.expect(!live.obj.isMarked());
+
+    vm.stack_top = 0;
+    try gc.collect();
+    try std.testing.expectEqual(@as(usize, 0), gc.object_count);
 }

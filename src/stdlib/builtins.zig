@@ -55,12 +55,12 @@ pub const TriggerGCFn = *const fn (vm_ptr: *anyopaque) void;
 
 /// GC statistics returned by the getGCStats callback.
 pub const GCStats = struct {
-    nursery_collections: u64,
-    oldgen_collections: u64,
-    bytes_freed: u64,
-    last_pause_ns: u64,
-    heap_size: usize,
-    nursery_size: usize,
+    collections: u64 = 0,
+    objects_freed: u64 = 0,
+    bytes_freed: u64 = 0,
+    last_pause_ns: u64 = 0,
+    heap_size: usize = 0,
+    live_objects: usize = 0,
 };
 
 /// Callback type: get GC statistics from the VM.
@@ -982,31 +982,24 @@ fn builtinGCStats(_: []const Value, allocator: Allocator, _: *[]const u8) Native
             }
         }
         // No GC available: return zeros.
-        break :blk GCStats{
-            .nursery_collections = 0,
-            .oldgen_collections = 0,
-            .bytes_freed = 0,
-            .last_pause_ns = 0,
-            .heap_size = 0,
-            .nursery_size = 0,
-        };
+        break :blk GCStats{};
     };
 
     const field_names = [_][]const u8{
-        "nursery_collections",
-        "oldgen_collections",
+        "collections",
+        "objects_freed",
         "bytes_freed",
         "last_pause_ns",
         "heap_size",
-        "nursery_size",
+        "live_objects",
     };
     const field_values = [_]Value{
-        try u64ToValue(stats.nursery_collections, allocator),
-        try u64ToValue(stats.oldgen_collections, allocator),
+        try u64ToValue(stats.collections, allocator),
+        try u64ToValue(stats.objects_freed, allocator),
         try u64ToValue(stats.bytes_freed, allocator),
         try u64ToValue(stats.last_pause_ns, allocator),
         try u64ToValue(stats.heap_size, allocator),
-        try u64ToValue(stats.nursery_size, allocator),
+        try u64ToValue(stats.live_objects, allocator),
     };
 
     const rec = try ObjRecord.create(allocator, &field_names, &field_values);
