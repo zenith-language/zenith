@@ -314,9 +314,7 @@ pub const Lexer = struct {
     }
 
     fn scanNumber(self: *Lexer, allocator: Allocator) !void {
-        while (!self.isAtEnd() and isDigit(self.peek())) {
-            _ = self.advance();
-        }
+        self.skipDigits();
 
         // Check for fractional part.
         if (!self.isAtEnd() and self.peek() == '.' and
@@ -325,12 +323,20 @@ pub const Lexer = struct {
             // Consume the '.'.
             _ = self.advance();
             // Consume fractional digits.
-            while (!self.isAtEnd() and isDigit(self.peek())) {
-                _ = self.advance();
-            }
+            self.skipDigits();
             try self.addToken(.float_literal, allocator);
         } else {
             try self.addToken(.int_literal, allocator);
+        }
+    }
+
+    /// Digits with optional `_` separators between them (1_000_000).
+    fn skipDigits(self: *Lexer) void {
+        while (!self.isAtEnd()) {
+            const c = self.peek();
+            if (isDigit(c) or (c == '_' and self.current + 1 < self.source.len and isDigit(self.peekNext()))) {
+                _ = self.advance();
+            } else break;
         }
     }
 
@@ -414,6 +420,14 @@ test "lexer: let binding" {
 test "lexer: float and int arithmetic" {
     try expectTags("3.14 + 2", &.{ .float_literal, .plus, .int_literal, .eof });
     try expectLexeme("3.14 + 2", 0, "3.14");
+}
+
+test "lexer: digit separators" {
+    try expectTags("1_000_000 + 2_5.0_5", &.{ .int_literal, .plus, .float_literal, .eof });
+    try expectLexeme("1_000_000", 0, "1_000_000");
+    // A trailing or doubled underscore ends the number.
+    try expectTags("1_", &.{ .int_literal, .identifier, .eof });
+    try expectTags("1__0", &.{ .int_literal, .identifier, .eof });
 }
 
 // Test 3: `"hello world"` tokenizes to [string_literal, eof]
