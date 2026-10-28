@@ -182,7 +182,6 @@ pub fn runRepl(allocator: Allocator) !void {
 
         var vm = VM.initWithClosure(compile_result.closure, gc_allocator, &gc_state, allocator);
         vm.trackCompilerObjects(compile_result.closure);
-        compile_result.vm_owns_constants = true;
         vm.setAtomNames(atom_names, allocator) catch {};
         if (adt_info.len > 0) {
             vm.setAdtTypes(adt_info);

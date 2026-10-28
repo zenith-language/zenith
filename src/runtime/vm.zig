@@ -224,9 +224,10 @@ pub const VM = struct {
         }
     }
 
-    /// Register all heap objects from the compiled constant pools so the VM
-    /// owns them for cleanup. Must be called once after initWithClosure.
-    /// In GC mode, these are permanent: never swept, never traced.
+    /// Register all heap objects from the compiled constant pools. Must be
+    /// called once after initWithClosure. In GC mode they are flagged
+    /// permanent (never swept, never traced) and stay owned by the compile
+    /// result; in legacy mode the VM takes ownership.
     pub fn trackCompilerObjects(self: *Self, closure: *ObjClosure) void {
         self.trackConstantsRecursive(closure.function);
     }

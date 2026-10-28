@@ -58,8 +58,6 @@ pub const GC = struct {
 
     /// Objects subject to collection.
     objects: ?*Obj = null,
-    /// Compiler constants, freed only by deinit.
-    permanent_objects: ?*Obj = null,
 
     backing_allocator: Allocator,
     marker: Marker = .{},
@@ -108,8 +106,6 @@ pub const GC = struct {
         self.arenas.deinit(self.backing_allocator);
         freeList(self.objects, self.backing_allocator);
         self.objects = null;
-        freeList(self.permanent_objects, self.backing_allocator);
-        self.permanent_objects = null;
         self.intern_table.deinit();
     }
 
@@ -136,13 +132,11 @@ pub const GC = struct {
         self.object_count += 1;
     }
 
-    /// Register a compiler constant: kept alive until deinit and skipped
-    /// by marking. Constants only reference other constants.
-    pub fn trackPermanent(self: *GC, obj: *Obj) void {
-        if (obj.isTracked()) return;
+    /// Flag a compiler constant: never swept and skipped by marking.
+    /// Constants only reference other constants. The compiler keeps
+    /// ownership and frees them with its result.
+    pub fn trackPermanent(_: *GC, obj: *Obj) void {
         obj.gc_flags |= Obj.GC_TRACKED | Obj.GC_PERM;
-        obj.next = self.permanent_objects;
-        self.permanent_objects = obj;
     }
 
     /// Register a stage arena with the GC for root scanning.
