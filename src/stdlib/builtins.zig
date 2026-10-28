@@ -1675,10 +1675,12 @@ fn builtinTake(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
 
     if (!first.isObjType(.stream)) {
-        err_msg.* = "take() expects a stream as first argument";
+        err_msg.* = "take() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isInt()) {
@@ -1699,10 +1701,12 @@ fn builtinDrop(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
 
     if (!first.isObjType(.stream)) {
-        err_msg.* = "drop() expects a stream as first argument";
+        err_msg.* = "drop() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isInt()) {
@@ -1759,10 +1763,12 @@ fn builtinCount(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
 
     if (!first.isObjType(.stream)) {
-        err_msg.* = "count() expects a stream as first argument";
+        err_msg.* = "count() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -1791,9 +1797,11 @@ fn builtinFlatMap(args: []const Value, allocator: Allocator, err_msg: *[]const u
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "flat_map() expects a stream as first argument";
+        err_msg.* = "flat_map() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isObjType(.closure)) {
@@ -1840,9 +1848,11 @@ fn builtinFilterOk(args: []const Value, allocator: Allocator, err_msg: *[]const 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "filter_ok() expects a stream as first argument";
+        err_msg.* = "filter_ok() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     const state = try allocator.create(StreamState);
@@ -1855,9 +1865,11 @@ fn builtinFilterErr(args: []const Value, allocator: Allocator, err_msg: *[]const
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "filter_err() expects a stream as first argument";
+        err_msg.* = "filter_err() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     const state = try allocator.create(StreamState);
@@ -1870,9 +1882,11 @@ fn builtinScan(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "scan() expects a stream as first argument";
+        err_msg.* = "scan() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[2].isObjType(.closure)) {
@@ -1967,9 +1981,11 @@ fn builtinTap(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "tap() expects a stream as first argument";
+        err_msg.* = "tap() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isObjType(.closure)) {
@@ -1989,9 +2005,11 @@ fn builtinBatch(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "batch() expects a stream as first argument";
+        err_msg.* = "batch() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isInt()) {
@@ -2030,9 +2048,11 @@ fn streamSortByImpl(args: []const Value, allocator: Allocator, err_msg: *[]const
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "sort_by() expects a stream as first argument";
+        err_msg.* = "sort_by() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     const key_fn = args[1];
@@ -2056,9 +2076,11 @@ fn builtinSum(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "sum() expects a stream as first argument";
+        err_msg.* = "sum() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -2138,9 +2160,11 @@ fn builtinFirst(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "first() expects a stream as first argument";
+        err_msg.* = "first() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -2157,9 +2181,11 @@ fn builtinLast(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "last() expects a stream as first argument";
+        err_msg.* = "last() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -2187,9 +2213,11 @@ fn builtinEach(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "each() expects a stream as first argument";
+        err_msg.* = "each() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isObjType(.closure)) {
@@ -2217,9 +2245,11 @@ fn builtinMin(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "min() expects a stream as first argument";
+        err_msg.* = "min() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -2255,9 +2285,11 @@ fn builtinMax(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "max() expects a stream as first argument";
+        err_msg.* = "max() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -2302,9 +2334,11 @@ fn builtinPartitionResult(args: []const Value, allocator: Allocator, err_msg: *[
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "partition_result() expects a stream as first argument";
+        err_msg.* = "partition_result() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -4114,10 +4148,12 @@ fn builtinParMap(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
 
     if (!first.isObjType(.stream)) {
-        err_msg.* = "par_map() expects a stream as first argument";
+        err_msg.* = "par_map() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -4164,10 +4200,12 @@ fn builtinParMapUnordered(args: []const Value, allocator: Allocator, err_msg: *[
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
 
     if (!first.isObjType(.stream)) {
-        err_msg.* = "par_map_unordered() expects a stream as first argument";
+        err_msg.* = "par_map_unordered() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -4212,10 +4250,12 @@ fn builtinParMapResult(args: []const Value, allocator: Allocator, err_msg: *[]co
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
 
     if (!first.isObjType(.stream)) {
-        err_msg.* = "par_map_result() expects a stream as first argument";
+        err_msg.* = "par_map_result() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -4276,9 +4316,11 @@ fn builtinThrottle(args: []const Value, allocator: Allocator, err_msg: *[]const 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "throttle() expects a stream as first argument";
+        err_msg.* = "throttle() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     // Parse rate (int or float).
@@ -4324,9 +4366,11 @@ fn builtinBuffer(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "buffer() expects a stream as first argument";
+        err_msg.* = "buffer() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isInt() or args[1].asInt() <= 0) {
@@ -4353,9 +4397,11 @@ fn builtinSingle(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "single() expects a stream as first argument";
+        err_msg.* = "single() expects a stream or list as first argument";
         return error.RuntimeError;
     }
 
@@ -4403,9 +4449,11 @@ fn builtinTapErr(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "tap_err() expects a stream as first argument";
+        err_msg.* = "tap_err() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     if (!args[1].isObjType(.closure)) {

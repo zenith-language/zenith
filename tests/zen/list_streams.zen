@@ -1,0 +1,9 @@
+-- Stream operators accept lists as well as streams and ranges.
+print([3, 1, 2] |> sum())
+print([3, 1, 2] |> count())
+print([3, 1, 2] |> max())
+print([3, 1, 2] |> first())
+print([1, 2, 3, 4] |> take(2) |> collect())
+print([1, 2, 3, 4] |> batch(3) |> collect())
+print([[1, 2], [3]] |> flat_map(|l| l) |> collect())
+print([1, 2, 3] |> par_map(2, |x| x * x) |> collect())

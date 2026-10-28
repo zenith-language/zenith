@@ -81,6 +81,7 @@ const normal_tests = [_]TestCase{
     .{ .name = "distinct", .zen_path = "tests/zen/distinct.zen", .expected_path = "tests/zen/distinct.expected", .is_error_test = false },
     .{ .name = "nested_builtins", .zen_path = "tests/zen/nested_builtins.zen", .expected_path = "tests/zen/nested_builtins.expected", .is_error_test = false },
     .{ .name = "ordering", .zen_path = "tests/zen/ordering.zen", .expected_path = "tests/zen/ordering.expected", .is_error_test = false },
+    .{ .name = "list_streams", .zen_path = "tests/zen/list_streams.zen", .expected_path = "tests/zen/list_streams.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{
