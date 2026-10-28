@@ -1,0 +1,28 @@
+-- Pipelines long enough to run the GC many times mid-stream.
+
+-- Arithmetic pipeline over 300K elements.
+print(range(0, 300000) |> map(|x| x * 2) |> filter(|x| x % 3 == 0) |> count())
+
+-- sum used to return a corrupted value once a collection ran.
+print(range(0, 20000) |> sum())
+
+-- Collecting records keeps every element alive.
+let rows = range(0, 100000) |> map(|i| {id: i, name: "user" ++ str(i)}) |> collect()
+print(len(rows))
+print(List.get(rows, 99999))
+
+-- Accumulators and buffered values survive collections.
+print(range(0, 100000) |> map(|i| str(i)) |> reduce("", |acc, s| if len(s) > len(acc) { s } else { acc }))
+print(range(0, 100000) |> map(|i| "k" ++ str(i)) |> last())
+print(range(0, 100000) |> map(|i| "k" ++ str(i % 977)) |> max())
+print(range(0, 100000) |> map(|i| [i, i + 1]) |> flatten() |> count())
+print(range(0, 100000) |> batch(7) |> map(|b| len(b)) |> sum())
+
+-- JSONL round trip through a file.
+range(0, 50000)
+  |> map(|i| {id: i, kind: if i % 4 == 0 { "purchase" } else { "view" }})
+  |> sink("/tmp/zen_e2e_large.jsonl", :jsonl)
+print(source("/tmp/zen_e2e_large.jsonl", :jsonl)
+  |> filter_ok()
+  |> filter(|r| r.kind == "purchase")
+  |> count())
