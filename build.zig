@@ -507,5 +507,10 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = e2e_mod });
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
+
+        const stress_step = b.step("test-gc-stress", "Run end-to-end tests collecting on every allocation");
+        const run_stress = b.addRunArtifact(t);
+        run_stress.setEnvironmentVariable("ZENITH_GC_STRESS", "1");
+        stress_step.dependOn(&run_stress.step);
     }
 }

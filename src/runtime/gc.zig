@@ -71,6 +71,9 @@ pub const GC = struct {
 
     /// ZENITH_GC_LOG=1 prints a line per collection to stderr.
     log_enabled: bool,
+    /// ZENITH_GC_STRESS=N collects on every N-th allocation (0 = off).
+    stress_interval: u32,
+    stress_countdown: u32 = 0,
 
     collecting: bool = false,
 
@@ -85,7 +88,13 @@ pub const GC = struct {
             .min_heap = DEFAULT_MIN_HEAP,
             .next_gc = DEFAULT_MIN_HEAP,
             .log_enabled = envFlag("ZENITH_GC_LOG"),
+            .stress_interval = envInt("ZENITH_GC_STRESS"),
         };
+    }
+
+    fn envInt(name: [:0]const u8) u32 {
+        const val = std.posix.getenv(name) orelse return 0;
+        return std.fmt.parseInt(u32, val, 10) catch 0;
     }
 
     fn envFlag(name: [:0]const u8) bool {
@@ -253,7 +262,7 @@ pub const GC = struct {
 
     fn gcAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
         const gc: *GC = @ptrCast(@alignCast(ctx));
-        if (gc.bytes_allocated + len > gc.next_gc) {
+        if (gc.bytes_allocated + len > gc.next_gc or gc.stressTick()) {
             gc.collect() catch {};
         }
         const result = gc.backing_allocator.vtable.alloc(gc.backing_allocator.ptr, len, alignment, ret_addr);
@@ -282,6 +291,16 @@ pub const GC = struct {
         // Saturating: some objects were allocated before the GC existed.
         gc.bytes_allocated -|= memory.len;
         gc.backing_allocator.vtable.free(gc.backing_allocator.ptr, memory, alignment, ret_addr);
+    }
+
+    fn stressTick(self: *GC) bool {
+        if (self.stress_interval == 0) return false;
+        if (self.stress_countdown > 0) {
+            self.stress_countdown -= 1;
+            return false;
+        }
+        self.stress_countdown = self.stress_interval - 1;
+        return true;
     }
 
     fn adjust(self: *GC, old_len: usize, new_len: usize) void {
