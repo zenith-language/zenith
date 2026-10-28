@@ -412,6 +412,152 @@ pub const ValueContext = struct {
     }
 };
 
+/// Context for hashing and comparing Values by content: strings by bytes,
+/// numbers numerically (1 == 1.0), and lists, tuples, records, maps and
+/// ADTs recursively. Records and maps ignore key order. Other objects
+/// (closures, streams, fibers, channels) compare by identity.
+pub const StructuralContext = struct {
+    pub fn hash(_: StructuralContext, v: Value) u32 {
+        return structuralHash(v);
+    }
+
+    pub fn eql(_: StructuralContext, a: Value, b: Value, _: usize) bool {
+        return structuralEql(a, b);
+    }
+};
+
+fn mix(h: u64, x: u64) u64 {
+    return (h ^ x) *% 0x100000001b3;
+}
+
+fn hashU64(x: u64) u64 {
+    var h = x *% 0x9E3779B97F4A7C15;
+    h ^= h >> 32;
+    return h;
+}
+
+fn structuralHash(v: Value) u32 {
+    return @truncate(structuralHash64(v));
+}
+
+fn structuralHash64(v: Value) u64 {
+    if (v.isInteger()) return hashU64(@bitCast(v.asI64()));
+    if (v.isFloat()) {
+        const f = v.asFloat();
+        // Integral floats hash like the equal int.
+        if (@trunc(f) == f and f >= -9.2e18 and f <= 9.2e18) {
+            return hashU64(@bitCast(@as(i64, @intFromFloat(f))));
+        }
+        return hashU64(@bitCast(f));
+    }
+    if (!v.isObj()) return hashU64(v.bits);
+    const o = v.asObj();
+    switch (o.obj_type) {
+        .string => return std.hash.Wyhash.hash(0, ObjString.fromObj(o).bytes),
+        .list => {
+            var h: u64 = 0x6c697374;
+            for (ObjList.fromObj(o).items.items) |item| h = mix(h, structuralHash64(item));
+            return h;
+        },
+        .tuple => {
+            var h: u64 = 0x7475706c;
+            for (ObjTuple.fromObj(o).fields) |item| h = mix(h, structuralHash64(item));
+            return h;
+        },
+        .record => {
+            // Order-independent: sum of per-field hashes.
+            const rec = ObjRecord.fromObj(o);
+            var h: u64 = 0x7265636f;
+            for (rec.field_names, rec.field_values) |name, val| {
+                h +%= mix(std.hash.Wyhash.hash(1, name), structuralHash64(val));
+            }
+            return h;
+        },
+        .map => {
+            const m = ObjMap.fromObj(o);
+            var h: u64 = 0x6d6170;
+            var it = m.entries.iterator();
+            while (it.next()) |entry| {
+                h +%= mix(structuralHash64(entry.key_ptr.*), structuralHash64(entry.value_ptr.*));
+            }
+            return h;
+        },
+        .adt => {
+            const a = ObjAdt.fromObj(o);
+            var h: u64 = mix(@as(u64, a.type_id) << 16 | a.variant_idx, 0x616474);
+            for (a.payload) |item| h = mix(h, structuralHash64(item));
+            return h;
+        },
+        else => return hashU64(v.bits),
+    }
+}
+
+fn structuralEql(a: Value, b: Value) bool {
+    if (a.bits == b.bits) return !(a.isFloat() and std.math.isNan(a.asFloat()));
+    if (isNumber(a) and isNumber(b)) {
+        if (a.isInteger() and b.isInteger()) return a.asI64() == b.asI64();
+        return toF64(a) == toF64(b);
+    }
+    if (!a.isObj() or !b.isObj()) return false;
+    const oa = a.asObj();
+    const ob = b.asObj();
+    if (oa.obj_type != ob.obj_type) return false;
+    switch (oa.obj_type) {
+        .string => return std.mem.eql(u8, ObjString.fromObj(oa).bytes, ObjString.fromObj(ob).bytes),
+        .list => return sliceEql(ObjList.fromObj(oa).items.items, ObjList.fromObj(ob).items.items),
+        .tuple => return sliceEql(ObjTuple.fromObj(oa).fields, ObjTuple.fromObj(ob).fields),
+        .record => {
+            const ra = ObjRecord.fromObj(oa);
+            const rb = ObjRecord.fromObj(ob);
+            if (ra.field_names.len != rb.field_names.len) return false;
+            outer: for (ra.field_names, ra.field_values) |name, val| {
+                for (rb.field_names, rb.field_values) |other_name, other_val| {
+                    if (std.mem.eql(u8, name, other_name)) {
+                        if (!structuralEql(val, other_val)) return false;
+                        continue :outer;
+                    }
+                }
+                return false;
+            }
+            return true;
+        },
+        .map => {
+            const ma = ObjMap.fromObj(oa);
+            const mb = ObjMap.fromObj(ob);
+            if (ma.entries.count() != mb.entries.count()) return false;
+            var it = ma.entries.iterator();
+            while (it.next()) |entry| {
+                const other = mb.entries.get(entry.key_ptr.*) orelse return false;
+                if (!structuralEql(entry.value_ptr.*, other)) return false;
+            }
+            return true;
+        },
+        .adt => {
+            const aa = ObjAdt.fromObj(oa);
+            const ab = ObjAdt.fromObj(ob);
+            if (aa.type_id != ab.type_id or aa.variant_idx != ab.variant_idx) return false;
+            return sliceEql(aa.payload, ab.payload);
+        },
+        else => return false,
+    }
+}
+
+fn isNumber(v: Value) bool {
+    return v.isFloat() or v.isInteger();
+}
+
+fn toF64(v: Value) f64 {
+    return if (v.isFloat()) v.asFloat() else @floatFromInt(v.asI64());
+}
+
+fn sliceEql(a: []const Value, b: []const Value) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!structuralEql(x, y)) return false;
+    }
+    return true;
+}
+
 /// Heap-allocated ordered hash map (preserves insertion order).
 pub const ObjMap = struct {
     obj: Obj,

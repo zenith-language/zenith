@@ -1909,9 +1909,11 @@ fn builtinDistinct(args: []const Value, allocator: Allocator, err_msg: *[]const 
     var first = args[0];
     if (first.isObjType(.range)) {
         first = try autoWrapRange(first, allocator);
+    } else if (first.isObjType(.list)) {
+        first = try autoWrapList(first, allocator);
     }
     if (!first.isObjType(.stream)) {
-        err_msg.* = "distinct() expects a stream as first argument";
+        err_msg.* = "distinct() expects a stream or list as first argument";
         return error.RuntimeError;
     }
     const state = try allocator.create(StreamState);

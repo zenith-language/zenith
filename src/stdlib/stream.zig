@@ -118,7 +118,8 @@ pub const StreamState = union(enum) {
 
     pub const DistinctOp = struct {
         upstream: Value, // NaN-boxed ObjStream pointer
-        seen: std.AutoArrayHashMapUnmanaged(u64, void),
+        /// Every distinct value seen so far, compared by content.
+        seen: std.ArrayHashMapUnmanaged(Value, void, obj_mod.StructuralContext, true),
     };
 
     pub const ZipOp = struct {
@@ -584,12 +585,13 @@ pub const StreamState = union(enum) {
             },
             .distinct_op => |*s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
+                const m = roots.mark();
                 while (true) {
+                    roots.restore(m);
                     const elem = (try upstream_stream.state.next(allocator)) orelse return null;
-                    const key = elem.bits;
-                    const entry = try s.seen.getOrPut(allocator, key);
+                    const entry = try s.seen.getOrPut(allocator, elem);
                     if (!entry.found_existing) {
-                        return elem;
+                        return roots.keep(m, elem);
                     }
                     // Duplicate -- skip.
                 }
@@ -1284,6 +1286,9 @@ pub const StreamState = union(enum) {
             },
             .distinct_op => |*s| {
                 try marker.processValue(&s.upstream, gc);
+                for (s.seen.keys()) |*v| {
+                    try marker.processValue(v, gc);
+                }
             },
             .zip_op => |*s| {
                 try marker.processValue(&s.upstream_a, gc);

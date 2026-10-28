@@ -78,6 +78,7 @@ const normal_tests = [_]TestCase{
     // Stream operators: buffer and throttle
     .{ .name = "buffer", .zen_path = "tests/zen/buffer.zen", .expected_path = "tests/zen/buffer.expected", .is_error_test = false },
     .{ .name = "throttle", .zen_path = "tests/zen/throttle.zen", .expected_path = "tests/zen/throttle.expected", .is_error_test = false },
+    .{ .name = "distinct", .zen_path = "tests/zen/distinct.zen", .expected_path = "tests/zen/distinct.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{

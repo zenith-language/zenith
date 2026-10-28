@@ -1,0 +1,18 @@
+-- distinct compares values by content, not identity
+let words = ["alice", "bob", "alice"] |> map(|s| s ++ "") |> distinct() |> collect()
+print(words)
+
+-- numbers compare numerically
+print([1, 1.0, 2, 2.5, 2.5] |> map(|x| x) |> distinct() |> collect())
+
+-- records and lists compare structurally, records ignore field order
+let rows = [{a: 1, b: "x"}, {b: "x", a: 1}, {a: 2, b: "x"}, {a: 1, b: "y"}]
+print(rows |> map(|r| r) |> distinct() |> count())
+print([[1, 2], [1, 2], [2, 1]] |> map(|l| l) |> distinct() |> count())
+
+-- ADTs compare by variant and payload
+print([Option.Some(1), Option.Some(1), Option.None, Option.None] |> map(|o| o) |> distinct() |> count())
+
+-- many duplicates stay correct when the GC runs mid-stream
+let n = range(0, 200000) |> map(|i| {id: str(i % 1000)}) |> distinct() |> count()
+print(n)
