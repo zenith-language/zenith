@@ -687,6 +687,8 @@ pub const VM = struct {
                     const func = ObjFunction.fromObj(func_val.asObj());
                     const closure = try ObjClosure.create(self.allocator, func);
                     self.trackObject(&closure.obj);
+                    // On the stack first: capturing upvalues allocates.
+                    try self.push(Value.fromObj(&closure.obj));
 
                     // Populate upvalues from descriptors.
                     for (0..func.upvalue_count) |i| {
@@ -698,8 +700,6 @@ pub const VM = struct {
                             closure.upvalues[i] = frame.closure.upvalues[index];
                         }
                     }
-
-                    try self.push(Value.fromObj(&closure.obj));
                 },
 
                 .op_get_upvalue => {
@@ -1034,8 +1034,9 @@ pub const VM = struct {
     // ── String concatenation ──────────────────────────────────────────
 
     fn stringConcat(self: *Self) RuntimeError!void {
-        const b = try self.pop();
-        const a = try self.pop();
+        // Operands stay on the stack until the result exists (GC roots).
+        const b = self.peek(0);
+        const a = self.peek(1);
 
         if (!a.isString() or !b.isString()) {
             try self.runtimeErrorAny(.E001, "operands must be strings for '++'");
@@ -1057,6 +1058,7 @@ pub const VM = struct {
             .hash = 0,
         };
         self.trackObject(&result.obj);
+        self.getStackTop().* -= 2;
         try self.push(Value.fromObj(&result.obj));
     }
 
@@ -1603,6 +1605,8 @@ pub const VM = struct {
                 const func = ObjFunction.fromObj(func_val.asObj());
                 const closure = try ObjClosure.create(self.allocator, func);
                 self.trackObject(&closure.obj);
+                // On the stack first: capturing upvalues allocates.
+                try self.push(Value.fromObj(&closure.obj));
                 for (0..func.upvalue_count) |i| {
                     const is_local = self.readByteFrame();
                     const index = self.readByteFrame();
@@ -1612,7 +1616,6 @@ pub const VM = struct {
                         closure.upvalues[i] = frame.closure.upvalues[index];
                     }
                 }
-                try self.push(Value.fromObj(&closure.obj));
             },
             .op_get_upvalue => {
                 const slot = self.readByteFrame();
@@ -1933,9 +1936,9 @@ pub const VM = struct {
     const ObjRecord = obj_mod.ObjRecord;
 
     fn execOpList(self: *Self, count: u16) RuntimeError!void {
+        // Untracked until fully built: an unregistered object is never swept,
+        // and the elements stay on the stack meanwhile.
         const lst = try ObjList.create(self.allocator);
-        self.trackObject(&lst.obj);
-
         const stack = self.getStack();
         const st = self.getStackTop();
         // Reserve capacity and fill from stack in order (first pushed = index 0).
@@ -1946,14 +1949,14 @@ pub const VM = struct {
             lst.items.appendAssumeCapacity(stack[base + i]);
         }
         st.* -= count;
+        self.trackObject(&lst.obj);
 
         try self.push(Value.fromObj(&lst.obj));
     }
 
     fn execOpMap(self: *Self, pair_count: u16) RuntimeError!void {
+        // Untracked until fully built (see execOpList).
         const m = try ObjMap.create(self.allocator);
-        self.trackObject(&m.obj);
-
         const stack = self.getStack();
         const st = self.getStackTop();
         // Stack has: key0, val0, key1, val1, ... (2*pair_count values).
@@ -1966,6 +1969,7 @@ pub const VM = struct {
             try m.entries.put(self.allocator, key, val);
         }
         st.* -= total;
+        self.trackObject(&m.obj);
 
         try self.push(Value.fromObj(&m.obj));
     }
@@ -1979,10 +1983,10 @@ pub const VM = struct {
         while (i < count) : (i += 1) {
             values[i] = stack[st.* - count + i];
         }
-        st.* -= count;
 
         const t = try ObjTuple.create(self.allocator, values);
         self.allocator.free(values); // ObjTuple.create copies the slice
+        st.* -= count;
         self.trackObject(&t.obj);
 
         try self.push(Value.fromObj(&t.obj));
@@ -2039,9 +2043,9 @@ pub const VM = struct {
         while (i < count) : (i += 1) {
             values[i] = stack[st.* - count + i];
         }
-        st.* -= count;
 
         const rec = try ObjRecord.create(self.allocator, names, values);
+        st.* -= count;
         self.trackObject(&rec.obj);
 
         try self.push(Value.fromObj(&rec.obj));
@@ -2088,17 +2092,16 @@ pub const VM = struct {
     /// Shared record spread execution.
     fn execRecordSpread(self: *Self, override_count: u8, override_names: []const []const u8) RuntimeError!void {
         // Stack: [base_record, override_val_0, override_val_1, ...]
-        // Pop override values.
+        // Operands stay on the stack until the new record exists (GC roots).
         const override_values = try self.allocator.alloc(Value, override_count);
         defer self.allocator.free(override_values);
 
         var i: u8 = 0;
         while (i < override_count) : (i += 1) {
-            override_values[override_count - 1 - i] = try self.pop();
+            override_values[override_count - 1 - i] = self.peek(i);
         }
 
-        // Pop base record.
-        const base_val = try self.pop();
+        const base_val = self.peek(override_count);
         if (!base_val.isObj() or base_val.asObj().obj_type != .record) {
             try self.runtimeErrorAny(.E001, "spread base must be a record");
             return error.RuntimeErr;
@@ -2156,6 +2159,7 @@ pub const VM = struct {
         }
 
         const rec = try ObjRecord.create(self.allocator, new_names[0..total], new_values[0..total]);
+        self.getStackTop().* -= @as(u32, override_count) + 1;
         self.trackObject(&rec.obj);
 
         try self.push(Value.fromObj(&rec.obj));
@@ -2208,19 +2212,32 @@ pub const VM = struct {
 
     const ObjAdt = obj_mod.ObjAdt;
 
+    /// Build an ADT value whose payload exists only in Zig locals. The
+    /// payload stays pinned across the allocation; push the result before
+    /// allocating again.
+    fn makeAdt(self: *Self, type_id: u16, variant_idx: u16, payload: []const Value) RuntimeError!Value {
+        const roots_mark = roots_mod.mark();
+        defer roots_mod.restore(roots_mark);
+        for (payload) |v| roots_mod.pin(v);
+        const adt = try ObjAdt.create(self.allocator, type_id, variant_idx, payload);
+        self.trackObject(&adt.obj);
+        return Value.fromObj(&adt.obj);
+    }
+
     fn execOpAdtConstruct(self: *Self, type_id: u16, variant_idx: u16, arity: u8) RuntimeError!void {
-        // Pop arity values from stack into payload.
+        // Copy arity values from the stack into payload; they stay on the
+        // stack until the ADT exists (GC roots).
         const payload = try self.allocator.alloc(Value, arity);
         defer self.allocator.free(payload);
 
-        // Pop in reverse order to match push order.
         var i: u8 = arity;
         while (i > 0) {
             i -= 1;
-            payload[i] = try self.pop();
+            payload[i] = self.peek(arity - 1 - i);
         }
 
         const adt = try ObjAdt.create(self.allocator, type_id, variant_idx, payload);
+        self.getStackTop().* -= arity;
         self.trackObject(&adt.obj);
         try self.push(Value.fromObj(&adt.obj));
     }
@@ -2295,19 +2312,21 @@ pub const VM = struct {
     }
 
     fn execOpListSlice(self: *Self, start: u16) RuntimeError!void {
-        const val = try self.pop();
+        // The source list stays on the stack while copying (GC root).
+        const val = self.peek(0);
         if (!val.isObj() or val.asObj().obj_type != .list) {
             try self.runtimeErrorAny(.E001, "op_list_slice: expected list");
             return error.RuntimeErr;
         }
         const src = ObjList.fromObj(val.asObj());
         const new_list = try ObjList.create(self.allocator);
-        self.trackObject(&new_list.obj);
 
         if (start < src.items.items.len) {
             const slice = src.items.items[start..];
             try new_list.items.appendSlice(self.allocator, slice);
         }
+        self.getStackTop().* -= 1;
+        self.trackObject(&new_list.obj);
 
         try self.push(Value.fromObj(&new_list.obj));
     }
@@ -2350,8 +2369,14 @@ pub const VM = struct {
             }
         }
 
+        const roots_mark = roots_mod.mark();
+        defer roots_mod.restore(roots_mark);
+        roots_mod.pin(closure_val);
+        if (name_val) |nv| roots_mod.pin(nv);
+
         const fiber = try ObjFiber.create(self.allocator, closure, null, fiber_name);
         self.trackObject(&fiber.obj);
+        roots_mod.pin(Value.fromObj(&fiber.obj));
 
         // In single-threaded mode (no scheduler), execute the fiber's closure
         // inline immediately. This makes spawn/join work correctly without a
@@ -2460,15 +2485,11 @@ pub const VM = struct {
         switch (result) {
             .value => |val| {
                 // Return Some(val)
-                const some = try obj_mod.ObjAdt.create(self.allocator, 0, 0, &[_]Value{val});
-                self.trackObject(&some.obj);
-                try self.push(Value.fromObj(&some.obj));
+                try self.push(try self.makeAdt(0, 0, &[_]Value{val}));
             },
             .closed => {
                 // Return None
-                const none = try obj_mod.ObjAdt.create(self.allocator, 0, 1, &[_]Value{});
-                self.trackObject(&none.obj);
-                try self.push(Value.fromObj(&none.obj));
+                try self.push(try self.makeAdt(0, 1, &[_]Value{}));
             },
             .would_block => {
                 // In single-threaded mode, check if an unbuffered channel has
@@ -2478,9 +2499,7 @@ pub const VM = struct {
                     ch.mutex.lock();
                     ch.handoff = null;
                     ch.mutex.unlock();
-                    const some = try obj_mod.ObjAdt.create(self.allocator, 0, 0, &[_]Value{val});
-                    self.trackObject(&some.obj);
-                    try self.push(Value.fromObj(&some.obj));
+                    try self.push(try self.makeAdt(0, 0, &[_]Value{val}));
                 } else {
                     try self.runtimeErrorAny(.E001, "channel recv would block (empty channel)");
                     return error.RuntimeErr;
@@ -2520,15 +2539,11 @@ pub const VM = struct {
                 // Result.Err(panic_message)
                 const msg_str = try ObjString.create(self.allocator, target.panic_message.?, null);
                 self.trackObject(&msg_str.obj);
-                const err_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 1, &[_]Value{Value.fromObj(&msg_str.obj)});
-                self.trackObject(&err_adt.obj);
-                try self.push(Value.fromObj(&err_adt.obj));
+                try self.push(try self.makeAdt(1, 1, &[_]Value{Value.fromObj(&msg_str.obj)}));
             } else {
                 // Result.Ok(result)
                 const result_val = target.result orelse Value.nil;
-                const ok_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 0, &[_]Value{result_val});
-                self.trackObject(&ok_adt.obj);
-                try self.push(Value.fromObj(&ok_adt.obj));
+                try self.push(try self.makeAdt(1, 0, &[_]Value{result_val}));
             }
         } else if (self.scheduler != null) {
             // Fiber not yet dead and scheduler is present: park the calling fiber.
@@ -2578,24 +2593,16 @@ pub const VM = struct {
             if (target.panic_message != null) {
                 const msg_str = try ObjString.create(self.allocator, target.panic_message.?, null);
                 self.trackObject(&msg_str.obj);
-                const err_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 1, &[_]Value{Value.fromObj(&msg_str.obj)});
-                self.trackObject(&err_adt.obj);
-                inner_result = Value.fromObj(&err_adt.obj);
+                inner_result = try self.makeAdt(1, 1, &[_]Value{Value.fromObj(&msg_str.obj)});
             } else {
                 const result_val = target.result orelse Value.nil;
-                const ok_adt = try obj_mod.ObjAdt.create(self.allocator, 1, 0, &[_]Value{result_val});
-                self.trackObject(&ok_adt.obj);
-                inner_result = Value.fromObj(&ok_adt.obj);
+                inner_result = try self.makeAdt(1, 0, &[_]Value{result_val});
             }
             // Wrap in Some.
-            const some = try obj_mod.ObjAdt.create(self.allocator, 0, 0, &[_]Value{inner_result});
-            self.trackObject(&some.obj);
-            try self.push(Value.fromObj(&some.obj));
+            try self.push(try self.makeAdt(0, 0, &[_]Value{inner_result}));
         } else {
             // Fiber still running; return None (non-blocking).
-            const none = try obj_mod.ObjAdt.create(self.allocator, 0, 1, &[_]Value{});
-            self.trackObject(&none.obj);
-            try self.push(Value.fromObj(&none.obj));
+            try self.push(try self.makeAdt(0, 1, &[_]Value{}));
         }
     }
 
