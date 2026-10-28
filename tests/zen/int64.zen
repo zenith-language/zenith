@@ -1,0 +1,31 @@
+-- Integers are exact 64-bit values: inline up to 48 bits, boxed beyond.
+let ts = 1_700_000_000_000
+print(ts)
+print(ts + 86_400_000)
+print(ts * 1000)
+print(type_of(ts * 1000))
+
+-- Arithmetic crossing the inline range stays exact.
+let big = 140737488355327
+print(big + 1)
+print((big + 1) - 1 == big)
+print(9223372036854775807)
+print(-9223372036854775807 - 1)
+print(4611686018427387904 / 3)
+print(4611686018427387905 % 10)
+print(3000000000 * 3)
+
+-- Sums no longer overflow at 32 bits.
+print(range(0, 10_000_000) |> sum())
+print(range(0, 3) |> map(|i| i * 4_000_000_000_000_000) |> sum())
+
+-- Comparisons and ordering across inline and boxed values.
+print(4_000_000_000_000_000 > 140737488355327)
+print(List.sort([9_000_000_000_000_000, 5, 1_700_000_000_000]))
+print([4_000_000_000_000_000, 4_000_000_000_000_000, 7] |> distinct() |> count())
+
+-- JSON keeps large integers exact both ways.
+let doc = unwrap(Json.decode("[9007199254740993, 1700000000000]"))
+print(List.get(doc, 0))
+print(unwrap(List.get(doc, 1)) + 1)
+print(unwrap(Json.encode([9007199254740993, 1700000000000])))

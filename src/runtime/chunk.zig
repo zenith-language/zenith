@@ -265,9 +265,9 @@ pub const Chunk = struct {
             } else if (val.isBool()) {
                 try writer.writeByte(TAG_BOOL);
                 try writer.writeByte(if (val.asBool()) 1 else 0);
-            } else if (val.isInt()) {
+            } else if (val.isInteger()) {
                 try writer.writeByte(TAG_INT);
-                try writeI64LE(writer, @as(i64, val.asInt()));
+                try writeI64LE(writer, val.asI64());
             } else if (val.isFloat()) {
                 try writer.writeByte(TAG_FLOAT);
                 try writeF64LE(writer, val.asFloat());
@@ -365,13 +365,7 @@ pub const Chunk = struct {
                 },
                 TAG_INT => blk: {
                     const i = try readI64LE(reader);
-                    // For deserialization, values are always within i32 range in Phase 1.
-                    if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) {
-                        break :blk Value.fromInt(@intCast(i));
-                    }
-                    // Large integers: try to create an ObjInt.
-                    const big = try Value.fromI64(i, allocator);
-                    break :blk big;
+                    break :blk try Value.fromI64(i, allocator);
                 },
                 TAG_FLOAT => blk: {
                     const f = try readF64LE(reader);

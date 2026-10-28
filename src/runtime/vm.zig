@@ -863,20 +863,14 @@ pub const VM = struct {
 
     fn execNegate(self: *Self) RuntimeError!void {
         const val = try self.pop();
-        if (val.isInt()) {
-            const n = val.asInt();
-            if (n == std.math.minInt(i32)) {
+        if (intOperand(val)) |n| {
+            if (n == std.math.minInt(i64)) {
                 try self.runtimeErrorAny(.E003, "integer overflow: cannot negate minimum integer");
                 return error.RuntimeErr;
             }
-            try self.push(Value.fromInt(-n));
+            try self.push(try self.makeInt(-n));
         } else if (val.isFloat()) {
             try self.push(Value.fromFloat(-val.asFloat()));
-        } else if (val.isObjType(.int_big)) {
-            const big_val = ObjInt.fromObj(val.asObj()).value;
-            const result = try Value.fromI64(-big_val, self.allocator);
-            if (result.isObj()) self.trackObject(result.asObj());
-            try self.push(result);
         } else {
             try self.runtimeErrorAny(.E001, "cannot negate non-numeric value");
             return error.RuntimeErr;
@@ -885,114 +879,114 @@ pub const VM = struct {
 
     // ── Arithmetic operations ─────────────────────────────────────────
 
-    fn binaryAdd(self: *Self) RuntimeError!void {
+    /// Integer value of an inline or heap integer, null for anything else.
+    fn intOperand(v: Value) ?i64 {
+        if (v.isInt()) return v.asInt();
+        if (v.isObjType(.int_big)) return ObjInt.fromObj(v.asObj()).value;
+        return null;
+    }
+
+    /// Numeric value as a float, null for non-numbers.
+    fn floatOperand(v: Value) ?f64 {
+        if (v.isFloat()) return v.asFloat();
+        if (intOperand(v)) |i| return @floatFromInt(i);
+        return null;
+    }
+
+    const ArithOp = enum { add, sub, mul };
+
+    /// Integers stay exact up to 64 bits (inline up to 48), mixing in a
+    /// float gives a float.
+    fn binaryArith(self: *Self, comptime op: ArithOp) RuntimeError!void {
         const b = try self.pop();
         const a = try self.pop();
 
-        if (a.isInt() and b.isInt()) {
-            const ai: i64 = a.asInt();
-            const bi: i64 = b.asInt();
-            const result = ai + bi;
-            if (result > std.math.maxInt(i32) or result < std.math.minInt(i32)) {
-                try self.runtimeErrorAny(.E003, "integer overflow");
-                return error.RuntimeErr;
+        if (intOperand(a)) |ai| {
+            if (intOperand(b)) |bi| {
+                const r = switch (op) {
+                    .add => @addWithOverflow(ai, bi),
+                    .sub => @subWithOverflow(ai, bi),
+                    .mul => @mulWithOverflow(ai, bi),
+                };
+                if (r[1] != 0) {
+                    try self.runtimeErrorAny(.E003, "integer overflow: result does not fit in 64 bits");
+                    return error.RuntimeErr;
+                }
+                try self.push(try self.makeInt(r[0]));
+                return;
             }
-            try self.push(Value.fromInt(@intCast(result)));
-        } else if (a.isFloat() and b.isFloat()) {
-            try self.push(Value.fromFloat(a.asFloat() + b.asFloat()));
-        } else if (a.isInt() and b.isFloat()) {
-            try self.push(Value.fromFloat(@as(f64, @floatFromInt(a.asInt())) + b.asFloat()));
-        } else if (a.isFloat() and b.isInt()) {
-            try self.push(Value.fromFloat(a.asFloat() + @as(f64, @floatFromInt(b.asInt()))));
-        } else {
-            try self.runtimeErrorAny(.E001, "operands must be numbers for '+'");
-            return error.RuntimeErr;
         }
+        if (floatOperand(a)) |fa| {
+            if (floatOperand(b)) |fb| {
+                try self.push(Value.fromFloat(switch (op) {
+                    .add => fa + fb,
+                    .sub => fa - fb,
+                    .mul => fa * fb,
+                }));
+                return;
+            }
+        }
+        const msg = switch (op) {
+            .add => "operands must be numbers for '+'",
+            .sub => "operands must be numbers for '-'",
+            .mul => "operands must be numbers for '*'",
+        };
+        try self.runtimeErrorAny(.E001, msg);
+        return error.RuntimeErr;
+    }
+
+    fn binaryAdd(self: *Self) RuntimeError!void {
+        return self.binaryArith(.add);
     }
 
     fn binarySub(self: *Self) RuntimeError!void {
-        const b = try self.pop();
-        const a = try self.pop();
-
-        if (a.isInt() and b.isInt()) {
-            const ai: i64 = a.asInt();
-            const bi: i64 = b.asInt();
-            const result = ai - bi;
-            if (result > std.math.maxInt(i32) or result < std.math.minInt(i32)) {
-                try self.runtimeErrorAny(.E003, "integer overflow");
-                return error.RuntimeErr;
-            }
-            try self.push(Value.fromInt(@intCast(result)));
-        } else if (a.isFloat() and b.isFloat()) {
-            try self.push(Value.fromFloat(a.asFloat() - b.asFloat()));
-        } else if (a.isInt() and b.isFloat()) {
-            try self.push(Value.fromFloat(@as(f64, @floatFromInt(a.asInt())) - b.asFloat()));
-        } else if (a.isFloat() and b.isInt()) {
-            try self.push(Value.fromFloat(a.asFloat() - @as(f64, @floatFromInt(b.asInt()))));
-        } else {
-            try self.runtimeErrorAny(.E001, "operands must be numbers for '-'");
-            return error.RuntimeErr;
-        }
+        return self.binaryArith(.sub);
     }
 
     fn binaryMul(self: *Self) RuntimeError!void {
-        const b = try self.pop();
-        const a = try self.pop();
-
-        if (a.isInt() and b.isInt()) {
-            const ai: i64 = a.asInt();
-            const bi: i64 = b.asInt();
-            const result = ai * bi;
-            if (result > std.math.maxInt(i32) or result < std.math.minInt(i32)) {
-                try self.runtimeErrorAny(.E003, "integer overflow");
-                return error.RuntimeErr;
-            }
-            try self.push(Value.fromInt(@intCast(result)));
-        } else if (a.isFloat() and b.isFloat()) {
-            try self.push(Value.fromFloat(a.asFloat() * b.asFloat()));
-        } else if (a.isInt() and b.isFloat()) {
-            try self.push(Value.fromFloat(@as(f64, @floatFromInt(a.asInt())) * b.asFloat()));
-        } else if (a.isFloat() and b.isInt()) {
-            try self.push(Value.fromFloat(a.asFloat() * @as(f64, @floatFromInt(b.asInt()))));
-        } else {
-            try self.runtimeErrorAny(.E001, "operands must be numbers for '*'");
-            return error.RuntimeErr;
-        }
+        return self.binaryArith(.mul);
     }
 
     fn binaryDiv(self: *Self) RuntimeError!void {
         const b = try self.pop();
         const a = try self.pop();
 
-        if (a.isInt() and b.isInt()) {
-            if (b.asInt() == 0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
-            try self.push(Value.fromInt(@intCast(@divTrunc(@as(i64, a.asInt()), @as(i64, b.asInt())))));
-        } else if (a.isFloat() and b.isFloat()) {
-            if (b.asFloat() == 0.0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
-            try self.push(Value.fromFloat(a.asFloat() / b.asFloat()));
-        } else if (a.isInt() and b.isFloat()) {
-            if (b.asFloat() == 0.0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
-            try self.push(Value.fromFloat(@as(f64, @floatFromInt(a.asInt())) / b.asFloat()));
-        } else if (a.isFloat() and b.isInt()) {
-            if (b.asInt() == 0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
-            try self.push(Value.fromFloat(a.asFloat() / @as(f64, @floatFromInt(b.asInt()))));
-        } else {
-            try self.runtimeErrorAny(.E001, "operands must be numbers for '/'");
-            return error.RuntimeErr;
+        if (intOperand(a)) |ai| {
+            if (intOperand(b)) |bi| {
+                if (bi == 0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
+                if (ai == std.math.minInt(i64) and bi == -1) {
+                    try self.runtimeErrorAny(.E003, "integer overflow: result does not fit in 64 bits");
+                    return error.RuntimeErr;
+                }
+                try self.push(try self.makeInt(@divTrunc(ai, bi)));
+                return;
+            }
         }
+        if (floatOperand(a)) |fa| {
+            if (floatOperand(b)) |fb| {
+                if (fb == 0.0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
+                try self.push(Value.fromFloat(fa / fb));
+                return;
+            }
+        }
+        try self.runtimeErrorAny(.E001, "operands must be numbers for '/'");
+        return error.RuntimeErr;
     }
 
     fn binaryMod(self: *Self) RuntimeError!void {
         const b = try self.pop();
         const a = try self.pop();
 
-        if (a.isInt() and b.isInt()) {
-            if (b.asInt() == 0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
-            try self.push(Value.fromInt(@intCast(@rem(@as(i64, a.asInt()), @as(i64, b.asInt())))));
-        } else {
-            try self.runtimeErrorAny(.E001, "operands must be integers for '%'");
-            return error.RuntimeErr;
+        if (intOperand(a)) |ai| {
+            if (intOperand(b)) |bi| {
+                if (bi == 0) { try self.runtimeErrorAny(.E004, "division by zero"); return error.RuntimeErr; }
+                // minInt % -1 is 0; @rem would trap on the overflowing quotient.
+                try self.push(try self.makeInt(if (bi == -1) 0 else @rem(ai, bi)));
+                return;
+            }
         }
+        try self.runtimeErrorAny(.E001, "operands must be integers for '%'");
+        return error.RuntimeErr;
     }
 
     // ── Comparison operations ─────────────────────────────────────────
@@ -1007,26 +1001,22 @@ pub const VM = struct {
     }
 
     fn compareValues(self: *Self, a: Value, b: Value, op: CompareOp) RuntimeError!bool {
-        if (a.isInt() and b.isInt()) {
-            const ai = a.asInt();
-            const bi = b.asInt();
-            return switch (op) {
-                .lt => ai < bi, .gt => ai > bi, .le => ai <= bi, .ge => ai >= bi,
-            };
+        if (intOperand(a)) |ai| {
+            if (intOperand(b)) |bi| {
+                return switch (op) {
+                    .lt => ai < bi, .gt => ai > bi, .le => ai <= bi, .ge => ai >= bi,
+                };
+            }
         }
 
-        var fa: f64 = undefined;
-        var fb: f64 = undefined;
-
-        if (a.isFloat()) { fa = a.asFloat(); } else if (a.isInt()) { fa = @floatFromInt(a.asInt()); } else {
+        const fa = floatOperand(a) orelse {
             try self.runtimeErrorAny(.E001, "operands must be numbers for comparison");
             return error.RuntimeErr;
-        }
-
-        if (b.isFloat()) { fb = b.asFloat(); } else if (b.isInt()) { fb = @floatFromInt(b.asInt()); } else {
+        };
+        const fb = floatOperand(b) orelse {
             try self.runtimeErrorAny(.E001, "operands must be numbers for comparison");
             return error.RuntimeErr;
-        }
+        };
 
         return switch (op) {
             .lt => fa < fb, .gt => fa > fb, .le => fa <= fb, .ge => fa >= fb,
@@ -1862,7 +1852,7 @@ pub const VM = struct {
             if (done) {
                 self.currentFrame().ip += jump_offset;
             } else {
-                stack[st.* - 1] = Value.fromInt(current);
+                stack[st.* - 1] = try self.makeInt(current);
                 stack[st.* - 2] = Value.fromInt(idx + 1);
             }
         } else if (iterable.isObjType(.channel)) {
@@ -1905,7 +1895,7 @@ pub const VM = struct {
             if (done) {
                 ip_ptr.* += jump_offset;
             } else {
-                stack[st.* - 1] = Value.fromInt(current);
+                stack[st.* - 1] = try self.makeInt(current);
                 stack[st.* - 2] = Value.fromInt(idx + 1);
             }
         } else if (iterable.isObjType(.channel)) {
@@ -2214,6 +2204,14 @@ pub const VM = struct {
     // ── ADT and pattern matching opcodes ─────────────────────────────
 
     const ObjAdt = obj_mod.ObjAdt;
+
+    /// Box an integer, on the heap when it does not fit inline. Store the
+    /// result somewhere reachable before allocating again.
+    fn makeInt(self: *Self, i: i64) RuntimeError!Value {
+        const v = try Value.fromI64(i, self.allocator);
+        if (v.isObj()) self.trackObject(v.asObj());
+        return v;
+    }
 
     /// Build an ADT value whose payload exists only in Zig locals. The
     /// payload stays pinned across the allocation; push the result before
@@ -3053,7 +3051,9 @@ test "vm: integer overflow error" {
     const allocator = std.testing.allocator;
     var tc = TestChunk.init(allocator);
     defer tc.deinit();
-    try tc.emitConstant(Value.fromInt(std.math.maxInt(i32)));
+    var big = try obj_mod.ObjInt.create(allocator, std.math.maxInt(i64));
+    defer big.obj.destroy(allocator);
+    try tc.emitConstant(Value.fromObj(&big.obj));
     try tc.emitConstant(Value.fromInt(1));
     try tc.emitOp(.op_add);
     try tc.emitReturn();

@@ -85,6 +85,7 @@ const normal_tests = [_]TestCase{
     .{ .name = "ordering", .zen_path = "tests/zen/ordering.zen", .expected_path = "tests/zen/ordering.expected", .is_error_test = false },
     .{ .name = "list_streams", .zen_path = "tests/zen/list_streams.zen", .expected_path = "tests/zen/list_streams.expected", .is_error_test = false },
     .{ .name = "streams_large", .zen_path = "tests/zen/streams_large.zen", .expected_path = "tests/zen/streams_large.expected", .is_error_test = false, .heavy = true },
+    .{ .name = "int64", .zen_path = "tests/zen/int64.zen", .expected_path = "tests/zen/int64.expected", .is_error_test = false },
 };
 
 const error_tests = [_]TestCase{

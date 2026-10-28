@@ -832,11 +832,11 @@ pub const Compiler = struct {
         const main_tokens = self.ast.nodes.items(.main_token);
         const tok_idx = main_tokens[node_idx];
         const text = self.ast.tokenSlice(tok_idx);
-        const val = std.fmt.parseInt(i32, text, 10) catch {
-            try self.emitError(node_idx, .E007, "invalid integer literal");
+        const val = std.fmt.parseInt(i64, text, 10) catch {
+            try self.emitError(node_idx, .E007, "integer literal does not fit in 64 bits");
             return;
         };
-        try self.emitConstant(Value.fromInt(val), self.getLine(node_idx));
+        try self.emitConstant(try Value.fromI64(val, self.allocator), self.getLine(node_idx));
     }
 
     fn compileFloatLiteral(self: *Self, node_idx: u32) Error!void {
@@ -2979,8 +2979,8 @@ pub const Compiler = struct {
 
         switch (tag) {
             .int_literal => {
-                const val = std.fmt.parseInt(i32, text, 10) catch return Value.nil;
-                return Value.fromInt(val);
+                const val = std.fmt.parseInt(i64, text, 10) catch return Value.nil;
+                return try Value.fromI64(val, self.allocator);
             },
             .float_literal => {
                 const val = std.fmt.parseFloat(f64, text) catch return Value.nil;

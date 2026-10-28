@@ -484,11 +484,12 @@ const Parser = struct {
 
         // Try integer path.
         if (std.fmt.parseInt(i64, num_text, 10)) |i| {
-            if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) {
-                return Value.fromInt(@intCast(i));
-            }
-            // Fits in i64 but not i32 -> store as float (NaN-boxing only supports inline i32).
-            return Value.fromFloat(@floatFromInt(i));
+            const v = Value.fromI64(i, self.allocator) catch {
+                self.setError("out of memory");
+                return null;
+            };
+            if (v.isObj()) trackObj(v.asObj());
+            return v;
         } else |_| {
             // Exceeds i64 range -> parse as float.
             const f = std.fmt.parseFloat(f64, num_text) catch {
@@ -686,15 +687,8 @@ fn emitValue(value: Value, allocator: Allocator, buf: *std.ArrayListUnmanaged(u8
                 try writer.writeByte('}');
             },
             .int_big => {
-                // Big integers stored on heap. Convert i64 to float for JSON.
-                const big = obj_mod.ObjInt.fromObj(obj_ptr);
-                // Format as integer if in safe integer range for doubles.
-                const v = big.value;
-                if (v >= -9007199254740992 and v <= 9007199254740992) {
-                    try writer.print("{d}", .{v});
-                } else {
-                    try writer.print("{d}", .{@as(f64, @floatFromInt(v))});
-                }
+                // Big integers are written exactly, even past 2^53.
+                try writer.print("{d}", .{obj_mod.ObjInt.fromObj(obj_ptr).value});
             },
             .function, .closure => {
                 emit_error_msg = "cannot encode function to JSON";

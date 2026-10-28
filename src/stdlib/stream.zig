@@ -63,9 +63,9 @@ pub const StreamState = union(enum) {
     memory_reader: MemoryReaderOp,
 
     pub const RangeIter = struct {
-        current: i32,
-        end: i32,
-        step: i32,
+        current: i64,
+        end: i64,
+        step: i64,
     };
 
     pub const RepeatIter = struct {
@@ -90,12 +90,12 @@ pub const StreamState = union(enum) {
 
     pub const TakeOp = struct {
         upstream: Value, // NaN-boxed ObjStream pointer
-        remaining: i32,
+        remaining: i64,
     };
 
     pub const DropOp = struct {
         upstream: Value, // NaN-boxed ObjStream pointer
-        remaining: i32,
+        remaining: i64,
         started: bool,
     };
 
@@ -141,7 +141,7 @@ pub const StreamState = union(enum) {
 
     pub const BatchOp = struct {
         upstream: Value, // NaN-boxed ObjStream pointer
-        size: i32,
+        size: i64,
         exhausted: bool,
     };
 
@@ -392,7 +392,8 @@ pub const StreamState = union(enum) {
                 } else {
                     if (s.current <= s.end) return null;
                 }
-                const val = Value.fromInt(s.current);
+                const val = try Value.fromI64(s.current, allocator);
+                if (val.isObj()) trackObj(val.asObj());
                 s.current += s.step;
                 return val;
             },
@@ -438,7 +439,7 @@ pub const StreamState = union(enum) {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 if (!s.started) {
                     // Discard `remaining` elements.
-                    var dropped: i32 = 0;
+                    var dropped: i64 = 0;
                     while (dropped < s.remaining) : (dropped += 1) {
                         const m = roots.mark();
                         defer roots.restore(m);
@@ -657,7 +658,7 @@ pub const StreamState = union(enum) {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 const batch_list = try ObjList.create(allocator);
                 trackObj(&batch_list.obj);
-                var count: i32 = 0;
+                var count: i64 = 0;
                 while (count < s.size) : (count += 1) {
                     // Elements stay reachable through batch_list.
                     const m = roots.mark();

@@ -949,13 +949,8 @@ fn builtinListFilterMap(args: []const Value, allocator: Allocator, err_msg: *[]c
 
 // ── GC module implementations ────────────────────────────────────────
 
-/// Convert a u64 stat value to a Value. Uses inline i32 for small values,
-/// heap-allocated ObjInt for large values.
+/// Convert a u64 stat value to a Value (heap-allocated beyond the inline range).
 fn u64ToValue(v: u64, allocator: Allocator) !Value {
-    if (v <= @as(u64, @intCast(std.math.maxInt(i32)))) {
-        return Value.fromInt(@intCast(v));
-    }
-    // Value exceeds i32 range; use i64 path (heap-allocates ObjInt if > i32).
     if (v <= @as(u64, @intCast(std.math.maxInt(i64)))) {
         return Value.fromI64(@intCast(v), allocator);
     }
@@ -2095,11 +2090,16 @@ fn builtinSum(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     while (true) {
         roots.restore(m);
         const elem = (try stream_obj.state.next(allocator)) orelse break;
-        if (elem.isInt()) {
+        if (elem.isInteger()) {
             if (has_float) {
-                float_sum += @as(f64, @floatFromInt(elem.asInt()));
+                float_sum += @as(f64, @floatFromInt(elem.asI64()));
             } else {
-                int_sum += @as(i64, elem.asInt());
+                const r = @addWithOverflow(int_sum, elem.asI64());
+                if (r[1] != 0) {
+                    err_msg.* = "sum() overflows a 64-bit integer";
+                    return error.RuntimeError;
+                }
+                int_sum = r[0];
             }
         } else if (elem.isFloat()) {
             if (!has_float) {
@@ -2112,10 +2112,6 @@ fn builtinSum(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
 
     if (has_float) {
         return Value.fromFloat(float_sum);
-    }
-    // Try to return as i32 if it fits, otherwise use i64.
-    if (int_sum >= @as(i64, std.math.minInt(i32)) and int_sum <= @as(i64, std.math.maxInt(i32))) {
-        return Value.fromInt(@intCast(int_sum));
     }
     return Value.fromI64(int_sum, allocator);
 }
@@ -2549,7 +2545,7 @@ fn applySinkOption(opts: *SinkOptions, kn: []const u8, val: Value) void {
     } else if (std.mem.eql(u8, kn, "indent")) {
         if (val.isInt()) {
             const iv = val.asInt();
-            if (iv >= 0 and iv <= 16) opts.indent = @intCast(@as(u32, @bitCast(iv)));
+            if (iv >= 0 and iv <= 16) opts.indent = @intCast(iv);
         }
     } else if (std.mem.eql(u8, kn, "compress")) {
         if (val.isAtom()) {
@@ -2560,12 +2556,12 @@ fn applySinkOption(opts: *SinkOptions, kn: []const u8, val: Value) void {
     } else if (std.mem.eql(u8, kn, "retry")) {
         if (val.isInt()) {
             const iv = val.asInt();
-            if (iv >= 0 and iv <= 10) opts.retry = @intCast(@as(u32, @bitCast(iv)));
+            if (iv >= 0 and iv <= 10) opts.retry = @intCast(iv);
         }
     } else if (std.mem.eql(u8, kn, "timeout")) {
         if (val.isInt()) {
             const iv = val.asInt();
-            if (iv > 0) opts.timeout = @intCast(@as(u32, @bitCast(iv)));
+            if (iv > 0) opts.timeout = @intCast(iv);
         }
     }
 }
@@ -4511,8 +4507,8 @@ fn builtinAvg(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     }
     var sum: f64 = 0;
     for (list.items.items) |v| {
-        if (v.isInt()) {
-            sum += @floatFromInt(v.asInt());
+        if (v.isInteger()) {
+            sum += @floatFromInt(v.asI64());
         } else if (v.isFloat()) {
             sum += v.asFloat();
         } else {

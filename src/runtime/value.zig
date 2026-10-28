@@ -9,7 +9,7 @@
 ///   Nil:       QNAN | 1
 ///   False:     QNAN | 2
 ///   True:      QNAN | 3
-///   Int(i32):  QNAN | TAG_INT  | (i32 as u32 in lower 32 bits)
+///   Int(i48):  QNAN | TAG_INT  | (i48 as u48 in lower 48 bits)
 ///   Atom(u32): QNAN | TAG_ATOM | (atom_id in lower 32 bits)
 ///   Object:    SIGN_BIT | QNAN | (pointer in lower 48 bits)
 ///
@@ -37,7 +37,7 @@ pub const Value = struct {
     /// Sign bit, used to distinguish object pointers.
     const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
 
-    /// Tag for inline i32 integers -- bit 48 in the NaN payload.
+    /// Tag for inline i48 integers -- bit 48 in the NaN payload.
     const TAG_INT: u64 = 0x0001_0000_0000_0000;
     /// Tag for atom IDs -- bit 49 in the NaN payload.
     const TAG_ATOM: u64 = 0x0002_0000_0000_0000;
@@ -67,15 +67,23 @@ pub const Value = struct {
         return .{ .bits = @bitCast(f) };
     }
 
-    /// Encode an inline i32 integer.
-    pub fn fromInt(i: i32) Value {
-        return .{ .bits = QNAN | TAG_INT | @as(u64, @as(u32, @bitCast(i))) };
+    /// Smallest and largest integers stored inline (without allocation).
+    pub const INLINE_INT_MIN: i64 = std.math.minInt(i48);
+    pub const INLINE_INT_MAX: i64 = std.math.maxInt(i48);
+
+    /// Encode an inline i48 integer.
+    pub fn fromInt(i: i48) Value {
+        return .{ .bits = QNAN | TAG_INT | @as(u64, @as(u48, @bitCast(i))) };
     }
 
-    /// Encode an i64.  If the value fits in i32, stores it inline;
+    pub fn fitsInline(i: i64) bool {
+        return i >= INLINE_INT_MIN and i <= INLINE_INT_MAX;
+    }
+
+    /// Encode an i64.  If the value fits in i48, stores it inline;
     /// otherwise heap-allocates an ObjInt.
     pub fn fromI64(i: i64, allocator: Allocator) !Value {
-        if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) {
+        if (fitsInline(i)) {
             return fromInt(@intCast(i));
         }
         const big = try ObjInt.create(allocator, i);
@@ -131,7 +139,7 @@ pub const Value = struct {
         return self.isObjType(.string);
     }
 
-    /// Returns true if this value represents an integer (either inline i32 or heap ObjInt).
+    /// Returns true if this value represents an integer (either inline i48 or heap ObjInt).
     pub fn isInteger(self: Value) bool {
         return self.isInt() or self.isObjType(.int_big);
     }
@@ -177,12 +185,12 @@ pub const Value = struct {
         return @bitCast(self.bits);
     }
 
-    /// Decode an inline i32 value.
-    pub fn asInt(self: Value) i32 {
-        return @bitCast(@as(u32, @truncate(self.bits)));
+    /// Decode an inline i48 value.
+    pub fn asInt(self: Value) i48 {
+        return @bitCast(@as(u48, @truncate(self.bits)));
     }
 
-    /// Decode an integer value.  For inline i32 values, returns the i32
+    /// Decode an integer value.  For inline values, returns the i48
     /// widened to i64. For heap-allocated big ints, returns the full i64.
     pub fn asI64(self: Value) i64 {
         if (self.isInt()) {
@@ -424,12 +432,14 @@ test "Value.fromInt zero" {
     try std.testing.expectEqual(@as(i32, 0), v.asInt());
 }
 
-test "Value.fromInt min/max i32" {
-    const min_v = Value.fromInt(std.math.minInt(i32));
-    try std.testing.expectEqual(std.math.minInt(i32), min_v.asInt());
+test "Value.fromInt min/max i48" {
+    const min_v = Value.fromInt(std.math.minInt(i48));
+    try std.testing.expectEqual(std.math.minInt(i48), min_v.asInt());
+    try std.testing.expect(min_v.isInt());
 
-    const max_v = Value.fromInt(std.math.maxInt(i32));
-    try std.testing.expectEqual(std.math.maxInt(i32), max_v.asInt());
+    const max_v = Value.fromInt(std.math.maxInt(i48));
+    try std.testing.expectEqual(std.math.maxInt(i48), max_v.asInt());
+    try std.testing.expect(max_v.isInt());
 }
 
 test "Value.nil" {
@@ -544,11 +554,11 @@ test "Value.eql strings by content" {
     try std.testing.expect(!va.eql(vc));
 }
 
-test "i32 overflow promotion to heap ObjInt" {
+test "i48 overflow promotion to heap ObjInt" {
     const allocator = std.testing.allocator;
 
-    // Value larger than i32 max.
-    const big_val: i64 = @as(i64, std.math.maxInt(i32)) + 1;
+    // Value larger than the inline maximum.
+    const big_val: i64 = Value.INLINE_INT_MAX + 1;
     const v = try Value.fromI64(big_val, allocator);
 
     // Must be an object (not inline int).
@@ -560,8 +570,11 @@ test "i32 overflow promotion to heap ObjInt" {
     v.asObj().destroy(allocator);
 }
 
-test "i64 within i32 range stays inline" {
+test "i64 within i48 range stays inline" {
     const allocator = std.testing.allocator;
+    const ts_ms = try Value.fromI64(1_700_000_000_000, allocator);
+    try std.testing.expect(ts_ms.isInt());
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), ts_ms.asI64());
     const v = try Value.fromI64(42, allocator);
     try std.testing.expect(v.isInt());
     try std.testing.expectEqual(@as(i64, 42), v.asI64());
@@ -570,7 +583,7 @@ test "i64 within i32 range stays inline" {
 
 test "negative i64 overflow to heap" {
     const allocator = std.testing.allocator;
-    const big_neg: i64 = @as(i64, std.math.minInt(i32)) - 1;
+    const big_neg: i64 = Value.INLINE_INT_MIN - 1;
     const v = try Value.fromI64(big_neg, allocator);
     try std.testing.expect(v.isObj());
     try std.testing.expectEqual(big_neg, v.asI64());

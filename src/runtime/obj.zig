@@ -252,11 +252,11 @@ pub const ObjInt = struct {
 /// Heap-allocated range descriptor for for-in iteration.
 pub const ObjRange = struct {
     obj: Obj,
-    start: i32,
-    end: i32,
-    step: i32,
+    start: i64,
+    end: i64,
+    step: i64,
 
-    pub fn create(allocator: Allocator, start: i32, end_val: i32, step: i32) !*ObjRange {
+    pub fn create(allocator: Allocator, start: i64, end_val: i64, step: i64) !*ObjRange {
         const r = try allocator.create(ObjRange);
         r.* = .{
             .obj = .{ .obj_type = .range },
