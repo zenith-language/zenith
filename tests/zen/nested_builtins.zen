@@ -1,0 +1,5 @@
+-- A closure called by a builtin may itself call builtins and stream terminals.
+print(range(0, 5) |> map(|i| str(i)) |> reduce("", |acc, s| acc ++ s))
+print(["a", "bb", "c"] |> reduce("", |acc, s| if len(s) > len(acc) { s } else { acc }))
+print(range(1, 4) |> map(|n| range(0, n) |> collect()) |> map(|l| len(l)) |> collect())
+print(List.map([2, 1], |n| range(0, n) |> map(|x| x * 10) |> sum()))

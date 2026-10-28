@@ -111,8 +111,9 @@ pub fn setSchedulerPtr(sched: ?*anyopaque) void {
     current_scheduler_ptr = sched;
 }
 
-/// Called by the VM after a builtin returns.
+/// Called by the VM when it shuts down.
 pub fn clearVM() void {
+    stream_mod.clearVM();
     current_vm = null;
     call_closure_fn = null;
     track_obj_fn = null;
@@ -1752,7 +1753,6 @@ fn builtinCollect(args: []const Value, allocator: Allocator, err_msg: *[]const u
 
     // Set stream module callbacks to match our current VM callbacks.
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     const result_list = try ObjList.create(allocator);
@@ -1783,7 +1783,6 @@ fn builtinCount(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
 
     // Set stream module callbacks.
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     var n: i32 = 0;
@@ -2079,7 +2078,6 @@ fn builtinSum(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     }
 
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     var int_sum: i64 = 0;
@@ -2128,7 +2126,6 @@ fn builtinReduce(args: []const Value, allocator: Allocator, err_msg: *[]const u8
             return error.RuntimeError;
         }
         setStreamCallbacks();
-        defer stream_mod.clearVM();
 
         const stream_obj = ObjStream.fromObj(first.asObj());
         var acc = args[1];
@@ -2163,7 +2160,6 @@ fn builtinFirst(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     }
 
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     // Empty stream -> None.
@@ -2183,7 +2179,6 @@ fn builtinLast(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     }
 
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     var last_val: ?Value = null;
@@ -2218,7 +2213,6 @@ fn builtinEach(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     }
 
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     const closure_val = args[1];
@@ -2245,7 +2239,6 @@ fn builtinMin(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     }
 
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     var min_val: ?Value = null;
@@ -2284,7 +2277,6 @@ fn builtinMax(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     }
 
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
     var max_val: ?Value = null;
@@ -3737,7 +3729,6 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
 
     // Set stream module callbacks for pulling.
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
 
@@ -4388,7 +4379,6 @@ fn builtinSingle(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     }
 
     setStreamCallbacks();
-    defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
 

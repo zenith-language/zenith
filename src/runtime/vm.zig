@@ -182,6 +182,7 @@ pub const VM = struct {
         }
         self.atom_names.deinit(self.infra_allocator);
         self.errors.deinit(self.infra_allocator);
+        builtins_mod.clearVM();
         // Clear module-level ADT type info to avoid stale references.
         if (self.adt_type_info != null) {
             builtins_mod.clearAdtTypes();
@@ -1159,7 +1160,8 @@ pub const VM = struct {
         if (self.atom_names.items.len > 0) {
             builtins_mod.setAtomNames(self.atom_names.items);
         }
-        defer builtins_mod.clearVM();
+        // Not cleared on return: a builtin may be running further up the
+        // native stack (a closure it called invoked this one). deinit clears.
 
         // Objects the builtin creates stay pinned until it returns.
         const roots_mark = roots_mod.mark();
