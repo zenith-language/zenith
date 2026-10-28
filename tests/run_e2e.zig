@@ -297,62 +297,15 @@ fn runNormalTest(tc: TestCase) !void {
 
 const TestFailed = error{TestFailed};
 
-test "e2e: arithmetic" {
-    try runNormalTest(normal_tests[0]);
-}
-
-test "e2e: let_bindings" {
-    try runNormalTest(normal_tests[1]);
-}
-
-test "e2e: if_else" {
-    try runNormalTest(normal_tests[2]);
-}
-
-test "e2e: loops" {
-    try runNormalTest(normal_tests[3]);
-}
-
-test "e2e: atoms" {
-    try runNormalTest(normal_tests[4]);
-}
-
-test "e2e: blocks" {
-    try runNormalTest(normal_tests[5]);
-}
-
-test "e2e: strings" {
-    try runNormalTest(normal_tests[6]);
-}
-
-test "e2e: builtins" {
-    try runNormalTest(normal_tests[7]);
-}
-
-// ── Phase 2 normal tests ──────────────────────────────────────────────────
-
-test "e2e: functions" {
-    try runNormalTest(normal_tests[8]);
-}
-
-test "e2e: closures" {
-    try runNormalTest(normal_tests[9]);
-}
-
-test "e2e: pipes" {
-    try runNormalTest(normal_tests[10]);
-}
-
-test "e2e: lambdas" {
-    try runNormalTest(normal_tests[11]);
-}
-
-test "e2e: named_args" {
-    try runNormalTest(normal_tests[12]);
-}
-
-test "e2e: tail_calls" {
-    try runNormalTest(normal_tests[13]);
+test "e2e: every normal program" {
+    // Run all cases before failing so one report lists every mismatch.
+    var failed: usize = 0;
+    for (normal_tests) |tc| {
+        runNormalTest(tc) catch {
+            failed += 1;
+        };
+    }
+    if (failed > 0) return error.TestFailed;
 }
 
 // ── Error tests ────────────────────────────────────────────────────────────
@@ -413,114 +366,6 @@ test "e2e error: not_callable" {
 
 test "e2e error: arity_mismatch" {
     try runErrorTest(error_tests[5]);
-}
-
-// ── Phase 3 normal tests ──────────────────────────────────────────────────
-
-test "e2e: lists" {
-    try runNormalTest(normal_tests[14]);
-}
-
-test "e2e: maps" {
-    try runNormalTest(normal_tests[15]);
-}
-
-test "e2e: tuples" {
-    try runNormalTest(normal_tests[16]);
-}
-
-test "e2e: records" {
-    try runNormalTest(normal_tests[17]);
-}
-
-test "e2e: adts" {
-    try runNormalTest(normal_tests[18]);
-}
-
-test "e2e: pattern_matching" {
-    try runNormalTest(normal_tests[19]);
-}
-
-test "e2e: result_option" {
-    try runNormalTest(normal_tests[20]);
-}
-
-test "e2e: string_ops" {
-    try runNormalTest(normal_tests[21]);
-}
-
-// ── Phase 4 normal tests ──────────────────────────────────────────────────
-
-test "e2e: gc" {
-    try runNormalTest(normal_tests[22]);
-}
-
-test "e2e: gc_stress" {
-    try runNormalTest(normal_tests[23]);
-}
-
-// ── Phase 5 normal tests ──────────────────────────────────────────────────
-
-test "e2e: streams_basic" {
-    try runNormalTest(normal_tests[24]);
-}
-
-test "e2e: streams_ops" {
-    try runNormalTest(normal_tests[25]);
-}
-
-test "e2e: streams_partition" {
-    try runNormalTest(normal_tests[26]);
-}
-
-test "e2e: json" {
-    try runNormalTest(normal_tests[27]);
-}
-
-test "e2e: file_io" {
-    try runNormalTest(normal_tests[28]);
-}
-
-test "e2e: streams" {
-    try runNormalTest(normal_tests[29]);
-}
-
-test "e2e: streams_lazy" {
-    try runNormalTest(normal_tests[30]);
-}
-
-test "e2e: jsonl" {
-    try runNormalTest(normal_tests[31]);
-}
-
-test "e2e: sugar" {
-    try runNormalTest(normal_tests[33]);
-}
-
-// ── Phase 7 normal tests ──────────────────────────────────────────────────
-
-test "e2e: fibers" {
-    try runNormalTest(normal_tests[34]);
-}
-
-test "e2e: fibers_error" {
-    try runNormalTest(normal_tests[35]);
-}
-
-test "e2e: channels" {
-    try runNormalTest(normal_tests[36]);
-}
-
-test "e2e: fiber_closures" {
-    try runNormalTest(normal_tests[37]);
-}
-
-test "e2e: select" {
-    try runNormalTest(normal_tests[38]);
-}
-
-test "e2e: par_map" {
-    try runNormalTest(normal_tests[39]);
 }
 
 // ── Phase 3 error tests ──────────────────────────────────────────────────
