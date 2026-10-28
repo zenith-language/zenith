@@ -1,0 +1,9 @@
+-- Escape sequences in string literals.
+print("tab:\t|")
+print("line one\nline two")
+print("quote: \"hi\" backslash: \\")
+print(len("\u{e9}"))
+print("snow: \u{2603}")
+-- JSON object literals no longer need workarounds.
+let doc = unwrap(Json.decode("{\"id\": 7, \"tags\": [\"a\", \"b\"]}"))
+print(Map.get(doc, "tags"))

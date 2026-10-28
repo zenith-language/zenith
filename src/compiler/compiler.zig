@@ -856,12 +856,53 @@ pub const Compiler = struct {
         const text = self.ast.tokenSlice(tok_idx);
         // Strip quotes from the token text.
         if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
-            const content = text[1 .. text.len - 1];
+            const content = unescapeString(text[1 .. text.len - 1], self.allocator) catch |err| switch (err) {
+                error.InvalidEscape => {
+                    try self.emitError(node_idx, .E007, "invalid escape sequence in string (use \\n, \\t, \\r, \\0, \\\\, \\\" or \\u{hex})");
+                    return;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            defer self.allocator.free(content);
             const str_obj = try ObjString.create(self.allocator, content, null);
             try self.emitConstant(Value.fromObj(&str_obj.obj), self.getLine(node_idx));
         } else {
             try self.emitError(node_idx, .E007, "invalid string literal");
         }
+    }
+
+    /// Decode escape sequences in a string literal's contents.
+    fn unescapeString(raw: []const u8, allocator: Allocator) error{ InvalidEscape, OutOfMemory }![]u8 {
+        var out = try std.ArrayListUnmanaged(u8).initCapacity(allocator, raw.len);
+        errdefer out.deinit(allocator);
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            if (raw[i] != '\\') {
+                out.appendAssumeCapacity(raw[i]);
+                continue;
+            }
+            i += 1;
+            if (i >= raw.len) return error.InvalidEscape;
+            switch (raw[i]) {
+                'n' => out.appendAssumeCapacity('\n'),
+                't' => out.appendAssumeCapacity('\t'),
+                'r' => out.appendAssumeCapacity('\r'),
+                '0' => out.appendAssumeCapacity(0),
+                '\\', '"' => out.appendAssumeCapacity(raw[i]),
+                'u' => {
+                    // \u{1F600}: a Unicode scalar value in hex.
+                    if (i + 1 >= raw.len or raw[i + 1] != '{') return error.InvalidEscape;
+                    const close = std.mem.indexOfScalarPos(u8, raw, i + 2, '}') orelse return error.InvalidEscape;
+                    const cp = std.fmt.parseInt(u21, raw[i + 2 .. close], 16) catch return error.InvalidEscape;
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch return error.InvalidEscape;
+                    try out.appendSlice(allocator, buf[0..n]);
+                    i = close;
+                },
+                else => return error.InvalidEscape,
+            }
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     fn compileBoolLiteral(self: *Self, node_idx: u32) Error!void {
@@ -2988,7 +3029,11 @@ pub const Compiler = struct {
             },
             .string_literal => {
                 if (text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"') {
-                    const content = text[1 .. text.len - 1];
+                    const content = unescapeString(text[1 .. text.len - 1], self.allocator) catch |err| switch (err) {
+                        error.InvalidEscape => return Value.nil,
+                        error.OutOfMemory => return error.OutOfMemory,
+                    };
+                    defer self.allocator.free(content);
                     const str_obj = try ObjString.create(self.allocator, content, null);
                     return Value.fromObj(&str_obj.obj);
                 }

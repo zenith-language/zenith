@@ -1,0 +1,7 @@
+tab:	|
+line one
+line two
+quote: "hi" backslash: \
+2
+snow: ☃
+Option.Some([a, b])
