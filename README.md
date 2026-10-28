@@ -32,7 +32,7 @@ source("https://gripmock.org/schema/stub.json", :json)
 - **Result/Option types** with combinators for error handling
 - **Closures** with upvalue capture and mutation
 - **Tail call optimization** -- deep recursion without stack overflow
-- **Generational GC** (nursery + old generation)
+- **Mark-sweep GC** with per-element root scopes -- long streams run in bounded memory
 - **NaN-boxed values** -- no heap allocation for primitives
 - **JSON/JSONL** encode/decode with streaming file I/O
 - **Interactive REPL** with syntax coloring
@@ -148,7 +148,14 @@ print(type_of("hello"))  -- string
 print(type_of(:ok))      -- atom
 ```
 
-**Strings** are UTF-8 and concatenated with `++`:
+**Integers** are exact 64-bit values. Up to 48 bits they are stored inline; larger ones are boxed transparently. `_` separates digits:
+
+```zenith
+print(1_700_000_000_000 * 1000)   -- 1700000000000000
+print(9223372036854775807 + 1)    -- error[E003]: integer overflow
+```
+
+**Strings** are UTF-8 and concatenated with `++`. Literals support `\n`, `\t`, `\r`, `\0`, `\\`, `\"` and `\u{hex}`:
 
 ```zenith
 print("hello" ++ " " ++ "world")  -- hello world
@@ -724,7 +731,7 @@ print(ok_values)   -- [1, 3, 5]
 
 ### Streams
 
-Streams are lazy, pull-based sequences. Transforms build a pipeline; terminals drive execution.
+Streams are lazy, pull-based sequences. Transforms build a pipeline; terminals drive execution. Every stream operator also accepts a list or a range.
 
 #### Sources
 
@@ -1077,7 +1084,7 @@ join(worker)
 | `panic(message)` | Terminate with error |
 | `range(n)` / `range(start, end)` / `range(start, end, step)` | Create range |
 | `gc()` | Trigger garbage collection |
-| `gc_stats()` | GC statistics record |
+| `gc_stats()` | GC statistics record: `collections`, `objects_freed`, `bytes_freed`, `last_pause_ns`, `heap_size`, `live_objects` |
 
 ### List
 
@@ -1244,8 +1251,8 @@ Source (.zen)
 
 Key implementation details:
 
-- **NaN-boxed values**: All values are 64-bit. Integers, booleans, nil, and atoms fit in NaN payload bits -- no heap allocation for primitives.
-- **Generational GC**: Semi-space copying nursery for young objects, mark-sweep for old generation. Write barriers track inter-generational references.
+- **NaN-boxed values**: All values are 64-bit. Integers up to 48 bits, booleans, nil, and atoms fit in NaN payload bits -- no heap allocation for primitives.
+- **Mark-sweep GC**: Non-moving, no write barriers. A collection runs when the heap doubles since the last one. Native code pins the values it holds on a root stack; stream operators and terminals open a scope per element so memory stays bounded. `ZENITH_GC_STRESS=N` collects on every N-th allocation (`zig build test-gc-stress`), `ZENITH_GC_LOG=1` logs each collection.
 - **M:N fiber scheduler**: Lightweight 4KB fiber stacks, work-stealing with Chase-Lev deques, one deque per OS thread.
 - **Platform-specific context switching**: x86-64 and aarch64 assembly for fiber stack swaps.
 - **Tail call optimization**: Tail calls reuse the current call frame (no stack growth).
