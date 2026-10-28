@@ -18,6 +18,7 @@ const Label = error_mod.Label;
 const builtins_mod = @import("builtins");
 const NativeFn = builtins_mod.NativeFn;
 const gc_mod = @import("gc");
+const roots_mod = @import("roots");
 const GC = gc_mod.GC;
 const fiber_mod = @import("fiber");
 const ObjFiber = fiber_mod.ObjFiber;
@@ -362,8 +363,11 @@ pub const VM = struct {
     pub fn run(self: *Self) RuntimeError!Value {
         // Register with the GC for root scanning. This happens here rather
         // than in init because init returns the VM by value.
+        const prev_roots = roots_mod.current;
+        defer roots_mod.current = prev_roots;
         if (self.gc) |g| {
             g.vm = self;
+            roots_mod.current = &g.temp_roots;
         }
 
         // If we have frames (closure mode), use frame-based dispatch.
@@ -1155,8 +1159,11 @@ pub const VM = struct {
         }
         defer builtins_mod.clearVM();
 
+        // Objects the builtin creates stay pinned until it returns.
+        const roots_mark = roots_mod.mark();
         var err_msg: []const u8 = "";
         const result = builtin.func(args, self.allocator, &err_msg) catch |err| {
+            roots_mod.restore(roots_mark);
             switch (err) {
                 error.RuntimeError => {
                     try self.runtimeErrorAny(.E001, err_msg);
@@ -1166,6 +1173,8 @@ pub const VM = struct {
             }
         };
 
+        roots_mod.restore(roots_mark);
+        // No allocation until the result is back on the stack.
         if (result.isObj()) self.trackObject(result.asObj());
 
         self.getStackTop().* -= (@as(u32, arg_count) + 1);
@@ -1317,6 +1326,7 @@ pub const VM = struct {
     fn trackObjectFromBuiltin(vm_ptr: *anyopaque, obj: *obj_mod.Obj) void {
         const vm: *Self = @ptrCast(@alignCast(vm_ptr));
         vm.trackObject(obj);
+        roots_mod.pin(Value.fromObj(obj));
     }
 
     /// Callback function for builtins to trigger a full GC collection.
@@ -1417,8 +1427,10 @@ pub const VM = struct {
                 const fc = vm.getFrameCount();
                 fc.* -= 1;
                 if (fc.* <= saved_frame_count) {
-                    // Our closure has returned. Restore stack.
+                    // Our closure has returned. Restore stack. The caller
+                    // holds the result in a Zig local, so pin it.
                     vm.getStackTop().* = frame.base_slot;
+                    roots_mod.pin(ret);
                     return ret;
                 }
                 // Nested function returned.

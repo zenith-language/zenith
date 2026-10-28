@@ -16,6 +16,8 @@ const value_mod = @import("value");
 const Value = value_mod.Value;
 const intern_mod = @import("intern");
 const InternTable = intern_mod.InternTable;
+const roots_mod = @import("roots");
+const RootStack = roots_mod.RootStack;
 const gc_roots_mod = @import("gc_roots");
 const arena_mod = @import("arena");
 const StageArena = arena_mod.StageArena;
@@ -36,8 +38,9 @@ const Scheduler = scheduler_mod.Scheduler;
 /// proportional to allocation. Objects never move and there are no write
 /// barriers: native code may mutate any object it holds.
 ///
-/// Roots are the VM and fiber stacks, frames and open upvalues, and
-/// registered arenas.
+/// Roots are the VM and fiber stacks, frames and open upvalues, registered
+/// arenas, and `temp_roots`, where native code pins the values it holds in
+/// Zig locals (see roots.zig).
 pub const GC = struct {
     // ── Heap accounting ──────────────────────────────────────────────
     bytes_allocated: usize = 0,
@@ -60,6 +63,7 @@ pub const GC = struct {
 
     backing_allocator: Allocator,
     marker: Marker = .{},
+    temp_roots: RootStack,
     arenas: std.ArrayListUnmanaged(*StageArena) = .empty,
 
     /// VM whose roots are scanned (set when the VM starts).
@@ -77,6 +81,7 @@ pub const GC = struct {
         return .{
             .backing_allocator = backing,
             .intern_table = try InternTable.init(backing, 256),
+            .temp_roots = RootStack.init(backing),
             .min_heap = DEFAULT_MIN_HEAP,
             .next_gc = DEFAULT_MIN_HEAP,
             .log_enabled = envFlag("ZENITH_GC_LOG"),
@@ -90,6 +95,7 @@ pub const GC = struct {
 
     pub fn deinit(self: *GC) void {
         self.marker.deinit(self.backing_allocator);
+        self.temp_roots.deinit();
         self.arenas.deinit(self.backing_allocator);
         freeList(self.objects, self.backing_allocator);
         self.objects = null;
@@ -457,7 +463,7 @@ test "trackObject is idempotent" {
     try std.testing.expect(str.obj.next == null);
 }
 
-test "collect frees unreachable objects and keeps rooted ones" {
+test "collect frees unreachable objects and keeps pinned ones" {
     var gc = try GC.init(std.testing.allocator);
     defer gc.deinit();
     const alloc = gc.allocator();
@@ -474,15 +480,16 @@ test "collect frees unreachable objects and keeps rooted ones" {
     const dead = try obj_mod.ObjString.create(alloc, "dead", null);
     gc.trackObject(&dead.obj);
 
-    vm.stack[0] = Value.fromObj(&lst.obj);
-    vm.stack_top = 1;
+    roots_mod.current = &gc.temp_roots;
+    defer roots_mod.current = null;
+    roots_mod.pin(Value.fromObj(&lst.obj));
 
     try gc.collect();
     try std.testing.expectEqual(@as(usize, 2), gc.object_count);
     try std.testing.expectEqual(@as(u64, 1), gc.objects_freed);
     try std.testing.expect(!live.obj.isMarked());
 
-    vm.stack_top = 0;
+    roots_mod.restore(0);
     try gc.collect();
     try std.testing.expectEqual(@as(usize, 0), gc.object_count);
 }

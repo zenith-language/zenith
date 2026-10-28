@@ -16,6 +16,7 @@ const Scheduler = scheduler_mod.Scheduler;
 /// 2. Every fiber known to the scheduler, or the VM's current fiber when
 ///    running without one.
 /// 3. Arena references.
+/// 4. Values pinned by native code on the temp root stack.
 pub fn scanRoots(marker: *Marker, gc: *GC, vm: *VM) !void {
     for (vm.stack[0..vm.stack_top]) |*val| {
         try marker.processValue(val, gc);
@@ -45,6 +46,10 @@ pub fn scanRoots(marker: *Marker, gc: *GC, vm: *VM) !void {
         for (arena.gc_refs.items) |*ref| {
             try marker.processValue(ref, gc);
         }
+    }
+
+    for (gc.temp_roots.slice()) |*val| {
+        try marker.processValue(val, gc);
     }
 }
 

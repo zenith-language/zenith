@@ -149,7 +149,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const roots_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/roots.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "value", .module = value_mod },
+        },
+    });
+
     gc_mod.addImport("value", value_mod);
+    gc_mod.addImport("roots", roots_mod);
     gc_mod.addImport("fiber", fiber_mod);
     gc_mod.addImport("channel", channel_mod);
 
@@ -218,6 +228,7 @@ pub fn build(b: *std.Build) void {
     // Wire obj_mod to import stream for ObjStream/StreamState.
     obj_mod.addImport("stream", stream_mod_build);
 
+    stream_mod_build.addImport("roots", roots_mod);
 
     const json_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib/json.zig"),
@@ -315,6 +326,10 @@ pub fn build(b: *std.Build) void {
 
     // Wire gc_mod to import gc_roots (root scanning in collect).
     gc_mod.addImport("gc_roots", gc_roots_mod);
+    // Native code pins its temporaries on the GC root stack.
+    builtins_mod.addImport("roots", roots_mod);
+    json_mod.addImport("roots", roots_mod);
+    vm_mod.addImport("roots", roots_mod);
     // Wire gc_mod to import vm for VM type access.
     gc_mod.addImport("vm", vm_mod);
     // Wire gc_mod to import scheduler for safepoint protocol.
@@ -441,6 +456,7 @@ pub fn build(b: *std.Build) void {
         intern_mod,
         arena_mod,
         gc_mod,
+        roots_mod,
         gc_roots_mod,
         obj_mod,
         value_mod,
