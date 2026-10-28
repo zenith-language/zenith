@@ -376,63 +376,54 @@ pub const StreamState = union(enum) {
         exhausted: bool,
     };
 
-    /// Pull the next element from this stream.
-    /// Returns Some(val) or None as ObjAdt Option values.
-    pub fn next(self: *StreamState, allocator: Allocator) NativeError!Value {
+    /// Pull the next element from this stream; null when it is exhausted.
+    pub fn next(self: *StreamState, allocator: Allocator) NativeError!?Value {
         switch (self.*) {
             .range_iter => |*s| {
                 if (s.step > 0) {
-                    if (s.current >= s.end) return makeNone(allocator);
+                    if (s.current >= s.end) return null;
                 } else {
-                    if (s.current <= s.end) return makeNone(allocator);
+                    if (s.current <= s.end) return null;
                 }
                 const val = Value.fromInt(s.current);
                 s.current += s.step;
-                return makeSome(val, allocator);
+                return val;
             },
             .repeat_iter => |s| {
-                return makeSome(s.value, allocator);
+                return s.value;
             },
             .iterate_iter => |*s| {
                 if (!s.started) {
                     s.started = true;
-                    return makeSome(s.current, allocator);
+                    return s.current;
                 }
                 // Apply function to current value to get next.
                 const result = try callClosure(s.fn_val, &[_]Value{s.current});
                 s.current = result;
-                return makeSome(result, allocator);
+                return result;
             },
             .map_op => |s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
-                const upstream_val = try upstream_stream.state.next(allocator);
-                // If upstream returned None, pass it through.
-                if (isNone(upstream_val)) return upstream_val;
-                // Extract the value from Some(val).
-                const inner = adtPayload(upstream_val, 0);
-                const mapped = try callClosure(s.fn_val, &[_]Value{inner});
-                return makeSome(mapped, allocator);
+                const inner = (try upstream_stream.state.next(allocator)) orelse return null;
+                return try callClosure(s.fn_val, &[_]Value{inner});
             },
             .filter_op => |s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 // Keep pulling until we find a matching element or upstream is exhausted.
                 while (true) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) return upstream_val;
-                    const inner = adtPayload(upstream_val, 0);
+                    const inner = (try upstream_stream.state.next(allocator)) orelse return null;
                     const predicate_result = try callClosure(s.fn_val, &[_]Value{inner});
                     if (!isFalsy(predicate_result)) {
-                        return makeSome(inner, allocator);
+                        return inner;
                     }
                 }
             },
             .take_op => |*s| {
-                if (s.remaining <= 0) return makeNone(allocator);
+                if (s.remaining <= 0) return null;
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
-                const upstream_val = try upstream_stream.state.next(allocator);
-                if (isNone(upstream_val)) return upstream_val;
+                const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                 s.remaining -= 1;
-                return upstream_val;
+                return elem;
             },
             .drop_op => |*s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
@@ -440,8 +431,7 @@ pub const StreamState = union(enum) {
                     // Discard `remaining` elements.
                     var dropped: i32 = 0;
                     while (dropped < s.remaining) : (dropped += 1) {
-                        const upstream_val = try upstream_stream.state.next(allocator);
-                        if (isNone(upstream_val)) return upstream_val;
+                        _ = (try upstream_stream.state.next(allocator)) orelse return null;
                     }
                     s.started = true;
                 }
@@ -453,15 +443,13 @@ pub const StreamState = union(enum) {
                     if (!s.inner.isNil()) {
                         const inner_stream = ObjStream.fromObj(s.inner.asObj());
                         const inner_val = try inner_stream.state.next(allocator);
-                        if (!isNone(inner_val)) return inner_val;
+                        if (inner_val) |v| return v;
                         // Inner stream exhausted, clear it.
                         s.inner = Value.nil;
                     }
                     // Pull from upstream.
                     const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) return upstream_val;
-                    const elem = adtPayload(upstream_val, 0);
+                    const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     // Apply function to get new inner stream or list.
                     const result = try callClosure(s.fn_val, &[_]Value{elem});
                     if (result.isObjType(.stream)) {
@@ -499,7 +487,7 @@ pub const StreamState = union(enum) {
                             s.inner = Value.fromObj(&wrapped.obj);
                         } else {
                             // Not a stream/list/range -- treat as single-element.
-                            return makeSome(result, allocator);
+                            return result;
                         }
                     }
                 }
@@ -507,15 +495,13 @@ pub const StreamState = union(enum) {
             .filter_map_op => |s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 while (true) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) return upstream_val;
-                    const elem = adtPayload(upstream_val, 0);
+                    const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     const result = try callClosure(s.fn_val, &[_]Value{elem});
                     // Option.Some(v): unwrap and yield.
                     if (result.isObjType(.adt)) {
                         const adt = ObjAdt.fromObj(result.asObj());
                         if (adt.type_id == 0 and adt.variant_idx == 0) {
-                            return makeSome(adt.payload[0], allocator);
+                            return adt.payload[0];
                         }
                         if (adt.type_id == 0 and adt.variant_idx == 1) {
                             continue; // Option.None: skip.
@@ -524,21 +510,19 @@ pub const StreamState = union(enum) {
                     // nil: skip (convenient for ?. chaining).
                     if (result.isNil()) continue;
                     // Non-Option, non-nil: yield as-is.
-                    return makeSome(result, allocator);
+                    return result;
                 }
             },
             .filter_ok_op => |s| {
                 // Pull Result values, keep only Ok payloads, skip Err.
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 while (true) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) return upstream_val;
-                    const elem = adtPayload(upstream_val, 0);
+                    const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     // Result.Ok: type_id=1, variant_idx=0
                     if (elem.isObjType(.adt)) {
                         const adt = ObjAdt.fromObj(elem.asObj());
                         if (adt.type_id == 1 and adt.variant_idx == 0) {
-                            return makeSome(adt.payload[0], allocator);
+                            return adt.payload[0];
                         }
                     }
                     // Result.Err or non-Result values are skipped.
@@ -548,14 +532,12 @@ pub const StreamState = union(enum) {
                 // Pull Result values, keep only Err payloads, skip Ok.
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 while (true) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) return upstream_val;
-                    const elem = adtPayload(upstream_val, 0);
+                    const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     // Result.Err: type_id=1, variant_idx=1
                     if (elem.isObjType(.adt)) {
                         const adt = ObjAdt.fromObj(elem.asObj());
                         if (adt.type_id == 1 and adt.variant_idx == 1) {
-                            return makeSome(adt.payload[0], allocator);
+                            return adt.payload[0];
                         }
                     }
                 }
@@ -563,9 +545,7 @@ pub const StreamState = union(enum) {
             .tap_err_op => |s| {
                 // Pass all elements through; invoke fn on Result.Err payloads.
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
-                const upstream_val = try upstream_stream.state.next(allocator);
-                if (isNone(upstream_val)) return upstream_val;
-                const elem = adtPayload(upstream_val, 0);
+                const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                 // Result.Err: type_id=1, variant_idx=1
                 if (elem.isObjType(.adt)) {
                     const adt = ObjAdt.fromObj(elem.asObj());
@@ -573,27 +553,23 @@ pub const StreamState = union(enum) {
                         _ = try callClosure(s.fn_val, &[_]Value{adt.payload[0]});
                     }
                 }
-                return makeSome(elem, allocator);
+                return elem;
             },
             .scan_op => |*s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
-                const upstream_val = try upstream_stream.state.next(allocator);
-                if (isNone(upstream_val)) return upstream_val;
-                const elem = adtPayload(upstream_val, 0);
+                const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                 const result = try callClosure(s.fn_val, &[_]Value{ s.acc, elem });
                 s.acc = result;
-                return makeSome(result, allocator);
+                return result;
             },
             .distinct_op => |*s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 while (true) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) return upstream_val;
-                    const elem = adtPayload(upstream_val, 0);
+                    const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     const key = elem.bits;
                     const entry = try s.seen.getOrPut(allocator, key);
                     if (!entry.found_existing) {
-                        return makeSome(elem, allocator);
+                        return elem;
                     }
                     // Duplicate -- skip.
                 }
@@ -601,15 +577,11 @@ pub const StreamState = union(enum) {
             .zip_op => |s| {
                 const stream_a = ObjStream.fromObj(s.upstream_a.asObj());
                 const stream_b = ObjStream.fromObj(s.upstream_b.asObj());
-                const val_a = try stream_a.state.next(allocator);
-                if (isNone(val_a)) return val_a;
-                const val_b = try stream_b.state.next(allocator);
-                if (isNone(val_b)) return val_b;
-                const elem_a = adtPayload(val_a, 0);
-                const elem_b = adtPayload(val_b, 0);
+                const elem_a = (try stream_a.state.next(allocator)) orelse return null;
+                const elem_b = (try stream_b.state.next(allocator)) orelse return null;
                 const tuple = try ObjTuple.create(allocator, &[_]Value{ elem_a, elem_b });
                 trackObj(&tuple.obj);
-                return makeSome(Value.fromObj(&tuple.obj), allocator);
+                return Value.fromObj(&tuple.obj);
             },
             .flatten_op => |*s| {
                 while (true) {
@@ -617,7 +589,7 @@ pub const StreamState = union(enum) {
                     if (!s.inner_stream.isNil()) {
                         const inner_s = ObjStream.fromObj(s.inner_stream.asObj());
                         const inner_val = try inner_s.state.next(allocator);
-                        if (!isNone(inner_val)) return inner_val;
+                        if (inner_val) |v| return v;
                         s.inner_stream = Value.nil;
                     }
                     // If we have an active inner list, yield from it.
@@ -626,19 +598,17 @@ pub const StreamState = union(enum) {
                         if (s.inner_idx < list_obj.items.items.len) {
                             const elem = list_obj.items.items[s.inner_idx];
                             s.inner_idx += 1;
-                            return makeSome(elem, allocator);
+                            return elem;
                         }
                         // Inner list exhausted.
                         s.inner_list = Value.nil;
                         s.inner_idx = 0;
                     }
                     // If no upstream (single-list flatten from flat_map auto-wrap), we are done.
-                    if (s.upstream.isNil()) return makeNone(allocator);
+                    if (s.upstream.isNil()) return null;
                     // Pull from upstream.
                     const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) return upstream_val;
-                    const elem = adtPayload(upstream_val, 0);
+                    const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                     if (elem.isObjType(.list)) {
                         s.inner_list = elem;
                         s.inner_idx = 0;
@@ -646,36 +616,32 @@ pub const StreamState = union(enum) {
                         s.inner_stream = elem;
                     } else {
                         // Non-list, non-stream element -- yield directly.
-                        return makeSome(elem, allocator);
+                        return elem;
                     }
                 }
             },
             .tap_op => |s| {
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
-                const upstream_val = try upstream_stream.state.next(allocator);
-                if (isNone(upstream_val)) return upstream_val;
-                const elem = adtPayload(upstream_val, 0);
+                const elem = (try upstream_stream.state.next(allocator)) orelse return null;
                 // Invoke side-effect function, ignore result.
                 _ = try callClosure(s.fn_val, &[_]Value{elem});
-                return makeSome(elem, allocator);
+                return elem;
             },
             .batch_op => |*s| {
-                if (s.exhausted) return makeNone(allocator);
+                if (s.exhausted) return null;
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 const batch_list = try ObjList.create(allocator);
                 trackObj(&batch_list.obj);
                 var count: i32 = 0;
                 while (count < s.size) : (count += 1) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) {
+                    const elem = (try upstream_stream.state.next(allocator)) orelse {
                         s.exhausted = true;
                         break;
-                    }
-                    const elem = adtPayload(upstream_val, 0);
+                    };
                     try batch_list.items.append(allocator, elem);
                 }
-                if (batch_list.items.items.len == 0) return makeNone(allocator);
-                return makeSome(Value.fromObj(&batch_list.obj), allocator);
+                if (batch_list.items.items.len == 0) return null;
+                return Value.fromObj(&batch_list.obj);
             },
             .sort_by_op => |*s| {
                 // On first call, collect all upstream, compute keys, sort.
@@ -684,9 +650,8 @@ pub const StreamState = union(enum) {
                     // Collect all elements.
                     var elems = std.ArrayListUnmanaged(Value){};
                     while (true) {
-                        const upstream_val = try upstream_stream.state.next(allocator);
-                        if (isNone(upstream_val)) break;
-                        try elems.append(allocator, adtPayload(upstream_val, 0));
+                        const elem = (try upstream_stream.state.next(allocator)) orelse break;
+                        try elems.append(allocator, elem);
                     }
                     const len = elems.items.len;
                     // Compute keys via key_fn.
@@ -725,10 +690,10 @@ pub const StreamState = union(enum) {
                 }
                 // Emit one element at a time.
                 const lst = s.sorted.?;
-                if (s.idx >= lst.items.items.len) return makeNone(allocator);
+                if (s.idx >= lst.items.items.len) return null;
                 const val = lst.items.items[s.idx];
                 s.idx += 1;
-                return makeSome(val, allocator);
+                return val;
             },
             .partition_ok => |s| {
                 return partitionNext(s.shared, true, allocator);
@@ -750,17 +715,17 @@ pub const StreamState = union(enum) {
             },
             .json_array_iter => |*s| {
                 const lst = ObjList.fromObj(s.items.asObj());
-                if (s.idx >= lst.items.items.len) return makeNone(allocator);
+                if (s.idx >= lst.items.items.len) return null;
                 const val = lst.items.items[s.idx];
                 s.idx += 1;
-                return makeSome(val, allocator);
+                return val;
             },
             .par_map => |*s| {
                 // Return buffered result if available.
                 if (s.result_buf != null and s.next_emit < s.batch_size) {
                     const val = s.result_buf.?[s.next_emit];
                     s.next_emit += 1;
-                    return makeSome(val, allocator);
+                    return val;
                 }
 
                 // Fail-fast: if a previous batch had an error, propagate it.
@@ -769,7 +734,7 @@ pub const StreamState = union(enum) {
                     return error.RuntimeError;
                 }
 
-                if (s.upstream_done) return makeNone(allocator);
+                if (s.upstream_done) return null;
 
                 // Fetch next batch of up to `concurrency` items from upstream.
                 const batch_max = s.concurrency;
@@ -784,16 +749,15 @@ pub const StreamState = union(enum) {
                 var count: u32 = 0;
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 while (count < batch_max) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) {
+                    const elem = (try upstream_stream.state.next(allocator)) orelse {
                         s.upstream_done = true;
                         break;
-                    }
-                    s.input_buf.?[count] = adtPayload(upstream_val, 0);
+                    };
+                    s.input_buf.?[count] = elem;
                     count += 1;
                 }
 
-                if (count == 0) return makeNone(allocator);
+                if (count == 0) return null;
 
                 // Dispatch batch to fibers via scheduler for parallel execution.
                 if (current_scheduler) |sched_ptr| {
@@ -865,14 +829,14 @@ pub const StreamState = union(enum) {
 
                 s.batch_size = count;
                 s.next_emit = 1; // Return first result now, rest on subsequent calls.
-                return makeSome(s.result_buf.?[0], allocator);
+                return s.result_buf.?[0];
             },
             .par_map_unordered => |*s| {
                 // Return buffered result if available.
                 if (s.result_buf != null and s.next_emit < s.batch_size) {
                     const val = s.result_buf.?[s.next_emit];
                     s.next_emit += 1;
-                    return makeSome(val, allocator);
+                    return val;
                 }
 
                 // Fail-fast: if a previous batch had an error, propagate it.
@@ -881,7 +845,7 @@ pub const StreamState = union(enum) {
                     return error.RuntimeError;
                 }
 
-                if (s.upstream_done) return makeNone(allocator);
+                if (s.upstream_done) return null;
 
                 // Fetch next batch from upstream.
                 const batch_max = s.concurrency;
@@ -895,16 +859,15 @@ pub const StreamState = union(enum) {
                 var count: u32 = 0;
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 while (count < batch_max) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) {
+                    const elem = (try upstream_stream.state.next(allocator)) orelse {
                         s.upstream_done = true;
                         break;
-                    }
-                    s.input_buf.?[count] = adtPayload(upstream_val, 0);
+                    };
+                    s.input_buf.?[count] = elem;
                     count += 1;
                 }
 
-                if (count == 0) return makeNone(allocator);
+                if (count == 0) return null;
 
                 // Dispatch batch to fibers via scheduler for parallel execution.
                 if (current_scheduler) |sched_ptr| {
@@ -971,17 +934,17 @@ pub const StreamState = union(enum) {
 
                 s.batch_size = count;
                 s.next_emit = 1;
-                return makeSome(s.result_buf.?[0], allocator);
+                return s.result_buf.?[0];
             },
             .par_map_result => |*s| {
                 // Return buffered result if available.
                 if (s.result_buf != null and s.next_emit < s.batch_size) {
                     const val = s.result_buf.?[s.next_emit];
                     s.next_emit += 1;
-                    return makeSome(val, allocator);
+                    return val;
                 }
 
-                if (s.upstream_done) return makeNone(allocator);
+                if (s.upstream_done) return null;
 
                 // Fetch next batch from upstream.
                 const batch_max = s.concurrency;
@@ -995,16 +958,15 @@ pub const StreamState = union(enum) {
                 var count: u32 = 0;
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 while (count < batch_max) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) {
+                    const elem = (try upstream_stream.state.next(allocator)) orelse {
                         s.upstream_done = true;
                         break;
-                    }
-                    s.input_buf.?[count] = adtPayload(upstream_val, 0);
+                    };
+                    s.input_buf.?[count] = elem;
                     count += 1;
                 }
 
-                if (count == 0) return makeNone(allocator);
+                if (count == 0) return null;
 
                 // Dispatch batch to fibers via scheduler for parallel execution (no fail-fast).
                 if (current_scheduler) |sched_ptr| {
@@ -1085,7 +1047,7 @@ pub const StreamState = union(enum) {
 
                 s.batch_size = count;
                 s.next_emit = 1;
-                return makeSome(s.result_buf.?[0], allocator);
+                return s.result_buf.?[0];
             },
             .throttle_op => |*s| {
                 if (!s.started) {
@@ -1123,27 +1085,25 @@ pub const StreamState = union(enum) {
                         s.buf.clearRetainingCapacity();
                         s.read_idx = 0;
                     }
-                    return makeSome(val, allocator);
+                    return val;
                 }
 
                 // Buffer empty. If upstream exhausted, we're done.
-                if (s.exhausted) return makeNone(allocator);
+                if (s.exhausted) return null;
 
                 // Refill buffer from upstream (up to capacity items).
                 const upstream_stream = ObjStream.fromObj(s.upstream.asObj());
                 var count: u32 = 0;
                 while (count < s.capacity) : (count += 1) {
-                    const upstream_val = try upstream_stream.state.next(allocator);
-                    if (isNone(upstream_val)) {
+                    const elem = (try upstream_stream.state.next(allocator)) orelse {
                         s.exhausted = true;
                         break;
-                    }
-                    const elem = adtPayload(upstream_val, 0);
+                    };
                     try s.buf.append(allocator, elem);
                 }
 
                 // If nothing was fetched, upstream was already empty.
-                if (s.buf.items.len == 0) return makeNone(allocator);
+                if (s.buf.items.len == 0) return null;
 
                 // Return first item from newly filled buffer.
                 const val = s.buf.items[0];
@@ -1152,7 +1112,7 @@ pub const StreamState = union(enum) {
                     s.buf.clearRetainingCapacity();
                     s.read_idx = 0;
                 }
-                return makeSome(val, allocator);
+                return val;
             },
             .tick => |*s| {
                 // Generate incrementing integers at regular intervals.
@@ -1162,14 +1122,14 @@ pub const StreamState = union(enum) {
                     s.last_emit = now;
                     const val = Value.fromInt(@intCast(s.counter));
                     s.counter += 1;
-                    return makeSome(val, allocator);
+                    return val;
                 }
                 const elapsed: u64 = @intCast(@max(0, now - s.last_emit));
                 if (elapsed >= s.interval_ms) {
                     s.last_emit = now;
                     const val = Value.fromInt(@intCast(s.counter));
                     s.counter += 1;
-                    return makeSome(val, allocator);
+                    return val;
                 }
                 // Not enough time has elapsed. In single-threaded mode,
                 // use a brief sleep and retry.
@@ -1177,7 +1137,7 @@ pub const StreamState = union(enum) {
                 s.last_emit = std.time.milliTimestamp();
                 const val = Value.fromInt(@intCast(s.counter));
                 s.counter += 1;
-                return makeSome(val, allocator);
+                return val;
             },
         }
     }
@@ -1396,18 +1356,18 @@ pub const StreamState = union(enum) {
 };
 
 /// Helper for file_reader and stdin_reader next(): read one line as ObjString.
-fn fileReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) NativeError!Value {
+fn fileReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) NativeError!?Value {
     const line = try frs.readLine(allocator);
     if (line) |line_bytes| {
         const str = try ObjString.create(allocator, line_bytes, null);
         trackObj(&str.obj);
-        return makeSome(Value.fromObj(&str.obj), allocator);
+        return Value.fromObj(&str.obj);
     }
-    return makeNone(allocator);
+    return null;
 }
 
 /// Helper for jsonl_reader next(): read one line, parse as JSON, wrap in Result.
-fn jsonlReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) NativeError!Value {
+fn jsonlReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) NativeError!?Value {
     while (true) {
         const line = try frs.readLine(allocator);
         if (line) |line_bytes| {
@@ -1429,7 +1389,7 @@ fn jsonlReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) Nati
                     // Wrap in Result.Ok (type_id=1, variant_idx=0).
                     const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{val});
                     trackObj(&ok_adt.obj);
-                    return makeSome(Value.fromObj(&ok_adt.obj), allocator);
+                    return Value.fromObj(&ok_adt.obj);
                 },
                 .err => |e| {
                     // Create ParseError record {message: String, line: Int}.
@@ -1445,20 +1405,20 @@ fn jsonlReaderNext(frs: *StreamState.FileReaderState, allocator: Allocator) Nati
                     // Wrap in Result.Err (type_id=1, variant_idx=1).
                     const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&record.obj)});
                     trackObj(&err_adt.obj);
-                    return makeSome(Value.fromObj(&err_adt.obj), allocator);
+                    return Value.fromObj(&err_adt.obj);
                 },
             }
         }
-        return makeNone(allocator);
+        return null;
     }
 }
 
 /// Helper for memory_reader next(): read one line from in-memory buffer.
 /// In JSONL mode, each line is parsed as JSON and wrapped in Result.
 /// In text mode, each line is returned as a string.
-fn memoryReaderNext(s: *StreamState.MemoryReaderOp, allocator: Allocator) NativeError!Value {
+fn memoryReaderNext(s: *StreamState.MemoryReaderOp, allocator: Allocator) NativeError!?Value {
     while (true) {
-        if (s.cursor >= s.data.len) return makeNone(allocator);
+        if (s.cursor >= s.data.len) return null;
 
         // Find next newline.
         var end = s.cursor;
@@ -1491,7 +1451,7 @@ fn memoryReaderNext(s: *StreamState.MemoryReaderOp, allocator: Allocator) Native
                 .ok => |val| {
                     const ok_adt = try ObjAdt.create(allocator, 1, 0, &[_]Value{val});
                     trackObj(&ok_adt.obj);
-                    return makeSome(Value.fromObj(&ok_adt.obj), allocator);
+                    return Value.fromObj(&ok_adt.obj);
                 },
                 .err => |e| {
                     const msg_str = try ObjString.create(allocator, e.message, null);
@@ -1505,34 +1465,32 @@ fn memoryReaderNext(s: *StreamState.MemoryReaderOp, allocator: Allocator) Native
                     trackObj(&record.obj);
                     const err_adt = try ObjAdt.create(allocator, 1, 1, &[_]Value{Value.fromObj(&record.obj)});
                     trackObj(&err_adt.obj);
-                    return makeSome(Value.fromObj(&err_adt.obj), allocator);
+                    return Value.fromObj(&err_adt.obj);
                 },
             }
         } else {
             // Text mode: return line as string.
             const str = try ObjString.create(allocator, line, null);
             trackObj(&str.obj);
-            return makeSome(Value.fromObj(&str.obj), allocator);
+            return Value.fromObj(&str.obj);
         }
     }
 }
 
 /// Shared helper for partition_ok and partition_err next() logic.
 /// If `want_ok` is true, returns from the ok_queue; otherwise from err_queue.
-fn partitionNext(shared: *StreamState.PartitionState, want_ok: bool, allocator: Allocator) NativeError!Value {
+fn partitionNext(shared: *StreamState.PartitionState, want_ok: bool, allocator: Allocator) NativeError!?Value {
     // Check our queue first.
     const my_queue = if (want_ok) &shared.ok_queue else &shared.err_queue;
     if (my_queue.items.len > 0) {
         const val = my_queue.orderedRemove(0);
-        return makeSome(val, allocator);
+        return val;
     }
     // Pull from upstream and classify.
     const other_queue = if (want_ok) &shared.err_queue else &shared.ok_queue;
     const upstream_stream = ObjStream.fromObj(shared.upstream.asObj());
     while (true) {
-        const upstream_val = try upstream_stream.state.next(allocator);
-        if (isNone(upstream_val)) return upstream_val;
-        const elem = adtPayload(upstream_val, 0);
+        const elem = (try upstream_stream.state.next(allocator)) orelse return null;
         // Classify: Result type_id=1, Ok=variant 0, Err=variant 1.
         if (elem.isObjType(.adt)) {
             const adt = ObjAdt.fromObj(elem.asObj());
@@ -1540,18 +1498,18 @@ fn partitionNext(shared: *StreamState.PartitionState, want_ok: bool, allocator: 
                 const payload_val = if (adt.payload.len > 0) adt.payload[0] else Value.nil;
                 if (adt.variant_idx == 0) {
                     // Ok variant.
-                    if (want_ok) return makeSome(payload_val, allocator);
+                    if (want_ok) return payload_val;
                     try other_queue.append(allocator, payload_val);
                 } else {
                     // Err variant.
-                    if (!want_ok) return makeSome(payload_val, allocator);
+                    if (!want_ok) return payload_val;
                     try other_queue.append(allocator, payload_val);
                 }
                 continue;
             }
         }
         // Non-Result values go to ok queue by default.
-        if (want_ok) return makeSome(elem, allocator);
+        if (want_ok) return elem;
         try other_queue.append(allocator, elem);
     }
 }
@@ -1642,33 +1600,6 @@ fn valueLessThan(a: Value, b: Value) bool {
         return std.mem.order(u8, sa, sb) == .lt;
     }
     return a.bits < b.bits;
-}
-
-// Option: type_id=0, Some=variant_idx 0 (arity 1), None=variant_idx 1 (arity 0)
-
-fn makeNone(allocator: Allocator) NativeError!Value {
-    const adt = try ObjAdt.create(allocator, 0, 1, &[_]Value{});
-    trackObj(&adt.obj);
-    return Value.fromObj(&adt.obj);
-}
-
-fn makeSome(val: Value, allocator: Allocator) NativeError!Value {
-    const adt = try ObjAdt.create(allocator, 0, 0, &[_]Value{val});
-    trackObj(&adt.obj);
-    return Value.fromObj(&adt.obj);
-}
-
-/// Check if a value is None (Option type_id=0, variant_idx=1).
-fn isNone(val: Value) bool {
-    if (!val.isObjType(.adt)) return false;
-    const adt = ObjAdt.fromObj(val.asObj());
-    return adt.type_id == 0 and adt.variant_idx == 1;
-}
-
-/// Get payload from ADT at given index.
-fn adtPayload(val: Value, idx: usize) Value {
-    const adt = ObjAdt.fromObj(val.asObj());
-    return adt.payload[idx];
 }
 
 /// Check if value is falsy (nil or false).

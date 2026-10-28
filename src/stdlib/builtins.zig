@@ -1758,11 +1758,7 @@ fn builtinCollect(args: []const Value, allocator: Allocator, err_msg: *[]const u
     trackObj(&result_list.obj);
 
     while (true) {
-        const val = try stream_obj.state.next(allocator);
-        // Check if None (Option type_id=0, variant_idx=1).
-        if (isAdtVariant(val, 0, 1)) break;
-        // Extract from Some(x).
-        const inner = adtPayload(val, 0);
+        const inner = (try stream_obj.state.next(allocator)) orelse break;
         try result_list.items.append(allocator, inner);
     }
 
@@ -1790,8 +1786,7 @@ fn builtinCount(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     var n: i32 = 0;
 
     while (true) {
-        const val = try stream_obj.state.next(allocator);
-        if (isAdtVariant(val, 0, 1)) break;
+        _ = (try stream_obj.state.next(allocator)) orelse break;
         n += 1;
     }
 
@@ -2085,9 +2080,7 @@ fn builtinSum(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var float_sum: f64 = 0.0;
 
     while (true) {
-        const val = try stream_obj.state.next(allocator);
-        if (isAdtVariant(val, 0, 1)) break;
-        const elem = adtPayload(val, 0);
+        const elem = (try stream_obj.state.next(allocator)) orelse break;
         if (elem.isInt()) {
             if (has_float) {
                 float_sum += @as(f64, @floatFromInt(elem.asInt()));
@@ -2133,9 +2126,7 @@ fn builtinReduce(args: []const Value, allocator: Allocator, err_msg: *[]const u8
         const closure_val = args[2];
 
         while (true) {
-            const val = try stream_obj.state.next(allocator);
-            if (isAdtVariant(val, 0, 1)) break;
-            const elem = adtPayload(val, 0);
+            const elem = (try stream_obj.state.next(allocator)) orelse break;
             acc = try callClosure(closure_val, &[_]Value{ acc, elem });
         }
         return acc;
@@ -2162,12 +2153,8 @@ fn builtinFirst(args: []const Value, allocator: Allocator, err_msg: *[]const u8)
     defer stream_mod.clearVM();
 
     const stream_obj = ObjStream.fromObj(first.asObj());
-    const val = try stream_obj.state.next(allocator);
-    if (isAdtVariant(val, 0, 1)) {
-        // Empty stream -> None.
-        return makeNone(allocator);
-    }
-    const elem = adtPayload(val, 0);
+    // Empty stream -> None.
+    const elem = (try stream_obj.state.next(allocator)) orelse return makeNone(allocator);
     return makeSome(elem, allocator);
 }
 
@@ -2189,9 +2176,7 @@ fn builtinLast(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     var last_val: ?Value = null;
 
     while (true) {
-        const val = try stream_obj.state.next(allocator);
-        if (isAdtVariant(val, 0, 1)) break;
-        last_val = adtPayload(val, 0);
+        last_val = (try stream_obj.state.next(allocator)) orelse break;
     }
 
     if (last_val) |lv| {
@@ -2222,9 +2207,7 @@ fn builtinEach(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
     const closure_val = args[1];
 
     while (true) {
-        const val = try stream_obj.state.next(allocator);
-        if (isAdtVariant(val, 0, 1)) break;
-        const elem = adtPayload(val, 0);
+        const elem = (try stream_obj.state.next(allocator)) orelse break;
         _ = try callClosure(closure_val, &[_]Value{elem});
     }
 
@@ -2249,9 +2232,7 @@ fn builtinMin(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var min_val: ?Value = null;
 
     while (true) {
-        const val = try stream_obj.state.next(allocator);
-        if (isAdtVariant(val, 0, 1)) break;
-        const elem = adtPayload(val, 0);
+        const elem = (try stream_obj.state.next(allocator)) orelse break;
         if (min_val) |current_min| {
             if (valueLessThan(elem, current_min)) {
                 min_val = elem;
@@ -2285,9 +2266,7 @@ fn builtinMax(args: []const Value, allocator: Allocator, err_msg: *[]const u8) N
     var max_val: ?Value = null;
 
     while (true) {
-        const val = try stream_obj.state.next(allocator);
-        if (isAdtVariant(val, 0, 1)) break;
-        const elem = adtPayload(val, 0);
+        const elem = (try stream_obj.state.next(allocator)) orelse break;
         if (max_val) |current_max| {
             if (valueLessThan(current_max, elem)) {
                 max_val = elem;
@@ -3743,9 +3722,7 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
 
             var first_elem = true;
             while (true) {
-                const val = try stream_obj.state.next(allocator);
-                if (isAdtVariant(val, 0, 1)) break;
-                const elem = adtPayload(val, 0);
+                const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (!first_elem) {
                     bw.interface.writeByte(',') catch {
@@ -3774,9 +3751,7 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
 
             var first_elem = true;
             while (true) {
-                const val = try stream_obj.state.next(allocator);
-                if (isAdtVariant(val, 0, 1)) break;
-                const elem = adtPayload(val, 0);
+                const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (!first_elem) {
                     bw.interface.writeAll(",\n") catch {
@@ -3798,9 +3773,7 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
 
         .jsonl => {
             while (true) {
-                const val = try stream_obj.state.next(allocator);
-                if (isAdtVariant(val, 0, 1)) break;
-                const elem = adtPayload(val, 0);
+                const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (elem.isObjType(.list)) {
                     const lst = ObjList.fromObj(elem.asObj());
@@ -3820,9 +3793,7 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
             var first_elem = true;
 
             while (true) {
-                const val = try stream_obj.state.next(allocator);
-                if (isAdtVariant(val, 0, 1)) break;
-                const elem = adtPayload(val, 0);
+                const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 if (first_elem) {
                     hdr_info = sinkExtractHeaders(elem, allocator, err_msg);
@@ -3875,9 +3846,8 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
             defer elements.deinit(allocator);
 
             while (true) {
-                const val = try stream_obj.state.next(allocator);
-                if (isAdtVariant(val, 0, 1)) break;
-                elements.append(allocator, adtPayload(val, 0)) catch {
+                const elem = (try stream_obj.state.next(allocator)) orelse break;
+                elements.append(allocator, elem) catch {
                     err_msg.* = "out of memory";
                     return error.RuntimeError;
                 };
@@ -3974,9 +3944,7 @@ fn builtinSink(args: []const Value, allocator: Allocator, err_msg: *[]const u8) 
 
         .text => {
             while (true) {
-                const val = try stream_obj.state.next(allocator);
-                if (isAdtVariant(val, 0, 1)) break;
-                const elem = adtPayload(val, 0);
+                const elem = (try stream_obj.state.next(allocator)) orelse break;
 
                 const formatted = formatValue(elem, allocator, current_atom_names) catch {
                     err_msg.* = "failed to format value for sink";
@@ -4380,18 +4348,17 @@ fn builtinSingle(args: []const Value, allocator: Allocator, err_msg: *[]const u8
     const stream_obj = ObjStream.fromObj(first.asObj());
 
     // Pull first element.
-    const val1 = try stream_obj.state.next(allocator);
-    if (isAdtVariant(val1, 0, 1)) {
+    const first_elem = try stream_obj.state.next(allocator);
+    if (first_elem == null) {
         // Empty stream.
         const msg = try ObjString.create(allocator, "empty stream", null);
         trackObj(&msg.obj);
         return makeErr(Value.fromObj(&msg.obj), allocator);
     }
-    const elem = adtPayload(val1, 0);
+    const elem = first_elem.?;
 
     // Pull second to verify singularity.
-    const val2 = try stream_obj.state.next(allocator);
-    if (isAdtVariant(val2, 0, 1)) {
+    if (try stream_obj.state.next(allocator) == null) {
         // Exactly one element.
         return elem;
     }
@@ -4602,13 +4569,10 @@ fn sinkFormatToBuffer(
         defer items.deinit(allocator);
 
         while (true) {
-            const val = stream_obj.state.next(allocator) catch {
+            const inner = (stream_obj.state.next(allocator) catch {
                 err_msg.* = "stream error during S3 sink";
                 return error.RuntimeError;
-            };
-            // Option.None = type_id=0, variant_idx=1
-            if (isAdtVariant(val, 0, 1)) break;
-            const inner = adtPayload(val, 0);
+            }) orelse break;
             items.append(allocator, inner) catch return error.OutOfMemory;
         }
 
@@ -4635,12 +4599,10 @@ fn sinkFormatToBuffer(
 
     // Text and JSONL: line-by-line.
     while (true) {
-        const val = stream_obj.state.next(allocator) catch {
+        const inner = (stream_obj.state.next(allocator) catch {
             err_msg.* = "stream error during S3 sink";
             return error.RuntimeError;
-        };
-        if (isAdtVariant(val, 0, 1)) break;
-        const inner = adtPayload(val, 0);
+        }) orelse break;
 
         if (sink_format == .jsonl) {
             switch (json_mod.emit(inner, allocator)) {
