@@ -1279,9 +1279,7 @@ pub const StreamState = union(enum) {
                 try marker.processValue(&s.upstream, gc);
                 try marker.processValue(&s.key_fn, gc);
                 if (s.sorted) |lst| {
-                    for (lst.items.items) |*v| {
-                        try marker.processValue(v, gc);
-                    }
+                    try marker.markObj(&lst.obj, gc);
                 }
             },
             .partition_ok, .partition_err => |*s| {
